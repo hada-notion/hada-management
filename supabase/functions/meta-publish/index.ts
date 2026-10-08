@@ -344,12 +344,16 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: message(e) }, 400);
   }
 
+  // 테스트 실행: 이미지 수집과 Storage 업로드까지만 하고 발행하지 않는다.
+  const dryRun = payload.dryRun === true ||
+    new URL(req.url).searchParams.get("dryRun") === "true";
+
   try {
     const page = await notion(cfg, `/pages/${pageId}`);
     const props = (page.properties ?? {}) as Json;
 
     const currentStatus = selectName(props["발행 상태"]);
-    if (!shouldPublish(currentStatus)) {
+    if (!dryRun && !shouldPublish(currentStatus)) {
       return json({
         ok: true,
         pageId,
@@ -392,11 +396,26 @@ Deno.serve(async (req) => {
       throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
     }
 
-    await setPublishStatus(cfg, pageId, "발행 중");
+    if (!dryRun) await setPublishStatus(cfg, pageId, "발행 중");
 
     const imageUrls: string[] = [];
     for (let index = 0; index < sourceUrls.length; index++) {
       imageUrls.push(await uploadImage(cfg, pageId, index, sourceUrls[index]));
+    }
+
+    if (dryRun) {
+      return json({
+        ok: true,
+        dryRun: true,
+        pageId,
+        status: currentStatus,
+        channels,
+        imageCount: imageUrls.length,
+        images: imageUrls,
+        caption,
+        captionLength: caption.length,
+        note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
+      });
     }
 
     const results: Json = {};
@@ -445,6 +464,9 @@ Deno.serve(async (req) => {
     });
   } catch (e) {
     const detail = message(e);
+    if (dryRun) {
+      return json({ ok: false, dryRun: true, pageId, error: detail }, 500);
+    }
     try {
       await setPublishStatus(cfg, pageId, "발행 실패");
     } catch {
