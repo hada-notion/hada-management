@@ -14,6 +14,8 @@ import {
   extractImageUrls,
   extractVideoUrls,
   isImageUrl,
+  isThreadsNotFound,
+  isThreadsNotReady,
   isVideoUrl,
   maskSecrets,
   mediaKindFor,
@@ -344,4 +346,30 @@ Deno.test("contentTypeFor: 영상 확장자도 처리한다", () => {
   assertEquals(contentTypeFor("mp4"), "video/mp4");
   assertEquals(contentTypeFor("webm"), "video/webm");
   assertEquals(contentTypeFor("png"), "image/png");
+});
+
+Deno.test("isThreadsNotReady/isThreadsNotFound: 메타 전파 지연 오류만 골라낸다", () => {
+  // 자식이 준비되기 전에 부모를 만들면 나는 오류. 다시 시도하면 통과한다.
+  const notReady = Object.assign(new Error("스레드 API 400: Invalid parameter · code 100 · subcode 4279004"), {
+    code: 100,
+    subcode: 4279004,
+  });
+  assertEquals(isThreadsNotReady(notReady), true);
+  assertEquals(isThreadsNotFound(notReady), false);
+  // 방금 만든 컨테이너가 아직 안 보일 때 나는 오류.
+  const notFound = Object.assign(new Error("스레드 API 404: The requested resource does not exist · code 24"), {
+    code: 24,
+    subcode: 4279009,
+  });
+  assertEquals(isThreadsNotFound(notFound), true);
+  assertEquals(isThreadsNotReady(notFound), false);
+  // 다른 오류는 그대로 올라가야 한다.
+  const other = Object.assign(new Error("스레드 API 400: 잘못된 값 · code 100 · subcode 1234567"), {
+    code: 100,
+    subcode: 1234567,
+  });
+  assertEquals(isThreadsNotReady(other), false);
+  assertEquals(isThreadsNotFound(other), false);
+  assertEquals(isThreadsNotFound(new Error("The requested resource does not exist")), true);
+  assertEquals(isThreadsNotFound(undefined), false);
 });

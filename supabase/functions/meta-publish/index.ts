@@ -49,6 +49,8 @@ import {
   hexPreview,
   extractImageUrls,
   extractVideoUrls,
+  isThreadsNotFound,
+  isThreadsNotReady,
   maskSecrets,
   mediaKindFor,
   needsRefresh,
@@ -71,6 +73,12 @@ const IG_VIDEO_POLL_ATTEMPTS = 12;
 const IG_VIDEO_POLL_INTERVAL_MS = 6000;
 const THREADS_CONTAINER_POLL_ATTEMPTS = 10;
 const THREADS_CONTAINER_POLL_INTERVAL_MS = 4000;
+// 자식 컨테이너가 준비되기 전에 부모를 만들면 메타가 400(subcode 4279004)으로 거절한다. 그때 다시 시도한다.
+const THREADS_CAROUSEL_CREATE_ATTEMPTS = 6;
+const THREADS_CAROUSEL_CREATE_DELAY_MS = 3000;
+// 발행 직후 컨테이너가 아직 전파되지 않아 "없다"는 답이 올 때가 있다.
+const THREADS_PUBLISH_ATTEMPTS = 5;
+const THREADS_PUBLISH_DELAY_MS = 2000;
 const COMMENT_LIMIT = 1900;
 const MIN_TOKEN_LENGTH = 40;
 
@@ -121,6 +129,45 @@ function secretsOf(cfg: Config): string[] {
 /** API 오류를 요약하고 비밀값을 지운 뒤 예외로 만든다. 응답을 통째로 남기지 않는 게 요점이다. */
 function apiError(cfg: Config, label: string, status: number, text: string, limit = 400): Error {
   return new Error(`${label} ${status}: ${maskSecrets(summarizeApiError(text, limit), secretsOf(cfg))}`);
+}
+
+/** 코드 값까지 들고 다니는 오류. 메타는 같은 400 이라도 하위 코드로 원인을 구분한다. */
+type ApiFailure = Error & { status?: number; code?: unknown; subcode?: unknown };
+
+function apiFailure(cfg: Config, label: string, status: number, text: string, limit = 400): ApiFailure {
+  const failure = apiError(cfg, label, status, text, limit) as ApiFailure;
+  failure.status = status;
+  try {
+    const parsed = JSON.parse(text) as Record<string, any>;
+    const detail = (parsed.error ?? parsed) as Record<string, any>;
+    failure.code = detail.code;
+    failure.subcode = detail.error_subcode;
+  } catch {
+    // JSON 이 아니면 코드 정보가 없다.
+  }
+  return failure;
+}
+
+/** 메타 쪽 전파가 늦어 생기는 오류만 골라 다시 시도한다. */
+async function retryWhen(
+  attempts: number,
+  delayMs: number,
+  shouldRetry: (e: unknown) => boolean,
+  run: () => Promise<Json>,
+  label: string,
+): Promise<Json> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await run();
+    } catch (e) {
+      lastError = e;
+      if (!shouldRetry(e) || attempt === attempts - 1) throw e;
+      console.warn(`${label} 재시도 ${attempt + 2}/${attempts}`, message(e));
+      await sleep(delayMs);
+    }
+  }
+  throw lastError;
 }
 
 function buildConfig() {
@@ -639,7 +686,7 @@ async function threadsFetch(
     headers: { "Authorization": `Bearer ${token}`, ...(init.headers ?? {}) },
   });
   const text = await res.text();
-  if (!res.ok) throw apiError(cfg, "스레드 API", res.status, text);
+  if (!res.ok) throw apiFailure(cfg, "스레드 API", res.status, text);
   return text ? JSON.parse(text) : {};
 }
 
@@ -668,7 +715,15 @@ async function waitForThreadsContainer(
   containerId: string,
 ): Promise<void> {
   for (let attempt = 0; attempt < THREADS_CONTAINER_POLL_ATTEMPTS; attempt++) {
-    const info = await threadsGet(cfg, auth, `${containerId}?fields=status,error_message`);
+    let info: Json;
+    try {
+      info = await threadsGet(cfg, auth, `${containerId}?fields=status,error_message`);
+    } catch (e) {
+      // 컨테이너를 막 만든 직후에는 아직 안 보일 수 있다. 그 오류만 넘긴다.
+      if (!isThreadsNotFound(e) || attempt === THREADS_CONTAINER_POLL_ATTEMPTS - 1) throw e;
+      await sleep(THREADS_CONTAINER_POLL_INTERVAL_MS);
+      continue;
+    }
     const status = String(info.status ?? "").toUpperCase();
     if (status === "FINISHED" || status === "PUBLISHED") return;
     if (status === "ERROR" || status === "EXPIRED") {
@@ -679,6 +734,46 @@ async function waitForThreadsContainer(
   }
   throw new Error(
     "스레드가 아직 파일을 처리하는 중입니다. 올라간 글은 없으니 잠시 뒤 같은 버튼을 다시 누르면 새로 처리합니다.",
+  );
+}
+
+/**
+ * 캐러셀 부모 컨테이너를 만든다.
+ * 자식들이 준비되기 전에 부모를 만들면 메타가 400(code 100, subcode 4279004)으로 거절하므로
+ * 조금 기다렸다 다시 시도한다.
+ */
+async function createThreadsCarousel(
+  cfg: Config,
+  auth: ThreadsAuth,
+  children: string[],
+  text: string,
+): Promise<Json> {
+  return await retryWhen(
+    THREADS_CAROUSEL_CREATE_ATTEMPTS,
+    THREADS_CAROUSEL_CREATE_DELAY_MS,
+    isThreadsNotReady,
+    () =>
+      threadsPost(cfg, auth, `${auth.userId}/threads`, {
+        media_type: "CAROUSEL",
+        children: children.join(","),
+        text,
+      }),
+    "스레드 캐러셀 컨테이너",
+  );
+}
+
+/** 발행 직후에는 컨테이너가 아직 전파되지 않아 "없다"는 답이 올 수 있다. 그때만 다시 시도한다. */
+async function publishThreadsContainer(
+  cfg: Config,
+  auth: ThreadsAuth,
+  containerId: string,
+): Promise<Json> {
+  return await retryWhen(
+    THREADS_PUBLISH_ATTEMPTS,
+    THREADS_PUBLISH_DELAY_MS,
+    isThreadsNotFound,
+    () => threadsPost(cfg, auth, `${auth.userId}/threads_publish`, { creation_id: containerId }),
+    "스레드 발행",
   );
 }
 
@@ -710,6 +805,7 @@ async function publishThreads(
       text,
     });
     containerId = container.id;
+    await waitForThreadsContainer(cfg, auth, containerId);
   } else {
     assertCarouselSize(media.urls.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
     const children: string[] = [];
@@ -721,15 +817,15 @@ async function publishThreads(
       });
       children.push(child.id);
     }
-    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
-      media_type: "CAROUSEL",
-      children: children.join(","),
-      text,
-    });
+    console.log("스레드 자식 컨테이너", children.length, "개 생성");
+    // 부모를 만들기 전에 자식들이 처리를 마쳐야 한다. 건너뛰면 4279004 로 거절당한다.
+    await Promise.all(children.map((id) => waitForThreadsContainer(cfg, auth, id)));
+    const container = await createThreadsCarousel(cfg, auth, children, text);
     containerId = container.id;
+    await waitForThreadsContainer(cfg, auth, containerId);
   }
 
-  const published = await threadsPost(cfg, auth, `${uid}/threads_publish`, { creation_id: containerId });
+  const published = await publishThreadsContainer(cfg, auth, containerId);
   const info = await threadsGet(cfg, auth, `${published.id}?fields=permalink`);
   return info.permalink ?? "";
 }

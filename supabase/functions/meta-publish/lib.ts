@@ -371,3 +371,21 @@ export function summarizeApiError(text: string, limit = 400): string {
   }
   return truncate(body, limit);
 }
+
+type ApiFailureLike = { code?: unknown; subcode?: unknown; message?: string };
+
+/**
+ * 스레드는 자식 컨테이너가 아직 준비되지 않은 상태에서 부모(캐러셀)를 만들면
+ * 400(code 100, subcode 4279004)으로 거절한다. 잠시 뒤 다시 시도하면 통과한다.
+ */
+export function isThreadsNotReady(e: unknown): boolean {
+  const failure = (e ?? {}) as ApiFailureLike;
+  return failure.code === 100 && failure.subcode === 4279004;
+}
+
+/** 방금 만든 컨테이너는 아직 모든 노드에 보이지 않아 "없다"는 답이 올 수 있다. */
+export function isThreadsNotFound(e: unknown): boolean {
+  const failure = (e ?? {}) as ApiFailureLike;
+  if (failure.code === 24 || failure.subcode === 4279009) return true;
+  return /does not exist/i.test(failure.message ?? "");
+}
