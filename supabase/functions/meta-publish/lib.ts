@@ -53,15 +53,6 @@ export function buildCaption(primary: string, fallback: string, fixedComment: st
   return `${base}\n\n${fixed}`;
 }
 
-/** 발행 채널을 정한다. 비어 있으면 두 채널 모두 발행한다. */
-export function normalizeChannels(values: string[] | undefined): string[] {
-  const list = values ?? [];
-  const picked = ["인스타그램", "스레드"].filter((c) => list.includes(c));
-  return picked.length > 0 ? picked : ["인스타그램", "스레드"];
-}
-
-export const PUBLISH_READY_STATUS = "발행 대기";
-
 export const IG_CAPTION_LIMIT = 2200;
 export const THREADS_TEXT_LIMIT = 500;
 
@@ -138,11 +129,9 @@ export function resolveRedirectUri(requestUrl: string, publicBaseUrl: string, ov
   return `https://${parsed.host}${path}`;
 }
 
-/** 발행 상태가 "발행 대기"일 때만 발행한다. 그 외에는 건너뛴다. */
 /**
  * 요청에서 발행 대상 페이지를 뽑는다. 지정이 없으면 빈 문자열을 돌려주고,
- * 호출부는 그때 큐 모드(발행 대기 행 조회)로 넘어간다.
- * 노션 버튼 웹훅은 DB 속성만 보낼 수 있어서 페이지 URL 이 오지 않는다.
+ * 호출부는 그때 큐 모드(⚪ 대기 행 조회)로 넘어간다.
  */
 export function readTarget(payload: Record<string, any>, requestUrl: string): string {
   let params: URLSearchParams;
@@ -197,10 +186,6 @@ export function channelHint(value: string | null): string | null {
   if (["instagram", "ig", "인스타그램", "인스타"].includes(key)) return "인스타그램";
   if (["threads", "thread", "스레드"].includes(key)) return "스레드";
   return null;
-}
-
-export function shouldPublish(currentStatus: string | undefined): boolean {
-  return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;
 }
 
 export function truncate(text: string, limit: number): string {

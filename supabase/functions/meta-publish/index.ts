@@ -7,7 +7,7 @@
 //
 // 큐 모드는 즉시 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
 // 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
-// 실제 결과는 페이지의 '발행 상태'·'실시간 처리 상태'·'인스타그램 상태'·'스레드 상태'로 확인한다.
+// 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'와 '실시간 처리 상태' 수식으로 확인한다.
 // 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
 //
 // 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
@@ -146,10 +146,6 @@ async function updatePage(cfg: Config, pageId: string, properties: Json): Promis
     method: "PATCH",
     body: JSON.stringify({ properties }),
   });
-}
-
-async function setPublishStatus(cfg: Config, pageId: string, status: string): Promise<void> {
-  await updatePage(cfg, pageId, { "발행 상태": { select: { name: status } } });
 }
 
 async function addComment(cfg: Config, pageId: string, content: string): Promise<void> {
@@ -598,10 +594,6 @@ async function publishThreads(
 const CHANNELS = ["인스타그램", "스레드"] as const;
 type Channel = typeof CHANNELS[number];
 
-const WORK_PROP: Record<Channel, string> = {
-  "인스타그램": "인스타그램 작업중",
-  "스레드": "스레드 작업중",
-};
 const RESULT_PROP: Record<Channel, string> = {
   "인스타그램": "인스타그램 상태",
   "스레드": "스레드 상태",
@@ -611,13 +603,21 @@ const LINK_PROP: Record<Channel, string> = {
   "스레드": "스레드 링크",
 };
 
-function isChecked(prop: Json | undefined): boolean {
-  return prop?.checkbox === true;
-}
+// 채널 상태 값. 학원관리 다른 DB 와 같은 5단계를 쓴다.
+const STATUS_WAITING = "⚪ 대기";
+const STATUS_WORKING = "🔄 작업중";
+const STATUS_DONE = "✅ 완료";
+const STATUS_ERROR = "⚠️ 오류";
 
-/** 지금 작업중 체크가 켜져 있는 채널. 버튼이 켜고 함수가 끝날 때 끈다. */
-function workingChannels(props: Json): Channel[] {
-  return CHANNELS.filter((channel) => isChecked(props[WORK_PROP[channel]]));
+/**
+ * 요청이 접수된 채널.
+ * 배포 버튼이 상태를 ⚪ 대기로 바꾸고 웹훅을 보내므로, 대기이거나 이미 작업중인 채널이 처리 대상이다.
+ */
+function requestedChannels(props: Json): Channel[] {
+  return CHANNELS.filter((channel) => {
+    const name = selectName(props[RESULT_PROP[channel]]);
+    return name === STATUS_WAITING || name === STATUS_WORKING;
+  });
 }
 
 // ---------- 작업 잠금 ----------
@@ -675,15 +675,14 @@ async function releaseJob(cfg: Config, pageId: string, channel: Channel): Promis
 // 노션 버튼 웹훅은 페이지 URL 을 실어 보낼 수 없다(보낼 수 있는 건 DB 속성뿐).
 // 그래서 작업중 체크가 켜진 행을 서버가 직접 조회한다.
 
-const QUEUE_SCAN_ATTEMPTS = 5;
-const QUEUE_SCAN_INTERVAL_MS = 4000;
 const QUEUE_TIME_BUDGET_MS = 110000;
 
 async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
+  // 버튼이 상태를 ⚪ 대기로 바꾼 뒤 웹훅을 보내므로, 웹훅이 오지 않은 행은 대기로 남는다.
   const filter = {
     or: CHANNELS.map((channel) => ({
-      property: WORK_PROP[channel],
-      checkbox: { equals: true },
+      property: RESULT_PROP[channel],
+      select: { equals: STATUS_WAITING },
     })),
   };
   const body = JSON.stringify({ filter, page_size: 20 });
@@ -711,15 +710,10 @@ async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
   }
 }
 
-// 버튼 액션 순서가 어긋나 웹훅이 먼저 도착하면 그 시점엔 아직 체크가 안 켜져 있다.
-// 몇 초 간격으로 몇 번 더 확인해서 그 경우를 흡수한다. 접수 응답을 먼저 보내므로 오래 기다려도 된다.
+// 웹훅이 페이지를 실어 보내면 이 경로는 쓰이지 않는다.
+// 웹훅이 실패해 ⚪ 대기로 남은 행을 줍는 백업 경로다.
 async function findQueuedPageIds(cfg: Config): Promise<string[]> {
-  for (let attempt = 1; attempt <= QUEUE_SCAN_ATTEMPTS; attempt++) {
-    const ids = await queryQueuedPageIds(cfg);
-    if (ids.length > 0) return ids;
-    if (attempt < QUEUE_SCAN_ATTEMPTS) await sleep(QUEUE_SCAN_INTERVAL_MS);
-  }
-  return [];
+  return await queryQueuedPageIds(cfg);
 }
 
 // ---------- 발행 ----------
@@ -756,18 +750,18 @@ async function publishRow(
   const page = await notion(cfg, `/pages/${pageId}`);
   const props = (page.properties ?? {}) as Json;
 
-  const working = workingChannels(props);
+  const requested = requestedChannels(props);
   // only 는 웹훅 주소의 ?channel= 로 지정한 채널이다. 지정이 있으면 그것만 처리한다.
   // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
   const channels: Channel[] = only !== null
     ? [only]
-    : (working.length > 0 ? working : (dryRun ? [...CHANNELS] : []));
+    : (requested.length > 0 ? requested : (dryRun ? [...CHANNELS] : []));
   if (channels.length === 0) {
     return {
       ok: true,
       pageId,
       skipped: true,
-      reason: "작업중 체크가 켜져 있지 않습니다. '인스타그램 배포'나 '스레드 배포' 버튼을 누르세요.",
+      reason: "요청된 채널이 없습니다. '인스타그램 배포'나 '스레드 배포' 버튼을 누르세요.",
     };
   }
 
@@ -810,10 +804,9 @@ async function publishRow(
   }
 
   await updatePage(cfg, pageId, {
-    "발행 상태": { select: { name: "발행 중" } },
-    "date:처리 시작 시각:start": new Date().toISOString(),
-    "date:처리 시작 시각:is_datetime": 1,
+    "처리 시작 시각": { date: { start: new Date().toISOString() } },
   });
+  console.log("meta-publish 시작", pageId, channels.join(","), `이미지 ${sourceUrls.length}장`);
 
   // 이미지는 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
   let imageUrls: string[] | null = null;
@@ -828,7 +821,7 @@ async function publishRow(
     }
     try {
       await updatePage(cfg, pageId, {
-        [RESULT_PROP[channel]]: { select: { name: "진행중" } },
+        [RESULT_PROP[channel]]: { select: { name: STATUS_WORKING } },
       });
 
       // 한도 초과는 그 채널의 이미지 업로드와 발행보다 앞에서 막는다.
@@ -852,11 +845,11 @@ async function publishRow(
 
       succeeded = true;
       const patch: Json = {
-        [RESULT_PROP[channel]]: { select: { name: "성공" } },
-        [WORK_PROP[channel]]: { checkbox: false },
+        [RESULT_PROP[channel]]: { select: { name: STATUS_DONE } },
       };
       if (link) patch[LINK_PROP[channel]] = { url: link };
       await updatePage(cfg, pageId, patch);
+      console.log("meta-publish 완료", pageId, channel, link || "(링크 없음)");
       results[channel] = link || "성공";
     } catch (e) {
       const detail = message(e);
@@ -864,8 +857,7 @@ async function publishRow(
       results[channel] = detail;
       try {
         await updatePage(cfg, pageId, {
-          [RESULT_PROP[channel]]: { select: { name: "실패" } },
-          [WORK_PROP[channel]]: { checkbox: false },
+          [RESULT_PROP[channel]]: { select: { name: STATUS_ERROR } },
           "마지막 오류": {
             rich_text: [{ type: "text", text: { content: truncate(`${channel} — ${detail}`, 1800) } }],
           },
@@ -880,26 +872,15 @@ async function publishRow(
 
   if (succeeded) {
     await updatePage(cfg, pageId, {
-      "date:발행 시각:start": new Date().toISOString(),
-      "date:발행 시각:is_datetime": 1,
+      "발행 시각": { date: { start: new Date().toISOString() } },
     });
   }
 
-  // 다시 읽어서 판단한다. 다른 실행이 아직 붙잡고 있는 채널이 남아 있으면 전체 상태를 끝내지 않는다.
-  const after = ((await notion(cfg, `/pages/${pageId}`)).properties ?? {}) as Json;
-  const stillWorking = workingChannels(after);
-  const states = CHANNELS.map((channel) => selectName(after[RESULT_PROP[channel]]));
-
-  const summary: Json = {};
-  if (stillWorking.length > 0) {
-    summary["발행 상태"] = { select: { name: "발행 중" } };
-  } else if (failures.length > 0 || states.includes("실패")) {
-    summary["발행 상태"] = { select: { name: "발행 실패" } };
-  } else {
-    summary["발행 상태"] = { select: { name: "발행 완료" } };
-    summary["마지막 오류"] = { rich_text: [] };
+  // 실패가 없으면 지난 오류 메시지를 비운다.
+  // 전체 요약은 '실시간 처리 상태' 수식이 채널 상태를 읽어 계산하므로 함수가 따로 쓰지 않는다.
+  if (failures.length === 0) {
+    await updatePage(cfg, pageId, { "마지막 오류": { rich_text: [] } });
   }
-  await updatePage(cfg, pageId, summary);
 
   if (failures.length > 0) {
     const note = succeeded
@@ -915,7 +896,6 @@ async function publishRow(
     imageCount: imageUrls ? imageUrls.length : 0,
     results,
     failures,
-    status: selectName(after["발행 상태"]),
   };
 }
 
@@ -931,7 +911,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
       processed: 0,
       results: [],
       remaining: [],
-      message: "작업중 체크가 켜진 컨텐츠가 없습니다.",
+      message: "요청(⚪ 대기)으로 남아 있는 컨텐츠가 없습니다.",
     };
   }
 
@@ -976,6 +956,12 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string): Promise<string> {
   const explicit = readTarget(payload, requestUrl);
   if (explicit !== "") return parsePageId(explicit);
+
+  // 노션 자동화 웹훅은 실행된 페이지를 data 에 통째로 실어 보낸다. 이게 가장 확실한 단서다.
+  const data = (payload.data ?? {}) as Json;
+  if (data.object === "page" && typeof data.id === "string") {
+    return parsePageId(data.id as string);
+  }
 
   const seen = new Set<string>();
   for (const candidate of collectPageCandidates(payload)) {
@@ -1054,12 +1040,16 @@ Deno.serve(async (req) => {
     ? publishRow(cfg, pageId, dryRun, hint)
     : runQueue(cfg, dryRun);
 
-  // 페이지를 지정한 수동 호출이나 ?wait=1 은 결과를 그대로 돌려준다.
-  if (pageId !== "" || wait) {
+  // 수동 호출(?pageId=·?pageUrl=·?url=)이나 ?wait=1 만 결과를 그대로 돌려준다.
+  // 버튼 웹훅은 본문에 페이지가 실려 오므로 여기서 걸리면 10초 제한에 걸린다. 항상 202 로 접수만 알린다.
+  const manual = reqUrl.searchParams.has("pageId") || reqUrl.searchParams.has("pageUrl") ||
+    reqUrl.searchParams.has("url");
+  if (wait || manual) {
     try {
       const body = await task;
       return json(body, body.ok === false ? 500 : 200);
     } catch (e) {
+      console.error("동기 실행 실패", message(e));
       return json({ ok: false, pageId, error: message(e) }, 500);
     }
   }
@@ -1073,7 +1063,7 @@ Deno.serve(async (req) => {
     return json({
       ok: true,
       accepted: true,
-      message: "접수했습니다. 실제 결과는 페이지의 발행 상태와 실시간 처리 상태로 확인하세요.",
+      message: "접수했습니다. 실제 결과는 페이지의 채널 상태와 실시간 처리 상태로 확인하세요.",
     }, 202);
   }
 

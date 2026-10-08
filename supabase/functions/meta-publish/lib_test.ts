@@ -12,13 +12,11 @@ import {
   extractImageUrls,
   isImageUrl,
   needsRefresh,
-  normalizeChannels,
   channelHint,
   collectPageCandidates,
   parsePageId,
   readTarget,
   resolveRedirectUri,
-  shouldPublish,
   sortCuts,
   threadsAuthorizeUrl,
   truncate,
@@ -67,25 +65,6 @@ Deno.test("buildCaption: 캡션 우선, 비면 대본, 고정 멘트는 뒤에 �
   assertEquals(buildCaption("", "대본 본문", ""), "대본 본문");
   assertEquals(buildCaption("", "", "고정 멘트"), "고정 멘트");
   assertEquals(buildCaption("", "", ""), "");
-});
-
-Deno.test("normalizeChannels: 비면 두 채널, 지정하면 지정한 채널만", () => {
-  assertEquals(normalizeChannels(undefined), ["인스타그램", "스레드"]);
-  assertEquals(normalizeChannels([]), ["인스타그램", "스레드"]);
-  assertEquals(normalizeChannels(["스레드"]), ["스레드"]);
-  assertEquals(normalizeChannels(["스레드", "인스타그램"]), ["인스타그램", "스레드"]);
-  assertEquals(normalizeChannels(["알 수 없음"]), ["인스타그램", "스레드"]);
-});
-
-Deno.test("shouldPublish: '발행 대기'일 때만 발행한다", () => {
-  assertEquals(shouldPublish("발행 대기"), true);
-  assertEquals(shouldPublish(" 발행 대기 "), true);
-  assertEquals(shouldPublish("미발행"), false);
-  assertEquals(shouldPublish("발행 중"), false);
-  assertEquals(shouldPublish("발행 완료"), false);
-  assertEquals(shouldPublish("발행 실패"), false);
-  assertEquals(shouldPublish(""), false);
-  assertEquals(shouldPublish(undefined), false);
 });
 
 Deno.test("assertCarouselSize: 장수 경계에서 막는다", () => {
