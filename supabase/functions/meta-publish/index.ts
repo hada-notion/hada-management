@@ -1,14 +1,24 @@
-// META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 카드뉴스를 발행한다.
+// META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 발행한다.
+//
+// 발행 소스는 컨텐츠 DB 의 '형식'으로 정한다.
+//   카드뉴스        → 컷(프롬프트)의 미리보기 이미지 캐러셀
+//   이미지          → 컨텐츠 '미리보기' 한 장
+//   영상-세로(9:16) → 컨텐츠 '미리보기' 영상 (릴스)
+//   영상-가로(16:9) → 컨텐츠 '미리보기' 영상 (릴스)
+//   카피            → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
 //
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
 //   본문에 페이지 지정(pageUrl/pageId/url/id)이 있거나 본문 어딘가에 노션 페이지 주소가 실려 있으면
-//   그 페이지만 처리하고 결과를 그대로 돌려준다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
-//   지정이 없으면 큐 모드다. '인스타그램 작업중'·'스레드 작업중' 체크가 켜진 행을 찾아 처리한다.
+//   그 페이지만 처리한다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
+//   지정이 없으면 상태가 ⚪ 대기인 채널을 처리하고, 그것도 없으면 큐 조회로 넘어간다.
 //
-// 큐 모드는 즉시 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
+// 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
 // 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
 // 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'와 '실시간 처리 상태' 수식으로 확인한다.
 // 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
+//
+// 오류 문구에는 비밀값이 섞여 들어올 수 있다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
+// 노션에 쓰기 전에 summarizeApiError 로 요약하고 maskSecrets 로 가린다.
 //
 // 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
 // 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
@@ -16,6 +26,7 @@
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
 
 import {
+  FORMAT_NAMES,
   IG_CAPTION_LIMIT,
   IG_CAROUSEL_MAX,
   IG_CAROUSEL_MIN,
@@ -27,27 +38,41 @@ import {
   assertCarouselSize,
   buildCaption,
   channelHint,
+  cleanToken,
   collectPageCandidates,
   captionLimitError,
   contentTypeFor,
   detectImageType,
+  detectVideoType,
   expiresAtFrom,
   extensionFor,
   hexPreview,
   extractImageUrls,
+  extractVideoUrls,
+  maskSecrets,
+  mediaKindFor,
   needsRefresh,
   parsePageId,
   readTarget,
   resolveRedirectUri,
   sortCuts,
+  summarizeApiError,
   threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
+import type { MediaKind } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
 const IG_CONTAINER_POLL_INTERVAL_MS = 3000;
+// 영상은 메타가 처리하는 데 시간이 걸린다. 다만 함수 실행 한도(150초)를 넘기면
+// 백그라운드 작업이 중간에 잘리므로, 기다리는 시간을 한도 안쪽으로 묶어둔다.
+const IG_VIDEO_POLL_ATTEMPTS = 12;
+const IG_VIDEO_POLL_INTERVAL_MS = 6000;
+const THREADS_CONTAINER_POLL_ATTEMPTS = 10;
+const THREADS_CONTAINER_POLL_INTERVAL_MS = 4000;
 const COMMENT_LIMIT = 1900;
+const MIN_TOKEN_LENGTH = 40;
 
 type Json = Record<string, any>;
 type Config = ReturnType<typeof buildConfig>;
@@ -63,6 +88,39 @@ function requiredEnv(name: string): string {
   const value = optionalEnv(name);
   if (value === "") throw new Error(`환경값 ${name}이(가) 설정되지 않았습니다.`);
   return value;
+}
+
+/**
+ * 환경값 토큰을 정리한다.
+ * 붙여넣기 사고로 값에 따옴표나 JSON 조각이 섞이면 토큰 부분만 남기고 로그로 알린다.
+ */
+function cleanEnvToken(name: string): string {
+  const raw = optionalEnv(name);
+  const token = cleanToken(raw);
+  if (raw !== "" && raw !== token) {
+    console.warn(`${name} 값에 토큰 외 문자(따옴표·중괄호 등)가 섞여 있어 토큰 부분만 사용합니다.`);
+  }
+  return token;
+}
+
+function assertToken(name: string, value: string): string {
+  if (value === "") throw new Error(`환경값 ${name}이(가) 설정되지 않았습니다.`);
+  if (value.length < MIN_TOKEN_LENGTH) {
+    throw new Error(
+      `${name} 값이 토큰으로 보이지 않습니다(길이 ${value.length}). 토큰 문자열만 저장했는지 확인하세요.`,
+    );
+  }
+  return value;
+}
+
+/** 오류 문구에서 지워야 할 비밀값 목록. 값 자체는 로그에도 남기지 않는다. */
+function secretsOf(cfg: Config): string[] {
+  return [cfg.igToken, cfg.threadsToken, cfg.threadsAppSecret, cfg.notionToken, cfg.storageKey, cfg.adminSecret];
+}
+
+/** API 오류를 요약하고 비밀값을 지운 뒤 예외로 만든다. 응답을 통째로 남기지 않는 게 요점이다. */
+function apiError(cfg: Config, label: string, status: number, text: string, limit = 400): Error {
+  return new Error(`${label} ${status}: ${maskSecrets(summarizeApiError(text, limit), secretsOf(cfg))}`);
 }
 
 function buildConfig() {
@@ -83,11 +141,11 @@ function buildConfig() {
     metaVersion: optionalEnv("META_GRAPH_VERSION") || "v26.0",
     igApiBase: optionalEnv("IG_API_BASE") || "https://graph.facebook.com",
     igUserId: optionalEnv("IG_USER_ID"),
-    igToken: optionalEnv("IG_ACCESS_TOKEN"),
+    igToken: cleanEnvToken("IG_ACCESS_TOKEN"),
     threadsVersion: optionalEnv("THREADS_GRAPH_VERSION") || "v1.0",
     threadsApiBase: optionalEnv("THREADS_API_BASE") || "https://graph.threads.net",
     threadsUserId: optionalEnv("THREADS_USER_ID"),
-    threadsToken: optionalEnv("THREADS_ACCESS_TOKEN"),
+    threadsToken: cleanEnvToken("THREADS_ACCESS_TOKEN"),
     threadsAppId: optionalEnv("THREADS_APP_ID"),
     threadsAppSecret: optionalEnv("THREADS_APP_SECRET"),
     threadsOauthBase: optionalEnv("THREADS_OAUTH_BASE") || "https://graph.threads.com",
@@ -116,7 +174,7 @@ async function notion(cfg: Config, path: string, init: RequestInit = {}): Promis
     },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`노션 API ${res.status} (${path}): ${text.slice(0, 400)}`);
+  if (!res.ok) throw apiError(cfg, `노션 API ${path}`, res.status, text);
   return text ? JSON.parse(text) : {};
 }
 
@@ -158,30 +216,51 @@ async function addComment(cfg: Config, pageId: string, content: string): Promise
   });
 }
 
-// ---------- 이미지 공개 호스팅 ----------
+// ---------- 미디어 공개 호스팅 ----------
+// 메타는 공개 URL 로만 파일을 가져간다. 노션 파일 주소는 만료되므로 우리 버킷에 다시 올려 쓴다.
 
-async function uploadImage(cfg: Config, pageId: string, index: number, sourceUrl: string): Promise<string> {
+type MediaRole = "image" | "video";
+
+async function uploadMedia(
+  cfg: Config,
+  pageId: string,
+  index: number,
+  sourceUrl: string,
+  role: MediaRole,
+): Promise<string> {
   if (!cfg.storageUrl || !cfg.storageKey) {
-    throw new Error("이미지 저장소 설정(SB_URL, SB_SERVICE_ROLE_KEY)이 없습니다.");
+    throw new Error("미디어 저장소 설정(SB_URL, SB_SERVICE_ROLE_KEY)이 없습니다.");
   }
 
   const download = await fetch(sourceUrl);
-  if (!download.ok) throw new Error(`이미지 내려받기 실패(${download.status})`);
+  if (!download.ok) throw new Error(`파일 내려받기 실패(${download.status})`);
   const bytes = new Uint8Array(await download.arrayBuffer());
-  if (bytes.byteLength === 0) throw new Error("이미지 파일이 비어 있습니다.");
+  if (bytes.byteLength === 0) throw new Error("파일이 비어 있습니다.");
 
   // 노션은 업로드 파일을 binary/octet-stream 으로 돌려주기도 한다.
   // 그래서 content-type 을 믿지 않고 파일 앞바이트로 실제 형식을 판별한다.
   const headerType = (download.headers.get("content-type") ?? "").toLowerCase().split(";")[0].trim();
-  const detected = detectImageType(bytes);
-  if (!detected && !headerType.startsWith("image/")) {
-    throw new Error(
-      `이미지가 아닌 파일입니다(content-type: ${headerType || "없음"}, 앞바이트: ${
-        hexPreview(bytes)
-      }, 크기: ${bytes.byteLength}바이트). 영상이나 다른 형식은 아직 발행할 수 없습니다.`,
-    );
+  const detail = `content-type: ${headerType || "없음"}, 앞바이트: ${hexPreview(bytes)}, 크기: ${bytes.byteLength}바이트`;
+
+  let ext: string;
+  if (role === "video") {
+    const detected = detectVideoType(bytes);
+    if (!detected && !headerType.startsWith("video/")) {
+      throw new Error(`영상 파일이 아닙니다(${detail}). '형식'과 '미리보기' 파일을 확인하세요.`);
+    }
+    ext = detected ?? extensionFor(headerType, sourceUrl);
+    if (!["mp4", "mov", "webm"].includes(ext)) {
+      throw new Error(`영상 형식을 알아내지 못했습니다(${detail}). mp4 로 다시 올려주세요.`);
+    }
+  } else {
+    const detected = detectImageType(bytes);
+    if (!detected && !headerType.startsWith("image/")) {
+      throw new Error(
+        `이미지가 아닌 파일입니다(${detail}). 영상은 '형식'을 영상-세로(9:16)나 영상-가로(16:9)로 두세요.`,
+      );
+    }
+    ext = detected ?? extensionFor(headerType, sourceUrl);
   }
-  const ext = detected ?? extensionFor(headerType, sourceUrl);
   const contentType = contentTypeFor(ext);
 
   const path = `${pageId}/${String(index + 1).padStart(2, "0")}.${ext}`;
@@ -196,8 +275,7 @@ async function uploadImage(cfg: Config, pageId: string, index: number, sourceUrl
     body: bytes,
   });
   if (!upload.ok) {
-    const detail = await upload.text();
-    throw new Error(`이미지 업로드 실패(${upload.status}): ${detail.slice(0, 300)}`);
+    throw apiError(cfg, "미디어 업로드 실패", upload.status, await upload.text(), 300);
   }
   return `${cfg.storageUrl}/storage/v1/object/public/${cfg.bucket}/${path}`;
 }
@@ -238,8 +316,7 @@ async function readToken(cfg: Config, channel: string): Promise<TokenRow | null>
       `&select=channel,access_token,user_id,expires_at,updated_at&limit=1`,
   );
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`토큰 저장소 조회 실패(${res.status}): ${detail.slice(0, 200)}`);
+    throw apiError(cfg, "토큰 저장소 조회 실패", res.status, await res.text(), 200);
   }
   const rows = (await res.json()) as TokenRow[];
   return rows.length > 0 ? rows[0] : null;
@@ -255,8 +332,7 @@ async function saveToken(cfg: Config, row: TokenRow): Promise<void> {
     body: JSON.stringify([row]),
   });
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`토큰 저장 실패(${res.status}): ${detail.slice(0, 200)}`);
+    throw apiError(cfg, "토큰 저장 실패", res.status, await res.text(), 200);
   }
 }
 
@@ -275,12 +351,14 @@ async function igRequest(cfg: Config, path: string, init: RequestInit = {}): Pro
   if (!cfg.igUserId || !cfg.igToken) {
     throw new Error("인스타그램 설정(IG_USER_ID, IG_ACCESS_TOKEN)이 없습니다.");
   }
+  // 값이 오염된 채로 저장되면 메타가 "Malformed access token" 으로 거절한다. 그 전에 우리가 먼저 알려준다.
+  assertToken("IG_ACCESS_TOKEN", cfg.igToken);
   const res = await fetch(`${cfg.igApiBase}/${cfg.metaVersion}/${path}`, {
     ...init,
     headers: { "Authorization": `Bearer ${cfg.igToken}`, ...(init.headers ?? {}) },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`인스타 API ${res.status}: ${text.slice(0, 400)}`);
+  if (!res.ok) throw apiError(cfg, "인스타 API", res.status, text);
   return text ? JSON.parse(text) : {};
 }
 
@@ -293,17 +371,25 @@ const igPost = (cfg: Config, path: string, params: Json) =>
 
 const igGet = (cfg: Config, path: string) => igRequest(cfg, path);
 
-async function waitForIgContainer(cfg: Config, containerId: string): Promise<void> {
-  for (let attempt = 0; attempt < IG_CONTAINER_POLL_ATTEMPTS; attempt++) {
+async function waitForIgContainer(
+  cfg: Config,
+  containerId: string,
+  attempts = IG_CONTAINER_POLL_ATTEMPTS,
+  intervalMs = IG_CONTAINER_POLL_INTERVAL_MS,
+): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     const info = await igGet(cfg, `${containerId}?fields=status_code,status`);
     const status = info.status_code ?? info.status;
     if (status === "FINISHED" || status === "PUBLISHED") return;
     if (status === "ERROR" || status === "EXPIRED") {
-      throw new Error(`인스타 컨테이너 처리 실패: ${JSON.stringify(info).slice(0, 300)}`);
+      const detail = maskSecrets(JSON.stringify(info), secretsOf(cfg));
+      throw new Error(`인스타 컨테이너 처리 실패: ${truncate(detail, 300)}`);
     }
-    await sleep(IG_CONTAINER_POLL_INTERVAL_MS);
+    await sleep(intervalMs);
   }
-  throw new Error("인스타 컨테이너 처리 대기 시간이 초과되었습니다.");
+  throw new Error(
+    "메타가 아직 파일을 처리하는 중입니다. 올라간 글은 없으니 잠시 뒤 같은 버튼을 다시 누르면 새로 처리합니다.",
+  );
 }
 
 async function publishInstagram(cfg: Config, imageUrls: string[], caption: string): Promise<string> {
@@ -330,6 +416,25 @@ async function publishInstagram(cfg: Config, imageUrls: string[], caption: strin
 
   await waitForIgContainer(cfg, containerId);
   const published = await igPost(cfg, `${cfg.igUserId}/media_publish`, { creation_id: containerId });
+  const info = await igGet(cfg, `${published.id}?fields=permalink`);
+  return info.permalink ?? "";
+}
+
+/**
+ * 릴스 발행. 영상은 컨테이너를 만든 뒤 메타가 처리할 때까지 기다려야 발행할 수 있다.
+ * 처리 시간이 길어 함수 한도에 걸리면 여기서 멈추는데, 그때는 media_publish 를 부르지 않았으므로
+ * 다시 실행해도 같은 글이 두 번 올라가지 않는다.
+ */
+async function publishInstagramReel(cfg: Config, videoUrl: string, caption: string): Promise<string> {
+  const text = truncate(caption, IG_CAPTION_LIMIT);
+  const container = await igPost(cfg, `${cfg.igUserId}/media`, {
+    media_type: "REELS",
+    video_url: videoUrl,
+    caption: text,
+    share_to_feed: "true",
+  });
+  await waitForIgContainer(cfg, container.id, IG_VIDEO_POLL_ATTEMPTS, IG_VIDEO_POLL_INTERVAL_MS);
+  const published = await igPost(cfg, `${cfg.igUserId}/media_publish`, { creation_id: container.id });
   const info = await igGet(cfg, `${published.id}?fields=permalink`);
   return info.permalink ?? "";
 }
@@ -372,9 +477,9 @@ async function threadsOauthRequest(
         : await fetch(`${base}${path}?${formBody(params).toString()}`);
       const text = await res.text();
       if (res.ok) return text ? JSON.parse(text) : {};
-      lastError = `스레드 OAuth ${res.status}: ${text.slice(0, 300)}`;
+      lastError = `스레드 OAuth ${res.status}: ${maskSecrets(summarizeApiError(text, 300), secretsOf(cfg))}`;
     } catch (e) {
-      lastError = message(e);
+      lastError = maskSecrets(message(e), secretsOf(cfg));
     }
   }
   throw new Error(lastError || "스레드 OAuth 요청에 실패했습니다.");
@@ -431,7 +536,7 @@ async function resolveThreadsAuth(cfg: Config): Promise<ThreadsAuth> {
     if (cfg.threadsUserId === "" || cfg.threadsToken === "") {
       throw new Error("스레드 인증 정보가 없습니다. 브라우저에서 스레드 인증을 먼저 진행하세요.");
     }
-    return { userId: cfg.threadsUserId, token: cfg.threadsToken };
+    return { userId: cfg.threadsUserId, token: assertToken("THREADS_ACCESS_TOKEN", cfg.threadsToken) };
   }
 
   const now = Date.now();
@@ -440,7 +545,7 @@ async function resolveThreadsAuth(cfg: Config): Promise<ThreadsAuth> {
     throw new Error("스레드 토큰이 만료되었습니다. 브라우저에서 스레드 인증을 다시 진행하세요.");
   }
 
-  let token = row.access_token;
+  let token = cleanToken(row.access_token);
   if (needsRefresh(Date.parse(row.updated_at), now, THREADS_REFRESH_AFTER_DAYS)) {
     try {
       const refreshed = await refreshThreadsToken(cfg, token);
@@ -460,7 +565,7 @@ async function resolveThreadsAuth(cfg: Config): Promise<ThreadsAuth> {
     }
   }
 
-  return { userId: row.user_id ?? cfg.threadsUserId, token };
+  return { userId: row.user_id ?? cfg.threadsUserId, token: assertToken("스레드 토큰", token) };
 }
 
 /** 브라우저로 열어 승인을 시작하는 안내 페이지. 링크만 보여주므로 인증이 필요 없다. */
@@ -534,7 +639,7 @@ async function threadsFetch(
     headers: { "Authorization": `Bearer ${token}`, ...(init.headers ?? {}) },
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`스레드 API ${res.status}: ${text.slice(0, 400)}`);
+  if (!res.ok) throw apiError(cfg, "스레드 API", res.status, text);
   return text ? JSON.parse(text) : {};
 }
 
@@ -548,27 +653,67 @@ const threadsPost = (cfg: Config, auth: ThreadsAuth, path: string, params: Json)
 const threadsGet = (cfg: Config, auth: ThreadsAuth, path: string) =>
   threadsFetch(cfg, auth.token, path);
 
+/**
+ * 발행 소스. 형식에 따라 컷 이미지 캐러셀 / 미리보기 한 장 / 미리보기 영상 / 글만 중 하나가 된다.
+ * 인스타그램은 글만 올리는 걸 지원하지 않으므로 text 는 스레드 전용이다.
+ */
+type MediaPlan =
+  | { kind: "images"; urls: string[] }
+  | { kind: "video"; url: string }
+  | { kind: "text" };
+
+async function waitForThreadsContainer(
+  cfg: Config,
+  auth: ThreadsAuth,
+  containerId: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < THREADS_CONTAINER_POLL_ATTEMPTS; attempt++) {
+    const info = await threadsGet(cfg, auth, `${containerId}?fields=status,error_message`);
+    const status = String(info.status ?? "").toUpperCase();
+    if (status === "FINISHED" || status === "PUBLISHED") return;
+    if (status === "ERROR" || status === "EXPIRED") {
+      const detail = maskSecrets(String(info.error_message ?? JSON.stringify(info)), secretsOf(cfg));
+      throw new Error(`스레드 컨테이너 처리 실패: ${truncate(detail, 300)}`);
+    }
+    await sleep(THREADS_CONTAINER_POLL_INTERVAL_MS);
+  }
+  throw new Error(
+    "스레드가 아직 파일을 처리하는 중입니다. 올라간 글은 없으니 잠시 뒤 같은 버튼을 다시 누르면 새로 처리합니다.",
+  );
+}
+
 async function publishThreads(
   cfg: Config,
   auth: ThreadsAuth,
-  imageUrls: string[],
+  media: MediaPlan,
   caption: string,
 ): Promise<string> {
   const text = truncate(caption, THREADS_TEXT_LIMIT);
   const uid = auth.userId;
 
   let containerId: string;
-  if (imageUrls.length === 1) {
+  if (media.kind === "text") {
+    const container = await threadsPost(cfg, auth, `${uid}/threads`, { media_type: "TEXT", text });
+    containerId = container.id;
+  } else if (media.kind === "video") {
+    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
+      media_type: "VIDEO",
+      video_url: media.url,
+      text,
+    });
+    containerId = container.id;
+    await waitForThreadsContainer(cfg, auth, containerId);
+  } else if (media.urls.length === 1) {
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "IMAGE",
-      image_url: imageUrls[0],
+      image_url: media.urls[0],
       text,
     });
     containerId = container.id;
   } else {
-    assertCarouselSize(imageUrls.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
+    assertCarouselSize(media.urls.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
     const children: string[] = [];
-    for (const url of imageUrls) {
+    for (const url of media.urls) {
       const child = await threadsPost(cfg, auth, `${uid}/threads`, {
         media_type: "IMAGE",
         image_url: url,
@@ -718,7 +863,8 @@ async function findQueuedPageIds(cfg: Config): Promise<string[]> {
 
 // ---------- 발행 ----------
 
-async function collectImageUrls(cfg: Config, props: Json): Promise<string[]> {
+/** 컷(프롬프트)에 연결된 컷들의 미리보기 이미지를 컷 순서대로 모은다. */
+async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> {
   const cutIds = relationIds(props["컷(프롬프트)"]);
   if (cutIds.length === 0) {
     throw new Error("'컷(프롬프트)' 관계가 비어 있습니다. 발행할 컷을 먼저 연결하세요.");
@@ -741,6 +887,52 @@ async function collectImageUrls(cfg: Config, props: Json): Promise<string[]> {
   return sourceUrls;
 }
 
+/** 컨텐츠 페이지의 '미리보기' 파일. 영상·이미지·카피처럼 한 덩어리인 형식에서 쓴다. */
+function previewFiles(props: Json): any[] {
+  return (props["미리보기"]?.files ?? []) as any[];
+}
+
+/**
+ * '형식'에 따라 발행 소스를 정한다.
+ * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 카피는 글만 올린다.
+ */
+async function collectSources(cfg: Config, props: Json, kind: MediaKind): Promise<MediaPlan> {
+  if (kind === "carousel") {
+    return { kind: "images", urls: await collectCutImageUrls(cfg, props) };
+  }
+  if (kind === "image") {
+    const urls = extractImageUrls(previewFiles(props));
+    if (urls.length === 0) {
+      throw new Error("'미리보기'에 이미지 파일이 없습니다. 발행할 이미지를 올려주세요.");
+    }
+    return { kind: "images", urls: urls.slice(0, 1) };
+  }
+  if (kind === "video") {
+    const urls = extractVideoUrls(previewFiles(props));
+    if (urls.length === 0) {
+      throw new Error("'미리보기'에 영상 파일이 없습니다. mp4 파일을 올려주세요.");
+    }
+    if (urls.length > 1) {
+      console.warn("'미리보기'에 영상이 여러 개라 첫 번째만 발행합니다.");
+    }
+    return { kind: "video", url: urls[0] };
+  }
+  return { kind: "text" };
+}
+
+/** 요청한 채널들이 같은 파일을 쓰도록 한 번만 올린다. */
+async function uploadPlan(cfg: Config, pageId: string, plan: MediaPlan): Promise<MediaPlan> {
+  if (plan.kind === "text") return plan;
+  if (plan.kind === "video") {
+    return { kind: "video", url: await uploadMedia(cfg, pageId, 0, plan.url, "video") };
+  }
+  const urls: string[] = [];
+  for (let index = 0; index < plan.urls.length; index++) {
+    urls.push(await uploadMedia(cfg, pageId, index, plan.urls[index], "image"));
+  }
+  return { kind: "images", urls };
+}
+
 async function publishRow(
   cfg: Config,
   pageId: string,
@@ -757,15 +949,31 @@ async function publishRow(
     ? [only]
     : (requested.length > 0 ? requested : (dryRun ? [...CHANNELS] : []));
   if (channels.length === 0) {
-    return {
-      ok: true,
-      pageId,
-      skipped: true,
-      reason: "요청된 채널이 없습니다. '인스타그램 배포'나 '스레드 배포' 버튼을 누르세요.",
-    };
+    // 버튼 설정이 어긋나면 여기로 온다. 상태를 ⚪ 대기로 바꾸지 않았거나
+    // 웹훅 주소에 ?channel=instagram|threads 가 빠진 경우다.
+    // 예전에는 아무 흔적 없이 끝나서 원인을 찾기 어려웠다. 이제는 로그와 안내를 남긴다.
+    console.log("meta-publish 건너뜀", pageId, "요청된 채널 없음");
+    const reason = "요청된 채널이 없어 아무것도 하지 않았습니다. " +
+      "배포 버튼이 상태를 ⚪ 대기로 바꾸는지, 웹훅 주소에 ?channel=instagram 또는 ?channel=threads 가 있는지 확인하세요.";
+    if (!dryRun && only === null) {
+      try {
+        await addComment(cfg, pageId, `META 업로드 안내\n\n${reason}`);
+      } catch (e) {
+        console.error("안내 코멘트 실패", message(e));
+      }
+    }
+    return { ok: true, pageId, skipped: true, reason };
   }
 
-  const sourceUrls = await collectImageUrls(cfg, props);
+  const format = selectName(props["형식"]);
+  const kind = mediaKindFor(format);
+  if (kind === null) {
+    throw new Error(
+      `'형식' 값을 확인하세요. 지금 값: '${format || "비어 있음"}'. 쓸 수 있는 값: ${FORMAT_NAMES.join(" / ")}`,
+    );
+  }
+
+  const plan = await collectSources(cfg, props, kind);
   const caption = buildCaption(
     richText(props["캡션"]),
     richText(props["대본"]),
@@ -775,12 +983,9 @@ async function publishRow(
     throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
   }
 
-  // 테스트 실행: 이미지 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
+  // 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
   if (dryRun) {
-    const imageUrls: string[] = [];
-    for (let index = 0; index < sourceUrls.length; index++) {
-      imageUrls.push(await uploadImage(cfg, pageId, index, sourceUrls[index]));
-    }
+    const uploaded = await uploadPlan(cfg, pageId, plan);
     let threadsAuthNote = "요청 채널에 스레드가 없습니다.";
     if (channels.includes("스레드")) {
       try {
@@ -794,8 +999,9 @@ async function publishRow(
       dryRun: true,
       pageId,
       channels,
-      imageCount: imageUrls.length,
-      images: imageUrls,
+      format,
+      mediaKind: kind,
+      media: uploaded,
       caption,
       captionLength: caption.length,
       threadsAuth: threadsAuthNote,
@@ -806,10 +1012,10 @@ async function publishRow(
   await updatePage(cfg, pageId, {
     "처리 시작 시각": { date: { start: new Date().toISOString() } },
   });
-  console.log("meta-publish 시작", pageId, channels.join(","), `이미지 ${sourceUrls.length}장`);
+  console.log("meta-publish 시작", pageId, channels.join(","), `${format} · ${kind}`);
 
-  // 이미지는 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
-  let imageUrls: string[] | null = null;
+  // 파일은 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
+  let uploaded: MediaPlan | null = null;
   const results: Json = {};
   const failures: string[] = [];
   let succeeded = false;
@@ -824,23 +1030,25 @@ async function publishRow(
         [RESULT_PROP[channel]]: { select: { name: STATUS_WORKING } },
       });
 
-      // 한도 초과는 그 채널의 이미지 업로드와 발행보다 앞에서 막는다.
+      // 한도 초과는 그 채널의 업로드와 발행보다 앞에서 막는다.
       const limitError = captionLimitError(caption, [channel]);
       if (limitError) throw new Error(limitError);
 
-      if (!imageUrls) {
-        const uploaded: string[] = [];
-        for (let index = 0; index < sourceUrls.length; index++) {
-          uploaded.push(await uploadImage(cfg, pageId, index, sourceUrls[index]));
-        }
-        imageUrls = uploaded;
+      // 인스타그램은 미디어 없는 발행을 지원하지 않는다. 이 채널만 실패로 남기고 스레드는 계속 간다.
+      if (kind === "text" && channel === "인스타그램") {
+        throw new Error("'카피' 형식은 미디어가 없어 인스타그램에 발행할 수 없습니다. '스레드 배포'를 쓰세요.");
       }
+
+      if (!uploaded) uploaded = await uploadPlan(cfg, pageId, plan);
+      const media: MediaPlan = uploaded;
 
       let link = "";
       if (channel === "인스타그램") {
-        link = await publishInstagram(cfg, imageUrls, caption);
+        link = media.kind === "video"
+          ? await publishInstagramReel(cfg, media.url, caption)
+          : await publishInstagram(cfg, media.kind === "images" ? media.urls : [], caption);
       } else {
-        link = await publishThreads(cfg, await resolveThreadsAuth(cfg), imageUrls, caption);
+        link = await publishThreads(cfg, await resolveThreadsAuth(cfg), media, caption);
       }
 
       succeeded = true;
@@ -852,7 +1060,8 @@ async function publishRow(
       console.log("meta-publish 완료", pageId, channel, link || "(링크 없음)");
       results[channel] = link || "성공";
     } catch (e) {
-      const detail = message(e);
+      // 메타는 거절한 토큰을 오류 문구에 되돌려준다. 노션에 쓰기 전에 한 번 더 가린다.
+      const detail = maskSecrets(message(e), secretsOf(cfg));
       failures.push(`${channel} — ${detail}`);
       results[channel] = detail;
       try {
@@ -886,14 +1095,16 @@ async function publishRow(
     const note = succeeded
       ? "성공한 채널은 그대로 두었습니다. 실패한 채널만 해당 버튼을 다시 눌러 재시도하세요."
       : "발행된 채널이 없습니다. 원인을 고친 뒤 다시 실행하세요.";
-    await addComment(cfg, pageId, `META 업로드 실패\n\n${failures.join("\n")}\n\n${note}`);
+    const detail = maskSecrets(failures.join("\n"), secretsOf(cfg));
+    await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}\n\n${note}`);
   }
 
   return {
     ok: failures.length === 0,
     pageId,
     channels,
-    imageCount: imageUrls ? imageUrls.length : 0,
+    format,
+    mediaKind: kind,
     results,
     failures,
   };

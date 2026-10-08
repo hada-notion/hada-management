@@ -247,6 +247,9 @@ export function contentTypeFor(ext: string): string {
   if (ext === "jpg") return "image/jpeg";
   if (ext === "webp") return "image/webp";
   if (ext === "gif") return "image/gif";
+  if (ext === "mp4") return "video/mp4";
+  if (ext === "mov") return "video/quicktime";
+  if (ext === "webm") return "video/webm";
   return "application/octet-stream";
 }
 
@@ -263,6 +266,108 @@ export function extensionFor(contentType: string, url: string): string {
   if (type.includes("jpeg") || type.includes("jpg")) return "jpg";
   if (type.includes("webp")) return "webp";
   if (type.includes("gif")) return "gif";
-  const match = url.toLowerCase().split("?")[0].match(/\.(png|jpe?g|webp|gif)$/);
+  if (type.includes("mp4")) return "mp4";
+  if (type.includes("quicktime") || type.includes("mov")) return "mov";
+  if (type.includes("webm")) return "webm";
+  const match = url.toLowerCase().split("?")[0].match(/\.(png|jpe?g|webp|gif|mp4|mov|webm)$/);
   return match ? match[1].replace("jpeg", "jpg") : "png";
+}
+
+export type VideoExt = "mp4" | "webm";
+
+/** 영상도 content-type 을 믿지 않고 앞바이트로 판별한다. 노션은 octet-stream 으로 돌려주기도 한다. */
+export function detectVideoType(bytes: Uint8Array): VideoExt | null {
+  const b = bytes;
+  if (b.length >= 8 && String.fromCharCode(b[4], b[5], b[6], b[7]) === "ftyp") return "mp4";
+  if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return "webm";
+  return null;
+}
+
+/** 컷 이미지와 짝을 이루는 판별. 이미지 발행 경로에서 영상 파일을 골라내는 데 쓴다. */
+export function isVideoUrl(url: string, name?: string): boolean {
+  const target = (name && name.trim() !== "" ? name : url).toLowerCase().split("?")[0];
+  return /\.(mp4|mov|webm|m4v)$/.test(target);
+}
+
+export function extractVideoUrls(files: NotionFile[] | undefined): string[] {
+  const urls: string[] = [];
+  for (const f of files ?? []) {
+    const url = f?.file?.url ?? f?.external?.url ?? "";
+    if (url === "") continue;
+    if (isVideoUrl(url, f?.name)) urls.push(url);
+  }
+  return urls;
+}
+
+/**
+ * 형식별 발행 소스.
+ * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 카피는 글만 올린다.
+ */
+export const FORMAT_NAMES = ["카드뉴스", "영상-세로(9:16)", "영상-가로(16:9)", "이미지", "카피"] as const;
+export type MediaKind = "carousel" | "image" | "video" | "text";
+
+export function mediaKindFor(format: string): MediaKind | null {
+  switch ((format ?? "").trim()) {
+    case "카드뉴스":
+      return "carousel";
+    case "이미지":
+      return "image";
+    case "영상-세로(9:16)":
+    case "영상-가로(16:9)":
+      return "video";
+    case "카피":
+      return "text";
+    default:
+      return null;
+  }
+}
+
+/**
+ * 환경값에 붙여넣기 사고로 따옴표나 JSON 조각이 섞이는 일이 있었다
+ * (실제로 토큰 뒤에 `","instagram_business_account":{...}` 가 붙어 있어 메타가 401 로 거절했다).
+ * 토큰에 쓸 수 없는 문자가 나오면 그 앞까지만 남긴다.
+ */
+export function cleanToken(raw: string): string {
+  let value = (raw ?? "").trim();
+  value = value.replace(/^Bearer\s+/i, "").trim();
+  value = value.replace(/^["'\[{,:\s]+/, "");
+  const match = value.match(/^[A-Za-z0-9_\-|]+/);
+  return match ? match[0] : "";
+}
+
+/** 오류 문구에 섞여 들어간 비밀값을 지운다. 값 자체는 어디에도 남기지 않는다. */
+export function maskSecrets(text: string, secrets: string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (typeof secret !== "string" || secret.length < 8) continue;
+    out = out.split(secret).join("***");
+  }
+  return out;
+}
+
+/**
+ * API 오류 본문에서 사람이 읽을 부분만 뽑는다.
+ * 응답을 통째로 남기면 토큰이 그대로 따라 들어온다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
+ */
+export function summarizeApiError(text: string, limit = 400): string {
+  const body = (text ?? "").trim();
+  if (body.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(body) as Record<string, any>;
+      const error = (parsed.error ?? parsed) as Record<string, any>;
+      const parts: string[] = [];
+      const msg = error.message ?? parsed.message;
+      if (typeof msg === "string" && msg.trim() !== "") parts.push(msg.trim());
+      const code = error.code ?? parsed.code;
+      if (code !== undefined && code !== null) parts.push(`code ${code}`);
+      if (error.error_subcode !== undefined && error.error_subcode !== null) {
+        parts.push(`subcode ${error.error_subcode}`);
+      }
+      if (error.fbtrace_id) parts.push(`trace ${error.fbtrace_id}`);
+      if (parts.length > 0) return truncate(parts.join(" · "), limit);
+    } catch {
+      // 깨진 JSON 이면 원문을 그대로 쓴다.
+    }
+  }
+  return truncate(body, limit);
 }

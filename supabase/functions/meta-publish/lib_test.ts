@@ -4,13 +4,19 @@ import {
   assertCarouselSize,
   buildCaption,
   captionLimitError,
+  cleanToken,
   contentTypeFor,
   detectImageType,
+  detectVideoType,
   expiresAtFrom,
   hexPreview,
   extensionFor,
   extractImageUrls,
+  extractVideoUrls,
   isImageUrl,
+  isVideoUrl,
+  maskSecrets,
+  mediaKindFor,
   needsRefresh,
   channelHint,
   collectPageCandidates,
@@ -18,6 +24,7 @@ import {
   readTarget,
   resolveRedirectUri,
   sortCuts,
+  summarizeApiError,
   threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
@@ -257,4 +264,84 @@ Deno.test("channelHint: 주소의 channel 값으로 채널을 알아낸다", () 
   assertEquals(channelHint(null), null);
   assertEquals(channelHint(""), null);
   assertEquals(channelHint("youtube"), null);
+});
+
+Deno.test("cleanToken: 붙여넣기 사고로 섞인 문자를 걷어낸다", () => {
+  const token = "EAA5OVbDlYu8BS" + "x".repeat(40);
+  assertEquals(cleanToken(token), token);
+  assertEquals(cleanToken(`  ${token}  `), token);
+  assertEquals(cleanToken(`"${token}"`), token);
+  assertEquals(cleanToken(`Bearer ${token}`), token);
+  // 실제로 났던 사고: 토큰 뒤에 /me/accounts 응답 조각이 그대로 붙어 있었다.
+  assertEquals(
+    cleanToken(`${token}","instagram_business_account":{"id":"17841471473945525"}]}`),
+    token,
+  );
+  // JSON 덩어리를 통째로 넣으면 앞 조각만 남는다. 길이가 짧아 호출부의 길이 검사에서 걸린다.
+  assertEquals(cleanToken('{"data":[]}'), "data");
+  assertEquals(cleanToken(""), "");
+});
+
+Deno.test("maskSecrets: 오류 문구에 섞인 비밀값을 지운다", () => {
+  const token = "EAA5OVbDlYu8BS" + "y".repeat(40);
+  assertEquals(maskSecrets(`Malformed access token ${token}`, [token]), "Malformed access token ***");
+  // 짧은 값은 문구를 망가뜨릴 수 있어 건드리지 않는다.
+  assertEquals(maskSecrets("abc", ["abc"]), "abc");
+  assertEquals(maskSecrets("값 없음", []), "값 없음");
+});
+
+Deno.test("summarizeApiError: 응답을 통째로 남기지 않고 읽을 부분만 남긴다", () => {
+  assertEquals(
+    summarizeApiError(
+      JSON.stringify({
+        error: { message: "Malformed access token EAA1", code: 190, error_subcode: 460, fbtrace_id: "AbC" },
+      }),
+    ),
+    "Malformed access token EAA1 · code 190 · subcode 460 · trace AbC",
+  );
+  // 노션 오류 모양도 같은 방식으로 읽는다.
+  assertEquals(
+    summarizeApiError(
+      JSON.stringify({ object: "error", status: 400, code: "validation_error", message: "형식이 올바르지 않습니다." }),
+    ),
+    "형식이 올바르지 않습니다. · code validation_error",
+  );
+  // JSON 이 아니면 원문을 길이만 잘라 쓴다.
+  assertEquals(summarizeApiError("서버 오류"), "서버 오류");
+  assertEquals(summarizeApiError("가".repeat(500), 10), "가".repeat(9) + "…");
+});
+
+Deno.test("mediaKindFor: 형식별 발행 소스를 정한다", () => {
+  assertEquals(mediaKindFor("카드뉴스"), "carousel");
+  assertEquals(mediaKindFor("이미지"), "image");
+  assertEquals(mediaKindFor("영상-세로(9:16)"), "video");
+  assertEquals(mediaKindFor("영상-가로(16:9)"), "video");
+  assertEquals(mediaKindFor("카피"), "text");
+  assertEquals(mediaKindFor(" 카드뉴스 "), "carousel");
+  assertEquals(mediaKindFor("릴스"), null);
+  assertEquals(mediaKindFor(""), null);
+});
+
+Deno.test("detectVideoType: 앞바이트로 영상 형식을 판별한다", () => {
+  assertEquals(detectVideoType(new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70])), "mp4");
+  assertEquals(detectVideoType(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0, 0])), "webm");
+  assertEquals(detectVideoType(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), null);
+});
+
+Deno.test("isVideoUrl/extractVideoUrls: 영상 파일만 골라낸다", () => {
+  assertEquals(isVideoUrl("https://x/a.mp4"), true);
+  assertEquals(isVideoUrl("https://x/a.png"), false);
+  assertEquals(isVideoUrl("https://x/a", "릴스.mp4"), true);
+  const files = [
+    { name: "릴스.mp4", file: { url: "https://x/1.mp4" } },
+    { name: "커버.png", file: { url: "https://x/2.png" } },
+  ];
+  assertEquals(extractVideoUrls(files), ["https://x/1.mp4"]);
+  assertEquals(extractImageUrls(files), ["https://x/2.png"]);
+});
+
+Deno.test("contentTypeFor: 영상 확장자도 처리한다", () => {
+  assertEquals(contentTypeFor("mp4"), "video/mp4");
+  assertEquals(contentTypeFor("webm"), "video/webm");
+  assertEquals(contentTypeFor("png"), "image/png");
 });
