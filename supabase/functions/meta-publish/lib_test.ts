@@ -3,7 +3,10 @@ import {
   THREADS_CAROUSEL_MAX,
   assertCarouselSize,
   buildCaption,
+  contentTypeFor,
+  detectImageType,
   expiresAtFrom,
+  hexPreview,
   extensionFor,
   extractImageUrls,
   isImageUrl,
@@ -166,4 +169,36 @@ Deno.test("resolveRedirectUri: 내부 주소를 공개 주소로 바꾼다", () 
     "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish");
   // 공개 주소를 모르면 호스트만 https 로 살린다
   assertEquals(resolveRedirectUri("http://x/meta-publish", "", ""), "https://x/meta-publish");
+});
+
+Deno.test("detectImageType: 앞바이트로 실제 형식을 판별한다", () => {
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+  const jpg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00]);
+  const webp = new Uint8Array([
+    0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00,
+    0x57, 0x45, 0x42, 0x50, 0x00,
+  ]);
+  const gif = new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x00]);
+  assertEquals(detectImageType(png), "png");
+  assertEquals(detectImageType(jpg), "jpg");
+  assertEquals(detectImageType(webp), "webp");
+  assertEquals(detectImageType(gif), "gif");
+  // 이미지가 아니거나 너무 짧으면 null
+  assertEquals(detectImageType(new Uint8Array([0x3c, 0x21, 0x64, 0x6f])), null);
+  assertEquals(detectImageType(new Uint8Array([0x89, 0x50])), null);
+  assertEquals(detectImageType(new Uint8Array([])), null);
+});
+
+Deno.test("contentTypeFor: 확장자를 메타가 아는 content-type 으로 바꾼다", () => {
+  assertEquals(contentTypeFor("png"), "image/png");
+  assertEquals(contentTypeFor("jpg"), "image/jpeg");
+  assertEquals(contentTypeFor("webp"), "image/webp");
+  assertEquals(contentTypeFor("gif"), "image/gif");
+  assertEquals(contentTypeFor("bin"), "application/octet-stream");
+});
+
+Deno.test("hexPreview: 앞바이트를 16진수로 보여준다", () => {
+  assertEquals(hexPreview(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), "89 50 4e 47");
+  assertEquals(hexPreview(new Uint8Array([0x01, 0x0a]), 8), "01 0a");
+  assertEquals(hexPreview(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]), 3), "01 02 03");
 });

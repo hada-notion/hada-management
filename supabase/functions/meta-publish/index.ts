@@ -17,8 +17,11 @@ import {
   THREADS_REFRESH_AFTER_DAYS,
   assertCarouselSize,
   buildCaption,
+  contentTypeFor,
+  detectImageType,
   expiresAtFrom,
   extensionFor,
+  hexPreview,
   extractImageUrls,
   needsRefresh,
   normalizeChannels,
@@ -153,14 +156,24 @@ async function uploadImage(cfg: Config, pageId: string, index: number, sourceUrl
 
   const download = await fetch(sourceUrl);
   if (!download.ok) throw new Error(`이미지 내려받기 실패(${download.status})`);
-  const contentType = download.headers.get("content-type") ?? "";
-  if (!contentType.startsWith("image/")) {
-    throw new Error(`이미지가 아닌 파일입니다(content-type: ${contentType || "없음"}). 영상 발행은 아직 지원하지 않습니다.`);
-  }
   const bytes = new Uint8Array(await download.arrayBuffer());
   if (bytes.byteLength === 0) throw new Error("이미지 파일이 비어 있습니다.");
 
-  const path = `${pageId}/${String(index + 1).padStart(2, "0")}.${extensionFor(contentType, sourceUrl)}`;
+  // 노션은 업로드 파일을 binary/octet-stream 으로 돌려주기도 한다.
+  // 그래서 content-type 을 믿지 않고 파일 앞바이트로 실제 형식을 판별한다.
+  const headerType = (download.headers.get("content-type") ?? "").toLowerCase().split(";")[0].trim();
+  const detected = detectImageType(bytes);
+  if (!detected && !headerType.startsWith("image/")) {
+    throw new Error(
+      `이미지가 아닌 파일입니다(content-type: ${headerType || "없음"}, 앞바이트: ${
+        hexPreview(bytes)
+      }, 크기: ${bytes.byteLength}바이트). 영상이나 다른 형식은 아직 발행할 수 없습니다.`,
+    );
+  }
+  const ext = detected ?? extensionFor(headerType, sourceUrl);
+  const contentType = contentTypeFor(ext);
+
+  const path = `${pageId}/${String(index + 1).padStart(2, "0")}.${ext}`;
   const upload = await fetch(`${cfg.storageUrl}/storage/v1/object/${cfg.bucket}/${path}`, {
     method: "POST",
     headers: {

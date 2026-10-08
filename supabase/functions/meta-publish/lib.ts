@@ -149,6 +149,43 @@ export function extractImageUrls(files: NotionFile[] | undefined): string[] {
   return urls;
 }
 
+export type ImageExt = "png" | "jpg" | "webp" | "gif";
+
+/**
+ * 파일 앞머리 바이트로 실제 이미지 형식을 판별한다.
+ * 노션은 업로드된 파일을 binary/octet-stream 으로 돌려주기도 해서 content-type 만으로는 부족하다.
+ */
+export function detectImageType(bytes: Uint8Array): ImageExt | null {
+  const b = bytes;
+  if (
+    b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 &&
+    b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a
+  ) return "png";
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpg";
+  if (
+    b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+    b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
+  ) return "webp";
+  if (b.length >= 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "gif";
+  return null;
+}
+
+/** 확장자에 맞는 content-type. 메타가 파일 형식을 판단할 때 쓴다. */
+export function contentTypeFor(ext: string): string {
+  if (ext === "png") return "image/png";
+  if (ext === "jpg") return "image/jpeg";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "application/octet-stream";
+}
+
+/** 실패했을 때 원인을 남기기 위한 앞바이트 표시. */
+export function hexPreview(bytes: Uint8Array, limit = 8): string {
+  return Array.from(bytes.slice(0, limit))
+    .map((n) => n.toString(16).padStart(2, "0"))
+    .join(" ");
+}
+
 export function extensionFor(contentType: string, url: string): string {
   const type = (contentType ?? "").toLowerCase();
   if (type.includes("png")) return "png";
