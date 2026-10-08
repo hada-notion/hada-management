@@ -62,6 +62,37 @@ export function normalizeChannels(values: string[] | undefined): string[] {
 
 export const PUBLISH_READY_STATUS = "발행 대기";
 
+/** 스레드 토큰은 60일짜리라, 마지막 갱신 후 이 일수가 지나면 미리 갱신한다. */
+export const THREADS_REFRESH_AFTER_DAYS = 30;
+
+export const THREADS_AUTHORIZE_SCOPES = ["threads_basic", "threads_content_publish"];
+
+/** 스레드 승인 화면 주소를 만든다. 브라우저에서 열면 code 를 받아 되돌아온다. */
+export function threadsAuthorizeUrl(appId: string, redirectUri: string, scopes: string[]): string {
+  const params = new URLSearchParams({
+    client_id: (appId ?? "").trim(),
+    redirect_uri: (redirectUri ?? "").trim(),
+    scope: scopes.join(","),
+    response_type: "code",
+  });
+  return `https://threads.com/oauth/authorize?${params.toString()}`;
+}
+
+/** 마지막 갱신 후 refreshAfterDays 일이 지났으면 true. 시각을 못 읽으면 갱신하지 않는다. */
+export function needsRefresh(updatedAtMs: number, nowMs: number, refreshAfterDays: number): boolean {
+  if (!Number.isFinite(updatedAtMs) || !Number.isFinite(nowMs)) return false;
+  const elapsed = nowMs - updatedAtMs;
+  if (elapsed < 0) return false;
+  return elapsed >= refreshAfterDays * 24 * 60 * 60 * 1000;
+}
+
+/** 토큰 응답의 expires_in(초)으로 만료 시각을 계산한다. 값이 없으면 null. */
+export function expiresAtFrom(nowMs: number, expiresInSeconds: unknown): string | null {
+  const seconds = typeof expiresInSeconds === "number" ? expiresInSeconds : Number(expiresInSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return new Date(nowMs + seconds * 1000).toISOString();
+}
+
 /** 발행 상태가 "발행 대기"일 때만 발행한다. 그 외에는 건너뛴다. */
 export function shouldPublish(currentStatus: string | undefined): boolean {
   return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;

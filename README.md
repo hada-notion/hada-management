@@ -9,6 +9,7 @@
 | `supabase/functions/meta-publish/index.ts` | 발행 함수 본체 |
 | `supabase/functions/meta-publish/lib.ts` | 캡션·정렬·장수 검사 등 순수 로직 |
 | `supabase/functions/meta-publish/lib_test.ts` | 순수 로직 테스트 |
+| `supabase/meta_tokens.sql` | 스레드 토큰 보관 표 생성 SQL |
 | `.github/workflows/deploy-supabase-functions.yml` | 타입 검사·테스트 후 Supabase로 배포 |
 
 ## 동작
@@ -20,6 +21,8 @@
 5. 게시물 링크와 발행 시각을 기록하고 `발행 완료`로 바꾼다
 
 발행 상태가 이미 `발행 중`이거나 `발행 완료`면 아무 것도 하지 않는다.
+
+스레드 토큰은 60일짜리라 `meta_tokens` 표에 담아두고, 발행할 때마다 마지막 갱신 후 30일이 지났으면 먼저 자동으로 연장한다.
 
 ## 한 번만 준비하면 되는 것
 
@@ -46,17 +49,43 @@ Settings → Secrets and variables → Actions
 | `SB_SERVICE_ROLE_KEY` | 예 | 서비스 롤 키 (Storage 업로드용) |
 | `IG_USER_ID` | 예 | 인스타그램 비즈니스 계정 ID |
 | `IG_ACCESS_TOKEN` | 예 | 인스타그램 액세스 토큰 |
-| `THREADS_USER_ID` | 예 | 스레드 사용자 ID |
-| `THREADS_ACCESS_TOKEN` | 예 | 스레드 액세스 토큰 |
+| `THREADS_APP_ID` | 예 | 메타 앱의 Threads App ID (스레드 인증용) |
+| `THREADS_APP_SECRET` | 예 | 메타 앱의 Threads App secret (스레드 인증용) |
 | `PUBLISH_FIXED_COMMENT` | 아니오 | 캡션 뒤에 붙는 고정 멘트 |
 | `META_GRAPH_VERSION` | 아니오 | 기본 `v26.0` |
 | `IG_API_BASE` | 아니오 | 기본 `https://graph.facebook.com`. 인스타그램 로그인 방식이면 `https://graph.instagram.com` |
 | `THREADS_GRAPH_VERSION` | 아니오 | 기본 `v1.0` |
+| `THREADS_OAUTH_BASE` | 아니오 | 기본 `https://graph.threads.com`. 실패하면 `https://graph.threads.net` 을 자동으로 다시 시도한다 |
+| `THREADS_REDIRECT_URI` | 아니오 | 비우면 함수 자신의 주소를 쓴다. 스레드 앱에 등록한 값과 달라야 할 때만 채운다 |
+| `THREADS_USER_ID` | 아니오 | 스레드 인증 전 임시값. 인증하면 `meta_tokens` 표의 값이 우선한다 |
+| `THREADS_ACCESS_TOKEN` | 아니오 | 위와 같다 |
+| `TOKEN_TABLE` | 아니오 | 기본 `meta_tokens` |
 | `PUBLISH_BUCKET` | 아니오 | 기본 `meta-publish` |
 
 값은 저장소에 넣지 않는다.
 
-### 4. 노션 자동화
+### 4. 스레드 토큰 표
+
+Supabase 대시보드 → SQL Editor 에 `supabase/meta_tokens.sql` 내용을 붙여넣고 실행한다. service role 만 읽고 쓸 수 있다.
+
+### 5. 스레드 인증 (한 번만, 그리고 60일마다 한 번씩)
+
+Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 자체 OAuth 를 한 번 거쳐야 한다.
+
+1. 메타 앱 대시보드 → Threads → 설정에 리디렉션 URI 를 등록한다.
+   `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish`
+2. 같은 화면에서 앱 역할에 `ha.da_2025` 를 Threads Tester 로 추가하고, 스레드 앱의 설정 → 웹사이트 권한에서 초대를 수락한다.
+3. 브라우저에서 아래 주소를 연다.
+
+   ```
+   https://threads.com/oauth/authorize?client_id=<THREADS_APP_ID>&redirect_uri=<위 리디렉션 URI>&scope=threads_basic,threads_content_publish&response_type=code
+   ```
+
+4. 승인하면 함수로 되돌아오고, 함수가 code 를 60일 토큰으로 바꿔 `meta_tokens` 표에 저장한 뒤 `스레드 인증 완료` 화면을 보여준다.
+
+이후에는 발행할 때마다 토큰이 자동으로 연장된다. 60일 넘게 발행을 쉬어 토큰이 만료되면 3번을 다시 하면 된다.
+
+### 6. 노션 자동화
 
 컨텐츠(학원관리) DB → ⚡ 자동화 → 새 자동화
 
@@ -87,5 +116,5 @@ curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish" 
 
 ## 검증 상태
 
-- 통과: `deno check` 타입 검사, 순수 로직 테스트 8개
-- 미검증: 실제 메타 앱·토큰으로 발행, 노션 자동화 연결, Storage 업로드, 앱 심사
+- 통과: `deno check` 타입 검사, 순수 로직 테스트 12개
+- 미검증: 실제 메타 앱·토큰으로 발행, 스레드 인증 콜백, 노션 자동화 연결, Storage 업로드, 앱 심사

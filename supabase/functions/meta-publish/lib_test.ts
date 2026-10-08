@@ -3,13 +3,16 @@ import {
   THREADS_CAROUSEL_MAX,
   assertCarouselSize,
   buildCaption,
+  expiresAtFrom,
   extensionFor,
   extractImageUrls,
   isImageUrl,
+  needsRefresh,
   normalizeChannels,
   parsePageId,
   shouldPublish,
   sortCuts,
+  threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
 
@@ -108,4 +111,40 @@ Deno.test("extensionFor: content-type 우선, 없으면 주소 확장자", () =>
   assertEquals(extensionFor("image/jpeg", "https://x/a.png"), "jpg");
   assertEquals(extensionFor("", "https://x/a.PNG?sig=1"), "png");
   assertEquals(extensionFor("", "https://x/a"), "png");
+});
+
+Deno.test("threadsAuthorizeUrl: 승인 주소를 만든다", () => {
+  const url = threadsAuthorizeUrl(
+    "1798018586325",
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+    ["threads_basic", "threads_content_publish"],
+  );
+  const parsed = new URL(url);
+  assertEquals(parsed.origin + parsed.pathname, "https://threads.com/oauth/authorize");
+  assertEquals(parsed.searchParams.get("client_id"), "1798018586325");
+  assertEquals(parsed.searchParams.get("scope"), "threads_basic,threads_content_publish");
+  assertEquals(parsed.searchParams.get("response_type"), "code");
+  assertEquals(
+    parsed.searchParams.get("redirect_uri"),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+  );
+});
+
+Deno.test("needsRefresh: 30일이 지나면 true, 그 전에는 false", () => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.parse("2026-08-01T00:00:00.000Z");
+  assertEquals(needsRefresh(now - 29 * day, now, 30), false);
+  assertEquals(needsRefresh(now - 30 * day, now, 30), true);
+  assertEquals(needsRefresh(now - 45 * day, now, 30), true);
+  // 아직 지나지 않은 미래 시각이거나 값이 깨졌으면 갱신하지 않는다.
+  assertEquals(needsRefresh(now + day, now, 30), false);
+  assertEquals(needsRefresh(Number.NaN, now, 30), false);
+});
+
+Deno.test("expiresAtFrom: expires_in 초를 만료 시각으로 바꾼다", () => {
+  const now = Date.parse("2026-08-01T00:00:00.000Z");
+  assertEquals(expiresAtFrom(now, 60 * 60 * 24 * 60), "2026-09-30T00:00:00.000Z");
+  assertEquals(expiresAtFrom(now, "3600"), "2026-08-01T01:00:00.000Z");
+  assertEquals(expiresAtFrom(now, undefined), null);
+  assertEquals(expiresAtFrom(now, 0), null);
 });
