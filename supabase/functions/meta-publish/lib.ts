@@ -43,13 +43,16 @@ export function sortCuts<T extends { order: number; pageId: string }>(cuts: T[])
 }
 
 /** 캡션을 만든다. 캡션이 비어 있으면 대본을 쓰고, 끝에 고정 멘트를 붙인다. */
-export function buildCaption(primary: string, fallback: string, fixedComment: string): string {
-  const p = (primary ?? "").trim();
-  const f = (fallback ?? "").trim();
-  const base = p !== "" ? p : f;
+/**
+ * 발행 문구는 '캡션'만 쓴다. 뒤에 고정 멘트를 한 줄 띄우고 붙인다.
+ * '대본'으로 대체하지 않는 이유: 대본은 제작 메모(컨셉·타겟·사진 지시)가 섞인 작업 문서라
+ * 발행 문구로 쓰면 메모가 그대로 게시되고 길이도 한도를 넘는다. 비어 있으면 호출부가 발행을 막는다.
+ */
+export function buildCaption(caption: string, fixedComment: string): string {
+  const base = (caption ?? "").trim();
   const fixed = (fixedComment ?? "").trim();
+  if (base === "") return "";
   if (fixed === "") return base;
-  if (base === "") return fixed;
   return `${base}\n\n${fixed}`;
 }
 
@@ -66,14 +69,30 @@ export const CAPTION_LIMITS: Record<string, number> = {
  * 발행 대상 채널 중 한도를 넘은 것이 있으면 사유를 돌려준다. 없으면 null.
  * 잘림 판정과 같은 기준(문자열 길이)으로 세어, 잘릴 조건이면 발행 전에 멈춘다.
  */
+/** 이모지로 보이는 글자. 스레드는 이 글자들을 UTF-8 바이트 수로 센다. */
+const EMOJI_CHAR = /^[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{1F1E6}-\u{1F1FF}]$/u;
+
+/**
+ * 스레드가 세는 글자 수.
+ * 스레드 문서 기준으로 이모지는 UTF-8 바이트 수(보통 4자)로 계산되고, 나머지 글자는 1자다.
+ * 그래서 이모지가 많으면 우리 글자 수 검사를 통과하고도 메타가 거절한다.
+ */
+export function threadsLength(text: string): number {
+  let total = 0;
+  for (const ch of text ?? "") {
+    total += EMOJI_CHAR.test(ch) ? new TextEncoder().encode(ch).length : 1;
+  }
+  return total;
+}
+
+/** 채널별 한도 검사. 스레드만 이모지를 바이트로 세는 규칙을 따른다. */
 export function captionLimitError(caption: string, channels: string[]): string | null {
   for (const channel of channels) {
     const limit = CAPTION_LIMITS[channel];
     if (limit === undefined) continue;
-    if (caption.length > limit) {
-      return `${channel} 한도(${limit}자)를 넘었습니다. 현재 ${caption.length}자, ${
-        caption.length - limit
-      }자를 줄여야 합니다.`;
+    const used = channel === "스레드" ? threadsLength(caption) : caption.length;
+    if (used > limit) {
+      return `${channel} 한도(${limit}자)를 넘었습니다. 현재 ${used}자, ${used - limit}자를 줄여야 합니다.`;
     }
   }
   return null;

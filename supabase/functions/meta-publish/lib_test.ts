@@ -27,6 +27,7 @@ import {
   resolveRedirectUri,
   sortCuts,
   summarizeApiError,
+  threadsLength,
   threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
@@ -66,14 +67,31 @@ Deno.test("sortCuts: 컷 순서 오름차순, 동률은 페이지 ID로 안정 �
   assertEquals(sorted.map((c) => c.pageId), ["a", "b", "c"]);
 });
 
-Deno.test("buildCaption: 캡션 우선, 비면 대본, 고정 멘트는 뒤에 한 줄 띄우고 붙임", () => {
-  assertEquals(buildCaption("캡션 본문", "대본 본문", "고정 멘트"), "캡션 본문\n\n고정 멘트");
-  assertEquals(buildCaption("  ", "대본 본문", "고정 멘트"), "대본 본문\n\n고정 멘트");
-  assertEquals(buildCaption("캡션 본문", "대본 본문", ""), "캡션 본문");
-  assertEquals(buildCaption("캡션 본문", "대본 본문", "   "), "캡션 본문");
-  assertEquals(buildCaption("", "대본 본문", ""), "대본 본문");
-  assertEquals(buildCaption("", "", "고정 멘트"), "고정 멘트");
-  assertEquals(buildCaption("", "", ""), "");
+Deno.test("buildCaption: 캡션 뒤에 고정 멘트를 한 줄 띄우고 붙인다", () => {
+  assertEquals(buildCaption("캡션 본문", "고정 멘트"), "캡션 본문\n\n고정 멘트");
+  assertEquals(buildCaption("  캡션 본문  ", "고정 멘트"), "캡션 본문\n\n고정 멘트");
+  assertEquals(buildCaption("캡션 본문", ""), "캡션 본문");
+  assertEquals(buildCaption("캡션 본문", "   "), "캡션 본문");
+  // 캡션이 비면 빈 값이 된다. 대본으로 대체하지 않는다(호출부가 발행을 막는다).
+  assertEquals(buildCaption("", "고정 멘트"), "");
+  assertEquals(buildCaption("", ""), "");
+});
+
+Deno.test("threadsLength: 이모지는 UTF-8 바이트로 센다", () => {
+  assertEquals(threadsLength(""), 0);
+  assertEquals(threadsLength("가나다"), 3);
+  assertEquals(threadsLength("abc"), 3);
+  // 스레드 문서 기준으로 이모지는 바이트 수(보통 4자)로 계산된다.
+  assertEquals(threadsLength("🙂"), 4);
+  assertEquals(threadsLength("가🙂"), 5);
+  // 그래서 이모지가 많으면 글자 수로는 통과해도 메타가 거절한다.
+  assertEquals(captionLimitError("🙂".repeat(120), ["스레드"]), null);
+  assertEquals(
+    captionLimitError("🙂".repeat(130), ["스레드"]),
+    "스레드 한도(500자)를 넘었습니다. 현재 520자, 20자를 줄여야 합니다.",
+  );
+  // 인스타그램은 글자 수로 센다.
+  assertEquals(captionLimitError("🙂".repeat(130), ["인스타그램"]), null);
 });
 
 Deno.test("assertCarouselSize: 장수 경계에서 막는다", () => {

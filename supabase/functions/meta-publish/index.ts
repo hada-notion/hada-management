@@ -59,6 +59,7 @@ import {
   resolveRedirectUri,
   sortCuts,
   summarizeApiError,
+  threadsLength,
   threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
@@ -1070,13 +1071,16 @@ async function publishRow(
   }
 
   const plan = await collectSources(cfg, props, kind);
-  const caption = buildCaption(
-    richText(props["캡션"]),
-    richText(props["대본"]),
-    cfg.fixedComment,
-  );
+  // 발행 문구는 '캡션'만 쓴다. '대본'은 제작 메모가 섞인 작업 문서라 대체재로 쓰지 않는다.
+  // 대본으로 대체하면 메모가 그대로 게시되고, 길이가 한도를 넘어 한 채널만 실패한다.
+  const captionText = richText(props["캡션"]);
+  const scriptText = richText(props["대본"]);
+  const caption = buildCaption(captionText, cfg.fixedComment);
   if (caption.trim() === "") {
-    throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
+    const scriptNote = scriptText.trim() === ""
+      ? "대본도 비어 있습니다."
+      : `대본은 ${scriptText.trim().length}자지만 발행 문구로 쓰지 않습니다(제작 메모가 섞여 있습니다).`;
+    throw new Error(`'캡션'이 비어 있어 발행하지 않았습니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`);
   }
 
   // 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
@@ -1100,6 +1104,7 @@ async function publishRow(
       media: uploaded,
       caption,
       captionLength: caption.length,
+      threadsCaptionLength: threadsLength(caption),
       threadsAuth: threadsAuthNote,
       note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
     };
@@ -1108,7 +1113,7 @@ async function publishRow(
   await updatePage(cfg, pageId, {
     "처리 시작 시각": { date: { start: new Date().toISOString() } },
   });
-  console.log("meta-publish 시작", pageId, channels.join(","), `${format} · ${kind}`);
+  console.log("meta-publish 시작", pageId, channels.join(","), `${format} · ${kind} · 캡션 ${caption.length}자`);
 
   // 파일은 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
   let uploaded: MediaPlan | null = null;
@@ -1128,7 +1133,13 @@ async function publishRow(
 
       // 한도 초과는 그 채널의 업로드와 발행보다 앞에서 막는다.
       const limitError = captionLimitError(caption, [channel]);
-      if (limitError) throw new Error(limitError);
+      if (limitError) {
+        // 어느 값이 길이를 만들었는지 같이 알려준다. 그래야 바로 고칠 수 있다.
+        const fixedLength = cfg.fixedComment.trim().length;
+        throw new Error(
+          `${limitError} (캡션 ${captionText.trim().length}자 + 고정 멘트 ${fixedLength}자 = 발행 문구 ${caption.length}자)`,
+        );
+      }
 
       // 인스타그램은 미디어 없는 발행을 지원하지 않는다. 이 채널만 실패로 남기고 스레드는 계속 간다.
       if (kind === "text" && channel === "인스타그램") {
