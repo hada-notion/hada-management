@@ -7,6 +7,9 @@
 //   영상-가로(16:9) → 컨텐츠 '미리보기' 영상 (릴스)
 //   카피            → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
 //
+// '캡션'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '카피' 형식뿐이다).
+// 그래서 이미지·캐러셀 발행에서는 caption·text 파라미터를 아예 빼고 보낸다.
+//
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
 //   본문에 페이지 지정(pageUrl/pageId/url/id)이 있거나 본문 어딘가에 노션 페이지 주소가 실려 있으면
 //   그 페이지만 처리한다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
@@ -58,6 +61,7 @@ import {
   readTarget,
   resolveRedirectUri,
   sortCuts,
+  optionalText,
   summarizeApiError,
   threadsLength,
   threadsAuthorizeUrl,
@@ -445,7 +449,10 @@ async function publishInstagram(cfg: Config, imageUrls: string[], caption: strin
 
   let containerId: string;
   if (imageUrls.length === 1) {
-    const container = await igPost(cfg, `${cfg.igUserId}/media`, { image_url: imageUrls[0], caption: text });
+    const container = await igPost(cfg, `${cfg.igUserId}/media`, {
+      image_url: imageUrls[0],
+      ...optionalText("caption", text),
+    });
     containerId = container.id;
   } else {
     assertCarouselSize(imageUrls.length, IG_CAROUSEL_MIN, IG_CAROUSEL_MAX, "인스타그램");
@@ -457,7 +464,7 @@ async function publishInstagram(cfg: Config, imageUrls: string[], caption: strin
     const container = await igPost(cfg, `${cfg.igUserId}/media`, {
       media_type: "CAROUSEL",
       children: children.join(","),
-      caption: text,
+      ...optionalText("caption", text),
     });
     containerId = container.id;
   }
@@ -478,7 +485,7 @@ async function publishInstagramReel(cfg: Config, videoUrl: string, caption: stri
   const container = await igPost(cfg, `${cfg.igUserId}/media`, {
     media_type: "REELS",
     video_url: videoUrl,
-    caption: text,
+    ...optionalText("caption", text),
     share_to_feed: "true",
   });
   await waitForIgContainer(cfg, container.id, IG_VIDEO_POLL_ATTEMPTS, IG_VIDEO_POLL_INTERVAL_MS);
@@ -757,7 +764,7 @@ async function createThreadsCarousel(
       threadsPost(cfg, auth, `${auth.userId}/threads`, {
         media_type: "CAROUSEL",
         children: children.join(","),
-        text,
+        ...optionalText("text", text),
       }),
     "스레드 캐러셀 컨테이너",
   );
@@ -789,13 +796,16 @@ async function publishThreads(
 
   let containerId: string;
   if (media.kind === "text") {
-    const container = await threadsPost(cfg, auth, `${uid}/threads`, { media_type: "TEXT", text });
+    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
+      media_type: "TEXT",
+      ...optionalText("text", text),
+    });
     containerId = container.id;
   } else if (media.kind === "video") {
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "VIDEO",
       video_url: media.url,
-      text,
+      ...optionalText("text", text),
     });
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
@@ -803,7 +813,7 @@ async function publishThreads(
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "IMAGE",
       image_url: media.urls[0],
-      text,
+      ...optionalText("text", text),
     });
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
@@ -1076,11 +1086,15 @@ async function publishRow(
   const captionText = richText(props["캡션"]);
   const scriptText = richText(props["대본"]);
   const caption = buildCaption(captionText, cfg.fixedComment);
-  if (caption.trim() === "") {
+  // 캡션이 비어도 막지 않는다. 카드뉴스는 그림이 본체라 글 없이 올리는 편이 낫다.
+  // 글이 본체인 '카피' 형식만 캡션이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
+  if (caption.trim() === "" && kind === "text") {
     const scriptNote = scriptText.trim() === ""
       ? "대본도 비어 있습니다."
       : `대본은 ${scriptText.trim().length}자지만 발행 문구로 쓰지 않습니다(제작 메모가 섞여 있습니다).`;
-    throw new Error(`'캡션'이 비어 있어 발행하지 않았습니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`);
+    throw new Error(
+      `'카피' 형식은 글이 본체라 '캡션'이 필요합니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`,
+    );
   }
 
   // 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다.

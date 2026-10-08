@@ -26,6 +26,7 @@ import {
   readTarget,
   resolveRedirectUri,
   sortCuts,
+  optionalText,
   summarizeApiError,
   threadsLength,
   threadsAuthorizeUrl,
@@ -72,9 +73,19 @@ Deno.test("buildCaption: 캡션 뒤에 고정 멘트를 한 줄 띄우고 붙인
   assertEquals(buildCaption("  캡션 본문  ", "고정 멘트"), "캡션 본문\n\n고정 멘트");
   assertEquals(buildCaption("캡션 본문", ""), "캡션 본문");
   assertEquals(buildCaption("캡션 본문", "   "), "캡션 본문");
-  // 캡션이 비면 빈 값이 된다. 대본으로 대체하지 않는다(호출부가 발행을 막는다).
-  assertEquals(buildCaption("", "고정 멘트"), "");
+  // 캡션이 비면 고정 멘트만 남고, 둘 다 비면 빈 문구가 된다.
+  assertEquals(buildCaption("", "고정 멘트"), "고정 멘트");
+  assertEquals(buildCaption("   ", "고정 멘트"), "고정 멘트");
   assertEquals(buildCaption("", ""), "");
+});
+
+Deno.test("optionalText: 글이 비면 파라미터에서 뺀다", () => {
+  assertEquals(optionalText("caption", "발행 문구"), { caption: "발행 문구" });
+  assertEquals(optionalText("text", "발행 문구"), { text: "발행 문구" });
+  // 빈 값은 키 자체를 만들지 않는다. 메타에 빈 문자열을 보내지 않기 위해서다.
+  assertEquals(optionalText("caption", ""), {});
+  assertEquals(optionalText("text", "   "), {});
+  assertEquals(optionalText("text", ""), {});
 });
 
 Deno.test("threadsLength: 이모지는 UTF-8 바이트로 센다", () => {

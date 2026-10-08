@@ -42,18 +42,28 @@ export function sortCuts<T extends { order: number; pageId: string }>(cuts: T[])
   });
 }
 
-/** 캡션을 만든다. 캡션이 비어 있으면 대본을 쓰고, 끝에 고정 멘트를 붙인다. */
 /**
- * 발행 문구는 '캡션'만 쓴다. 뒤에 고정 멘트를 한 줄 띄우고 붙인다.
+ * 발행 문구를 만든다. '캡션' 뒤에 고정 멘트를 한 줄 띄우고 붙인다.
  * '대본'으로 대체하지 않는 이유: 대본은 제작 메모(컨셉·타겟·사진 지시)가 섞인 작업 문서라
- * 발행 문구로 쓰면 메모가 그대로 게시되고 길이도 한도를 넘는다. 비어 있으면 호출부가 발행을 막는다.
+ * 발행 문구로 쓰면 메모가 그대로 게시되고 길이도 한도를 넘는다.
+ * 캡션이 비면 고정 멘트만 남고, 둘 다 비면 빈 문구가 된다. 그래도 발행은 막지 않는다.
+ * 카드뉴스는 그림이 본체라 글 없이 올릴 수 있고, 글이 꼭 필요한 '카피' 형식만 호출부가 막는다.
  */
 export function buildCaption(caption: string, fixedComment: string): string {
   const base = (caption ?? "").trim();
   const fixed = (fixedComment ?? "").trim();
-  if (base === "") return "";
+  if (base === "") return fixed;
   if (fixed === "") return base;
   return `${base}\n\n${fixed}`;
+}
+
+/**
+ * 글이 비어 있으면 파라미터에서 아예 뺀다.
+ * 메타는 빈 문자열을 값으로 보내면 거절할 수 있고, 이미지·캐러셀 발행에는 글이 필수가 아니다.
+ */
+export function optionalText(key: string, text: string): Record<string, string> {
+  const value = (text ?? "").trim();
+  return value === "" ? {} : { [key]: value };
 }
 
 export const IG_CAPTION_LIMIT = 2200;
