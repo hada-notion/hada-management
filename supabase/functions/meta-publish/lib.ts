@@ -60,6 +60,13 @@ export function normalizeChannels(values: string[] | undefined): string[] {
   return picked.length > 0 ? picked : ["인스타그램", "스레드"];
 }
 
+export const PUBLISH_READY_STATUS = "발행 대기";
+
+/** 발행 상태가 "발행 대기"일 때만 발행한다. 그 외에는 건너뛴다. */
+export function shouldPublish(currentStatus: string | undefined): boolean {
+  return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;
+}
+
 export function truncate(text: string, limit: number): string {
   if (text.length <= limit) return text;
   return `${text.slice(0, limit - 1).trimEnd()}…`;

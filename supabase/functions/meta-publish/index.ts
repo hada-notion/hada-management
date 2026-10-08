@@ -16,6 +16,7 @@ import {
   extractImageUrls,
   normalizeChannels,
   parsePageId,
+  shouldPublish,
   sortCuts,
   truncate,
 } from "./lib.ts";
@@ -348,8 +349,15 @@ Deno.serve(async (req) => {
     const props = (page.properties ?? {}) as Json;
 
     const currentStatus = selectName(props["발행 상태"]);
-    if (currentStatus === "발행 중" || currentStatus === "발행 완료") {
-      return json({ ok: true, pageId, skipped: true, reason: `발행 상태가 '${currentStatus}'입니다.` });
+    if (!shouldPublish(currentStatus)) {
+      return json({
+        ok: true,
+        pageId,
+        skipped: true,
+        reason: currentStatus === ""
+          ? "발행 상태가 비어 있습니다. '발행 대기'일 때만 발행합니다."
+          : `발행 상태가 '${currentStatus}'입니다. '발행 대기'일 때만 발행합니다.`,
+      });
     }
 
     const cutIds = relationIds(props["컷(프롬프트)"]);
