@@ -1,0 +1,71 @@
+name: Deploy Supabase Functions
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'supabase/functions/**'
+      - '.github/workflows/deploy-supabase-functions.yml'
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v1.x
+
+      - name: Type-check all functions (deno check)
+        run: |
+          set -e
+          for f in supabase/functions/*/index.ts; do
+            echo "== deno check $f =="
+            deno check "$f"
+          done
+
+      - name: Run tests
+        run: |
+          set -e
+          for f in supabase/functions/*/*_test.ts; do
+            echo "== deno test $f =="
+            deno test "$f"
+          done
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy all Edge Functions
+        run: supabase functions deploy --project-ref "$SUPABASE_PROJECT_ID" --no-verify-jwt
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+
+      - name: Verify deployed function list matches repository
+        run: |
+          set -e
+          LIST_OUTPUT=$(supabase functions list --project-ref "$SUPABASE_PROJECT_ID")
+          echo "$LIST_OUTPUT"
+          MISSING=""
+          for dir in supabase/functions/*/; do
+            name=$(basename "$dir")
+            [ "$name" = "_shared" ] && continue
+            if ! echo "$LIST_OUTPUT" | grep -qF "$name"; then
+              MISSING="$MISSING $name"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::배포 목록에서 확인되지 않은 함수:$MISSING"
+            exit 1
+          fi
+          echo "저장소의 모든 함수가 배포 목록에서 확인되었습니다."
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
