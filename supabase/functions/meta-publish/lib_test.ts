@@ -14,6 +14,7 @@ import {
   needsRefresh,
   normalizeChannels,
   parsePageId,
+  readTarget,
   resolveRedirectUri,
   shouldPublish,
   sortCuts,
@@ -224,4 +225,25 @@ Deno.test("captionLimitError: 채널 한도를 넘으면 발행 전에 막는다
   );
   // 한도가 정의되지 않은 채널은 검사하지 않는다.
   assertEquals(captionLimitError("가".repeat(900), ["기타"]), null);
+});
+
+Deno.test("readTarget: 페이지 지정이 있으면 그 값을 쓴다", () => {
+  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish";
+  assertEquals(readTarget({ pageUrl: "https://app.notion.com/p/abc" }, base), "https://app.notion.com/p/abc");
+  assertEquals(readTarget({ pageId: "abc" }, base), "abc");
+  assertEquals(readTarget({ url: "https://app.notion.com/p/abc" }, base), "https://app.notion.com/p/abc");
+  assertEquals(readTarget({ id: "abc" }, base), "abc");
+  assertEquals(readTarget({ page: { url: "https://app.notion.com/p/abc" } }, base), "https://app.notion.com/p/abc");
+  assertEquals(readTarget({}, `${base}?pageUrl=https%3A%2F%2Fapp.notion.com%2Fp%2Fabc`), "https://app.notion.com/p/abc");
+  assertEquals(readTarget({}, `${base}?pageId=abc`), "abc");
+});
+
+Deno.test("readTarget: 페이지 지정이 없으면 빈 값이 되어 큐 모드로 넘어간다", () => {
+  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish";
+  // 노션 버튼 웹훅은 DB 속성만 보낸다. 페이지 URL 이 없으므로 큐 모드다.
+  assertEquals(readTarget({ "발행 상태": "발행 대기" }, base), "");
+  assertEquals(readTarget({}, base), "");
+  assertEquals(readTarget({ pageUrl: "   " }, base), "");
+  // 주소가 망가져도 예외로 죽지 않고 큐 모드로 넘어간다.
+  assertEquals(readTarget({}, "not-a-url"), "");
 });

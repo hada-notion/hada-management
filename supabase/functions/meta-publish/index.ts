@@ -1,7 +1,9 @@
-// META 업로드 자동화 — 노션 자동화 웹훅을 받아 인스타그램·스레드에 카드뉴스를 발행한다.
+// META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 카드뉴스를 발행한다.
 //
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
 // 본문: { "pageUrl": "https://app.notion.com/p/..." }  — pageId/url/id 도 허용
+//       본문에 페이지 지정이 없으면 큐 모드로 동작한다. 컨텐츠 DB 에서 '발행 상태' 가
+//       '발행 대기' 인 행을 찾아 전부 발행한다. 노션 '게시' 버튼 웹훅이 이 경로를 쓴다.
 //
 // 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
 // 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
@@ -29,6 +31,8 @@ import {
   needsRefresh,
   normalizeChannels,
   parsePageId,
+  PUBLISH_READY_STATUS,
+  readTarget,
   resolveRedirectUri,
   shouldPublish,
   sortCuts,
@@ -66,6 +70,11 @@ function buildConfig() {
     storageKey: optionalEnv("SB_SERVICE_ROLE_KEY") || optionalEnv("SUPABASE_SERVICE_ROLE_KEY"),
     bucket: optionalEnv("PUBLISH_BUCKET") || "meta-publish",
     fixedComment: optionalEnv("PUBLISH_FIXED_COMMENT"),
+    // 큐 모드에서 조회할 컨텐츠(학원관리) DB.
+    contentDataSourceId: optionalEnv("CONTENT_DATA_SOURCE_ID") ||
+      "dda5e4d7-d1b1-4c24-a75a-9442ce9664ca",
+    contentDatabaseId: optionalEnv("CONTENT_DATABASE_ID") ||
+      "ef3145878aba4994af456e11c27c9028",
     metaVersion: optionalEnv("META_GRAPH_VERSION") || "v26.0",
     igApiBase: optionalEnv("IG_API_BASE") || "https://graph.facebook.com",
     igUserId: optionalEnv("IG_USER_ID"),
@@ -581,80 +590,72 @@ async function publishThreads(
 
 // ---------- 진입점 ----------
 
-function readTarget(payload: Json, requestUrl: string): string {
-  const url = new URL(requestUrl);
-  return String(
-    payload.pageUrl ??
-      payload.pageId ??
-      payload.url ??
-      payload.id ??
-      payload.page?.url ??
-      url.searchParams.get("pageUrl") ??
-      url.searchParams.get("pageId") ??
-      "",
-  );
+const QUEUE_SCAN_ATTEMPTS = 4;
+const QUEUE_SCAN_INTERVAL_MS = 5000;
+const QUEUE_TIME_BUDGET_MS = 100000;
+
+// 노션 버튼 웹훅은 페이지 URL 을 실어 보낼 수 없다(보낼 수 있는 건 DB 속성뿐).
+// 그래서 '발행 대기' 행을 서버가 직접 조회한다. 대기 = 발행 큐.
+async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
+  const filter = { property: "발행 상태", select: { equals: PUBLISH_READY_STATUS } };
+  const body = JSON.stringify({ filter, page_size: 20 });
+  const ids = (res: Json) => ((res.results ?? []) as Json[]).map((page) => page.id as string);
+
+  let firstError = "";
+  try {
+    // 데이터 소스 단위 조회가 최신 방식이다.
+    return ids(await notion(cfg, `/data_sources/${cfg.contentDataSourceId}/query`, {
+      method: "POST",
+      headers: { "Notion-Version": "2025-09-03" },
+      body,
+    }));
+  } catch (e) {
+    firstError = message(e);
+  }
+  try {
+    // 예전 버전 경로. 데이터 소스가 하나뿐인 DB 는 이쪽으로도 조회된다.
+    return ids(await notion(cfg, `/databases/${cfg.contentDatabaseId}/query`, {
+      method: "POST",
+      body,
+    }));
+  } catch (e) {
+    throw new Error(`컨텐츠 DB 조회에 실패했습니다. (${firstError} / ${message(e)})`);
+  }
 }
 
-Deno.serve(async (req) => {
-  let cfg: Config;
-  try {
-    cfg = buildConfig();
-  } catch (e) {
-    return json({ ok: false, error: message(e) }, 500);
+// 버튼 액션 순서가 어긋나 웹훅이 먼저 도착하면 그 시점엔 아직 '발행 대기' 가 아니다.
+// 몇 초 간격으로 몇 번 더 확인해서 그 경우를 흡수한다.
+async function findQueuedPageIds(cfg: Config): Promise<string[]> {
+  for (let attempt = 1; attempt <= QUEUE_SCAN_ATTEMPTS; attempt++) {
+    const ids = await queryQueuedPageIds(cfg);
+    if (ids.length > 0) return ids;
+    if (attempt < QUEUE_SCAN_ATTEMPTS) await sleep(QUEUE_SCAN_INTERVAL_MS);
   }
+  return [];
+}
 
-  // 인증 없이 열리는 GET 경로 두 개.
-  // - ?threads_auth=1 : 승인 링크를 보여주는 안내 페이지
-  // - ?code=...       : 스레드가 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
-  const reqUrl = new URL(req.url);
-  if (req.method === "GET" && reqUrl.searchParams.has("threads_auth")) {
-    return handleThreadsAuthPage(reqUrl, cfg);
-  }
-  if (req.method === "GET" && (reqUrl.searchParams.has("code") || reqUrl.searchParams.has("error"))) {
-    return await handleThreadsCallback(reqUrl, cfg);
-  }
-
-  if (req.headers.get("x-admin-key") !== cfg.adminSecret) {
-    return json({ ok: false, error: "인증에 실패했습니다. x-admin-key 헤더를 확인하세요." }, 401);
-  }
-
-  let payload: Json = {};
-  if (req.method === "POST") {
-    const raw = await req.text();
-    if (raw.trim() !== "") {
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        return json({ ok: false, error: "본문을 JSON으로 읽지 못했습니다." }, 400);
-      }
-    }
-  }
-
-  let pageId = "";
-  try {
-    pageId = parsePageId(readTarget(payload, req.url));
-  } catch (e) {
-    return json({ ok: false, error: message(e) }, 400);
-  }
-
-  // 테스트 실행: 이미지 수집과 Storage 업로드까지만 하고 발행하지 않는다.
-  const dryRun = payload.dryRun === true ||
-    new URL(req.url).searchParams.get("dryRun") === "true";
-
+async function publishOnePage(
+  cfg: Config,
+  pageId: string,
+  dryRun: boolean,
+): Promise<{ body: Json; status: number }> {
   try {
     const page = await notion(cfg, `/pages/${pageId}`);
     const props = (page.properties ?? {}) as Json;
 
     const currentStatus = selectName(props["발행 상태"]);
     if (!dryRun && !shouldPublish(currentStatus)) {
-      return json({
-        ok: true,
-        pageId,
-        skipped: true,
-        reason: currentStatus === ""
-          ? "발행 상태가 비어 있습니다. '발행 대기'일 때만 발행합니다."
-          : `발행 상태가 '${currentStatus}'입니다. '발행 대기'일 때만 발행합니다.`,
-      });
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          pageId,
+          skipped: true,
+          reason: currentStatus === ""
+            ? "발행 상태가 비어 있습니다. '발행 대기'일 때만 발행합니다."
+            : `발행 상태가 '${currentStatus}'입니다. '발행 대기'일 때만 발행합니다.`,
+        },
+      };
     }
 
     const cutIds = relationIds(props["컷(프롬프트)"]);
@@ -713,19 +714,22 @@ Deno.serve(async (req) => {
     }
 
     if (dryRun) {
-      return json({
-        ok: true,
-        dryRun: true,
-        pageId,
-        status: currentStatus,
-        channels,
-        imageCount: imageUrls.length,
-        images: imageUrls,
-        caption,
-        captionLength: caption.length,
-        threadsAuth: threadsAuthNote,
-        note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
-      });
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          dryRun: true,
+          pageId,
+          status: currentStatus,
+          channels,
+          imageCount: imageUrls.length,
+          images: imageUrls,
+          caption,
+          captionLength: caption.length,
+          threadsAuth: threadsAuthNote,
+          note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
+        },
+      };
     }
 
     const results: Json = {};
@@ -765,18 +769,21 @@ Deno.serve(async (req) => {
       await addComment(cfg, pageId, `META 업로드 실패\n\n${failures.join("\n")}\n\n${note}`);
     }
 
-    return json({
-      ok: failures.length === 0,
-      pageId,
-      imageCount: imageUrls.length,
-      channels,
-      results,
-      failures,
-    });
+    return {
+      status: 200,
+      body: {
+        ok: failures.length === 0,
+        pageId,
+        imageCount: imageUrls.length,
+        channels,
+        results,
+        failures,
+      },
+    };
   } catch (e) {
     const detail = message(e);
     if (dryRun) {
-      return json({ ok: false, dryRun: true, pageId, error: detail }, 500);
+      return { status: 500, body: { ok: false, dryRun: true, pageId, error: detail } };
     }
     try {
       await setPublishStatus(cfg, pageId, "발행 실패");
@@ -788,6 +795,101 @@ Deno.serve(async (req) => {
     } catch {
       // 코멘트 실패는 무시하고 응답으로 원인을 돌려준다.
     }
-    return json({ ok: false, pageId, error: detail }, 500);
+    return { status: 500, body: { ok: false, pageId, error: detail } };
   }
+}
+
+Deno.serve(async (req) => {
+  let cfg: Config;
+  try {
+    cfg = buildConfig();
+  } catch (e) {
+    return json({ ok: false, error: message(e) }, 500);
+  }
+
+  // 인증 없이 열리는 GET 경로 두 개.
+  // - ?threads_auth=1 : 승인 링크를 보여주는 안내 페이지
+  // - ?code=...       : 스레드가 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
+  const reqUrl = new URL(req.url);
+  if (req.method === "GET" && reqUrl.searchParams.has("threads_auth")) {
+    return handleThreadsAuthPage(reqUrl, cfg);
+  }
+  if (req.method === "GET" && (reqUrl.searchParams.has("code") || reqUrl.searchParams.has("error"))) {
+    return await handleThreadsCallback(reqUrl, cfg);
+  }
+
+  if (req.headers.get("x-admin-key") !== cfg.adminSecret) {
+    return json({ ok: false, error: "인증에 실패했습니다. x-admin-key 헤더를 확인하세요." }, 401);
+  }
+
+  let payload: Json = {};
+  if (req.method === "POST") {
+    const raw = await req.text();
+    if (raw.trim() !== "") {
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        // 노션 버튼 웹훅 본문 형식은 보장되지 않는다. 못 읽어도 큐 조회로 넘어간다.
+        payload = {};
+      }
+    }
+  }
+
+  // 테스트 실행: 이미지 수집과 Storage 업로드까지만 하고 발행하지 않는다.
+  const dryRun = payload.dryRun === true || reqUrl.searchParams.get("dryRun") === "true";
+  const target = readTarget(payload, req.url).trim();
+
+  // 페이지를 지정한 호출(수동 테스트, 재시도)은 그 페이지만 처리한다.
+  if (target !== "") {
+    let pageId = "";
+    try {
+      pageId = parsePageId(target);
+    } catch (e) {
+      return json({ ok: false, error: message(e) }, 400);
+    }
+    const result = await publishOnePage(cfg, pageId, dryRun);
+    return json(result.body, result.status);
+  }
+
+  // 큐 모드: 페이지 지정 없이 들어온 호출(노션 '게시' 버튼 웹훅)은 대기 중인 행을 처리한다.
+  const startedAt = Date.now();
+  const queued = await findQueuedPageIds(cfg);
+  if (queued.length === 0) {
+    return json({
+      ok: true,
+      queue: true,
+      dryRun,
+      requested: 0,
+      processed: 0,
+      results: [],
+      remaining: [],
+      message: "발행 대기 상태인 컨텐츠가 없습니다.",
+    });
+  }
+
+  const results: Json[] = [];
+  const remaining: string[] = [];
+  for (let index = 0; index < queued.length; index++) {
+    // 한 번의 호출이 함수 실행 시간 한도를 넘지 않도록 남은 행은 다음 호출로 미룬다.
+    if (index > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
+      remaining.push(queued[index]);
+      continue;
+    }
+    const result = await publishOnePage(cfg, queued[index], dryRun);
+    results.push({ pageId: queued[index], ...result.body });
+  }
+
+  const body: Json = {
+    ok: results.every((item) => item.ok !== false),
+    queue: true,
+    dryRun,
+    requested: queued.length,
+    processed: results.length,
+    results,
+    remaining,
+  };
+  if (remaining.length > 0) {
+    body.note = "처리 시간이 부족해 남은 행은 그대로 두었습니다. '게시' 버튼을 한 번 더 눌러주세요.";
+  }
+  return json(body, 200);
 });

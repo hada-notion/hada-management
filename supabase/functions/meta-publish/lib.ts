@@ -139,6 +139,29 @@ export function resolveRedirectUri(requestUrl: string, publicBaseUrl: string, ov
 }
 
 /** 발행 상태가 "발행 대기"일 때만 발행한다. 그 외에는 건너뛴다. */
+/**
+ * 요청에서 발행 대상 페이지를 뽑는다. 지정이 없으면 빈 문자열을 돌려주고,
+ * 호출부는 그때 큐 모드(발행 대기 행 조회)로 넘어간다.
+ * 노션 버튼 웹훅은 DB 속성만 보낼 수 있어서 페이지 URL 이 오지 않는다.
+ */
+export function readTarget(payload: Record<string, any>, requestUrl: string): string {
+  let params: URLSearchParams;
+  try {
+    params = new URL(requestUrl).searchParams;
+  } catch {
+    params = new URLSearchParams();
+  }
+  const value = payload.pageUrl ??
+    payload.pageId ??
+    payload.url ??
+    payload.id ??
+    payload.page?.url ??
+    params.get("pageUrl") ??
+    params.get("pageId") ??
+    "";
+  return String(value).trim();
+}
+
 export function shouldPublish(currentStatus: string | undefined): boolean {
   return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;
 }
