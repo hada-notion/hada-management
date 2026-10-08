@@ -1,7 +1,8 @@
 // META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 카드뉴스를 발행한다.
 //
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
-//   본문에 페이지 지정(pageUrl/pageId/url/id)이 있으면 그 페이지만 처리하고 결과를 그대로 돌려준다.
+//   본문에 페이지 지정(pageUrl/pageId/url/id)이 있거나 본문 어딘가에 노션 페이지 주소가 실려 있으면
+//   그 페이지만 처리하고 결과를 그대로 돌려준다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
 //   지정이 없으면 큐 모드다. '인스타그램 작업중'·'스레드 작업중' 체크가 켜진 행을 찾아 처리한다.
 //
 // 큐 모드는 즉시 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
@@ -25,6 +26,8 @@ import {
   THREADS_REFRESH_AFTER_DAYS,
   assertCarouselSize,
   buildCaption,
+  channelHint,
+  collectPageCandidates,
   captionLimitError,
   contentTypeFor,
   detectImageType,
@@ -744,13 +747,21 @@ async function collectImageUrls(cfg: Config, props: Json): Promise<string[]> {
   return sourceUrls;
 }
 
-async function publishRow(cfg: Config, pageId: string, dryRun: boolean): Promise<Json> {
+async function publishRow(
+  cfg: Config,
+  pageId: string,
+  dryRun: boolean,
+  only: Channel | null = null,
+): Promise<Json> {
   const page = await notion(cfg, `/pages/${pageId}`);
   const props = (page.properties ?? {}) as Json;
 
   const working = workingChannels(props);
+  // only 는 웹훅 주소의 ?channel= 로 지정한 채널이다. 지정이 있으면 그것만 처리한다.
   // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
-  const channels: Channel[] = working.length > 0 ? working : (dryRun ? [...CHANNELS] : []);
+  const channels: Channel[] = only !== null
+    ? [only]
+    : (working.length > 0 ? working : (dryRun ? [...CHANNELS] : []));
   if (channels.length === 0) {
     return {
       ok: true,
@@ -956,6 +967,37 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 
 // ---------- 진입점 ----------
 
+/**
+ * 발행할 페이지를 정한다.
+ * 본문에 페이지 지정이 있으면 그것을 쓰고, 없으면 본문 어딘가에 실린 노션 주소 중
+ * 실제 컨텐츠 페이지('컷(프롬프트)' 관계가 있는 페이지)를 골라 쓴다.
+ * 아무것도 못 찾으면 빈 문자열을 돌려주고 호출부는 큐 모드로 넘어간다.
+ */
+async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string): Promise<string> {
+  const explicit = readTarget(payload, requestUrl);
+  if (explicit !== "") return parsePageId(explicit);
+
+  const seen = new Set<string>();
+  for (const candidate of collectPageCandidates(payload)) {
+    let id = "";
+    try {
+      id = parsePageId(candidate);
+    } catch {
+      continue;
+    }
+    if (id === "" || seen.has(id)) continue;
+    seen.add(id);
+    try {
+      const page = await notion(cfg, `/pages/${id}`);
+      // 컷 관계가 없는 페이지(예: 관계 속성에 실려 온 컷 페이지)는 후보에서 뺀다.
+      if (((page.properties ?? {}) as Json)["컷(프롬프트)"] !== undefined) return id;
+    } catch {
+      // 접근할 수 없으면 다음 후보로 넘어간다.
+    }
+  }
+  return "";
+}
+
 Deno.serve(async (req) => {
   let cfg: Config;
   try {
@@ -983,6 +1025,7 @@ Deno.serve(async (req) => {
   if (req.method === "POST") {
     const raw = await req.text();
     if (raw.trim() !== "") {
+      console.log("meta-publish 본문", raw.slice(0, 1500));
       try {
         payload = JSON.parse(raw);
       } catch {
@@ -994,19 +1037,21 @@ Deno.serve(async (req) => {
 
   const dryRun = payload.dryRun === true || reqUrl.searchParams.get("dryRun") === "true";
   const wait = reqUrl.searchParams.get("wait") === "1";
-  const target = readTarget(payload, req.url);
+  const hintText = channelHint(reqUrl.searchParams.get("channel"));
+  const hint: Channel | null = hintText !== null && (CHANNELS as readonly string[]).includes(hintText)
+    ? hintText as Channel
+    : null;
 
   let pageId = "";
-  if (target !== "") {
-    try {
-      pageId = parsePageId(target);
-    } catch (e) {
-      return json({ ok: false, error: message(e) }, 400);
-    }
+  try {
+    pageId = await resolveTargetPage(cfg, payload, req.url);
+  } catch (e) {
+    return json({ ok: false, error: message(e) }, 400);
   }
+  console.log("meta-publish 대상", pageId || "(없음: 큐 모드)", "채널", hint ?? "(없음)");
 
   const task: Promise<Json> = pageId !== ""
-    ? publishRow(cfg, pageId, dryRun)
+    ? publishRow(cfg, pageId, dryRun, hint)
     : runQueue(cfg, dryRun);
 
   // 페이지를 지정한 수동 호출이나 ?wait=1 은 결과를 그대로 돌려준다.

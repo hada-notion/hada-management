@@ -13,6 +13,8 @@ import {
   isImageUrl,
   needsRefresh,
   normalizeChannels,
+  channelHint,
+  collectPageCandidates,
   parsePageId,
   readTarget,
   resolveRedirectUri,
@@ -246,4 +248,34 @@ Deno.test("readTarget: 페이지 지정이 없으면 빈 값이 되어 큐 모�
   assertEquals(readTarget({ pageUrl: "   " }, base), "");
   // 주소가 망가져도 예외로 죽지 않고 큐 모드로 넘어간다.
   assertEquals(readTarget({}, "not-a-url"), "");
+});
+
+Deno.test("collectPageCandidates: 본문 어디에 있든 노션 주소를 찾는다", () => {
+  assertEquals(
+    collectPageCandidates({ "페이지 URL": "https://app.notion.com/p/3f1ba040586b80fd91f0efa3c32b37c2" }),
+    ["https://app.notion.com/p/3f1ba040586b80fd91f0efa3c32b37c2"],
+  );
+  // 키 이름이 달라도, 깊이 묻혀 있어도 찾는다.
+  assertEquals(collectPageCandidates({ data: { properties: { link: "https://www.notion.so/x-3f1ba040586b80fd91f0efa3c32b37c2" } } }), [
+    "https://www.notion.so/x-3f1ba040586b80fd91f0efa3c32b37c2",
+  ]);
+  // 관계 속성처럼 주소가 여러 개면 전부 모은다. 어느 것이 컨텐츠 페이지인지는 호출부가 확인한다.
+  assertEquals(collectPageCandidates({ relation: ["3f1ba040586b80fd91f0efa3c32b37c2", "9d42bac3eece4995acda607590ae1728"] }), [
+    "3f1ba040586b80fd91f0efa3c32b37c2",
+    "9d42bac3eece4995acda607590ae1728",
+  ]);
+  // 주소가 아니면 담지 않는다.
+  assertEquals(collectPageCandidates({ "발행 상태": "발행 대기", "이름": "수업 중 상담 전화" }), []);
+  assertEquals(collectPageCandidates({ "인스타그램 링크": "https://www.instagram.com/p/abc" }), []);
+});
+
+Deno.test("channelHint: 주소의 channel 값으로 채널을 알아낸다", () => {
+  assertEquals(channelHint("instagram"), "인스타그램");
+  assertEquals(channelHint("IG"), "인스타그램");
+  assertEquals(channelHint("인스타그램"), "인스타그램");
+  assertEquals(channelHint("threads"), "스레드");
+  assertEquals(channelHint("스레드"), "스레드");
+  assertEquals(channelHint(null), null);
+  assertEquals(channelHint(""), null);
+  assertEquals(channelHint("youtube"), null);
 });

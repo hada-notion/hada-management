@@ -162,6 +162,43 @@ export function readTarget(payload: Record<string, any>, requestUrl: string): st
   return String(value).trim();
 }
 
+/**
+ * 웹훅 본문 어디에 있든 노션 페이지 주소처럼 생긴 값을 모은다.
+ * 노션 버튼 웹훅의 본문 키 이름이 화면마다 달라질 수 있어서 이름에 기대지 않는다.
+ */
+export function collectPageCandidates(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (
+      /notion\.(so|com)\//i.test(text) ||
+      /^[0-9a-f]{32}$/i.test(text) ||
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text)
+    ) {
+      out.push(text);
+    }
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectPageCandidates(item, out);
+    return out;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      collectPageCandidates(item, out);
+    }
+  }
+  return out;
+}
+
+/** URL 의 channel 값으로 채널을 알아낸다. 없으면 null. */
+export function channelHint(value: string | null): string | null {
+  const key = (value ?? "").trim().toLowerCase();
+  if (key === "") return null;
+  if (["instagram", "ig", "인스타그램", "인스타"].includes(key)) return "인스타그램";
+  if (["threads", "thread", "스레드"].includes(key)) return "스레드";
+  return null;
+}
+
 export function shouldPublish(currentStatus: string | undefined): boolean {
   return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;
 }
