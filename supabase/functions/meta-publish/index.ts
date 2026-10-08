@@ -1,9 +1,13 @@
 // META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 카드뉴스를 발행한다.
 //
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
-// 본문: { "pageUrl": "https://app.notion.com/p/..." }  — pageId/url/id 도 허용
-//       본문에 페이지 지정이 없으면 큐 모드로 동작한다. 컨텐츠 DB 에서 '발행 상태' 가
-//       '발행 대기' 인 행을 찾아 전부 발행한다. 노션 '게시' 버튼 웹훅이 이 경로를 쓴다.
+//   본문에 페이지 지정(pageUrl/pageId/url/id)이 있으면 그 페이지만 처리하고 결과를 그대로 돌려준다.
+//   지정이 없으면 큐 모드다. '인스타그램 작업중'·'스레드 작업중' 체크가 켜진 행을 찾아 처리한다.
+//
+// 큐 모드는 즉시 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
+// 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
+// 실제 결과는 페이지의 '발행 상태'·'실시간 처리 상태'·'인스타그램 상태'·'스레드 상태'로 확인한다.
+// 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
 //
 // 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
 // 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
@@ -29,12 +33,9 @@ import {
   hexPreview,
   extractImageUrls,
   needsRefresh,
-  normalizeChannels,
   parsePageId,
-  PUBLISH_READY_STATUS,
   readTarget,
   resolveRedirectUri,
-  shouldPublish,
   sortCuts,
   threadsAuthorizeUrl,
   truncate,
@@ -69,6 +70,7 @@ function buildConfig() {
     storageUrl: optionalEnv("SB_URL") || optionalEnv("SUPABASE_URL"),
     storageKey: optionalEnv("SB_SERVICE_ROLE_KEY") || optionalEnv("SUPABASE_SERVICE_ROLE_KEY"),
     bucket: optionalEnv("PUBLISH_BUCKET") || "meta-publish",
+    jobTable: optionalEnv("JOB_TABLE") || "meta_jobs",
     fixedComment: optionalEnv("PUBLISH_FIXED_COMMENT"),
     // 큐 모드에서 조회할 컨텐츠(학원관리) DB.
     contentDataSourceId: optionalEnv("CONTENT_DATA_SOURCE_ID") ||
@@ -588,16 +590,99 @@ async function publishThreads(
   return info.permalink ?? "";
 }
 
-// ---------- 진입점 ----------
+// ---------- 채널 ----------
 
-const QUEUE_SCAN_ATTEMPTS = 4;
-const QUEUE_SCAN_INTERVAL_MS = 5000;
-const QUEUE_TIME_BUDGET_MS = 100000;
+const CHANNELS = ["인스타그램", "스레드"] as const;
+type Channel = typeof CHANNELS[number];
 
+const WORK_PROP: Record<Channel, string> = {
+  "인스타그램": "인스타그램 작업중",
+  "스레드": "스레드 작업중",
+};
+const RESULT_PROP: Record<Channel, string> = {
+  "인스타그램": "인스타그램 상태",
+  "스레드": "스레드 상태",
+};
+const LINK_PROP: Record<Channel, string> = {
+  "인스타그램": "인스타그램 링크",
+  "스레드": "스레드 링크",
+};
+
+function isChecked(prop: Json | undefined): boolean {
+  return prop?.checkbox === true;
+}
+
+/** 지금 작업중 체크가 켜져 있는 채널. 버튼이 켜고 함수가 끝날 때 끈다. */
+function workingChannels(props: Json): Channel[] {
+  return CHANNELS.filter((channel) => isChecked(props[WORK_PROP[channel]]));
+}
+
+// ---------- 작업 잠금 ----------
+// 같은 행의 같은 채널을 두 실행이 동시에 처리하면 같은 글이 두 번 올라간다.
+// Supabase 표에 (페이지, 채널) 잠금을 걸어 한 번에 한 실행만 처리하게 한다.
+// 표가 없거나 잠금 장치가 막혀도 발행 자체를 막지는 않는다.
+
+const JOB_STALE_MS = 15 * 60 * 1000;
+
+async function claimJob(cfg: Config, pageId: string, channel: Channel): Promise<boolean> {
+  if (!storageReady(cfg)) return true;
+  const now = new Date().toISOString();
+  const key = `page_id=eq.${encodeURIComponent(pageId)}&channel=eq.${encodeURIComponent(channel)}`;
+  try {
+    const res = await sbRest(cfg, cfg.jobTable, {
+      method: "POST",
+      headers: { "Prefer": "resolution=ignore-duplicates,return=representation" },
+      body: JSON.stringify({ page_id: pageId, channel, started_at: now }),
+    });
+    if (res.status === 404) return true;
+    if (!res.ok) {
+      console.error("잠금 실패", res.status, (await res.text()).slice(0, 200));
+      return true;
+    }
+    const rows = (await res.json()) as Json[];
+    if (rows.length > 0) return true;
+
+    // 누가 이미 잡고 있다. 15분 넘게 멈춘 잠금이면 가져온다.
+    const cutoff = new Date(Date.now() - JOB_STALE_MS).toISOString();
+    const takeover = await sbRest(cfg, `${cfg.jobTable}?${key}&started_at=lt.${encodeURIComponent(cutoff)}`, {
+      method: "PATCH",
+      headers: { "Prefer": "return=representation" },
+      body: JSON.stringify({ started_at: now }),
+    });
+    if (!takeover.ok) return false;
+    const taken = (await takeover.json()) as Json[];
+    return taken.length > 0;
+  } catch (e) {
+    console.error("잠금 오류", message(e));
+    return true;
+  }
+}
+
+async function releaseJob(cfg: Config, pageId: string, channel: Channel): Promise<void> {
+  if (!storageReady(cfg)) return;
+  const key = `page_id=eq.${encodeURIComponent(pageId)}&channel=eq.${encodeURIComponent(channel)}`;
+  try {
+    await sbRest(cfg, `${cfg.jobTable}?${key}`, { method: "DELETE" });
+  } catch (e) {
+    console.error("잠금 해제 실패", message(e));
+  }
+}
+
+// ---------- 큐 ----------
 // 노션 버튼 웹훅은 페이지 URL 을 실어 보낼 수 없다(보낼 수 있는 건 DB 속성뿐).
-// 그래서 '발행 대기' 행을 서버가 직접 조회한다. 대기 = 발행 큐.
+// 그래서 작업중 체크가 켜진 행을 서버가 직접 조회한다.
+
+const QUEUE_SCAN_ATTEMPTS = 5;
+const QUEUE_SCAN_INTERVAL_MS = 4000;
+const QUEUE_TIME_BUDGET_MS = 110000;
+
 async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
-  const filter = { property: "발행 상태", select: { equals: PUBLISH_READY_STATUS } };
+  const filter = {
+    or: CHANNELS.map((channel) => ({
+      property: WORK_PROP[channel],
+      checkbox: { equals: true },
+    })),
+  };
   const body = JSON.stringify({ filter, page_size: 20 });
   const ids = (res: Json) => ((res.results ?? []) as Json[]).map((page) => page.id as string);
 
@@ -623,8 +708,8 @@ async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
   }
 }
 
-// 버튼 액션 순서가 어긋나 웹훅이 먼저 도착하면 그 시점엔 아직 '발행 대기' 가 아니다.
-// 몇 초 간격으로 몇 번 더 확인해서 그 경우를 흡수한다.
+// 버튼 액션 순서가 어긋나 웹훅이 먼저 도착하면 그 시점엔 아직 체크가 안 켜져 있다.
+// 몇 초 간격으로 몇 번 더 확인해서 그 경우를 흡수한다. 접수 응답을 먼저 보내므로 오래 기다려도 된다.
 async function findQueuedPageIds(cfg: Config): Promise<string[]> {
   for (let attempt = 1; attempt <= QUEUE_SCAN_ATTEMPTS; attempt++) {
     const ids = await queryQueuedPageIds(cfg);
@@ -634,170 +719,242 @@ async function findQueuedPageIds(cfg: Config): Promise<string[]> {
   return [];
 }
 
-async function publishOnePage(
-  cfg: Config,
-  pageId: string,
-  dryRun: boolean,
-): Promise<{ body: Json; status: number }> {
-  try {
-    const page = await notion(cfg, `/pages/${pageId}`);
-    const props = (page.properties ?? {}) as Json;
+// ---------- 발행 ----------
 
-    const currentStatus = selectName(props["발행 상태"]);
-    if (!dryRun && !shouldPublish(currentStatus)) {
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          pageId,
-          skipped: true,
-          reason: currentStatus === ""
-            ? "발행 상태가 비어 있습니다. '발행 대기'일 때만 발행합니다."
-            : `발행 상태가 '${currentStatus}'입니다. '발행 대기'일 때만 발행합니다.`,
-        },
-      };
-    }
+async function collectImageUrls(cfg: Config, props: Json): Promise<string[]> {
+  const cutIds = relationIds(props["컷(프롬프트)"]);
+  if (cutIds.length === 0) {
+    throw new Error("'컷(프롬프트)' 관계가 비어 있습니다. 발행할 컷을 먼저 연결하세요.");
+  }
+  const cuts: { pageId: string; order: number; files: any[] }[] = [];
+  for (const cutId of cutIds) {
+    const cutPage = await notion(cfg, `/pages/${cutId}`);
+    const cutProps = (cutPage.properties ?? {}) as Json;
+    cuts.push({
+      pageId: cutId,
+      order: cutOrder(cutProps["컷 순서"]),
+      files: cutProps["미리보기"]?.files ?? [],
+    });
+  }
+  const sourceUrls: string[] = [];
+  for (const cut of sortCuts(cuts)) sourceUrls.push(...extractImageUrls(cut.files));
+  if (sourceUrls.length === 0) {
+    throw new Error("발행할 이미지를 찾지 못했습니다. 컷의 '미리보기' 파일을 확인하세요.");
+  }
+  return sourceUrls;
+}
 
-    const cutIds = relationIds(props["컷(프롬프트)"]);
-    if (cutIds.length === 0) {
-      throw new Error("'컷(프롬프트)' 관계가 비어 있습니다. 발행할 컷을 먼저 연결하세요.");
-    }
+async function publishRow(cfg: Config, pageId: string, dryRun: boolean): Promise<Json> {
+  const page = await notion(cfg, `/pages/${pageId}`);
+  const props = (page.properties ?? {}) as Json;
 
-    const cuts: { pageId: string; order: number; files: any[] }[] = [];
-    for (const cutId of cutIds) {
-      const cutPage = await notion(cfg, `/pages/${cutId}`);
-      const cutProps = (cutPage.properties ?? {}) as Json;
-      cuts.push({
-        pageId: cutId,
-        order: cutOrder(cutProps["컷 순서"]),
-        files: cutProps["미리보기"]?.files ?? [],
-      });
-    }
+  const working = workingChannels(props);
+  // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
+  const channels: Channel[] = working.length > 0 ? working : (dryRun ? [...CHANNELS] : []);
+  if (channels.length === 0) {
+    return {
+      ok: true,
+      pageId,
+      skipped: true,
+      reason: "작업중 체크가 켜져 있지 않습니다. '인스타그램 배포'나 '스레드 배포' 버튼을 누르세요.",
+    };
+  }
 
-    const sourceUrls: string[] = [];
-    for (const cut of sortCuts(cuts)) sourceUrls.push(...extractImageUrls(cut.files));
-    if (sourceUrls.length === 0) {
-      throw new Error("발행할 이미지를 찾지 못했습니다. 컷의 '미리보기' 파일을 확인하세요.");
-    }
+  const sourceUrls = await collectImageUrls(cfg, props);
+  const caption = buildCaption(
+    richText(props["캡션"]),
+    richText(props["대본"]),
+    cfg.fixedComment,
+  );
+  if (caption.trim() === "") {
+    throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
+  }
 
-    const channels = normalizeChannels(multiSelectNames(props["발행 채널"]));
-    const caption = buildCaption(
-      richText(props["캡션"]),
-      richText(props["대본"]),
-      cfg.fixedComment,
-    );
-    if (caption.trim() === "") {
-      throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
-    }
-
-    // 한도 초과는 이미지 업로드와 인스타그램 발행보다 앞에서 막는다.
-    // 뒤에서 막으면 한 채널만 올라간 반쪽 상태가 된다.
-    const limitError = captionLimitError(caption, channels);
-    if (limitError) throw new Error(limitError);
-
-    if (!dryRun) await setPublishStatus(cfg, pageId, "발행 중");
-
+  // 테스트 실행: 이미지 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
+  if (dryRun) {
     const imageUrls: string[] = [];
     for (let index = 0; index < sourceUrls.length; index++) {
       imageUrls.push(await uploadImage(cfg, pageId, index, sourceUrls[index]));
     }
-
-    let threadsAuth: ThreadsAuth | null = null;
-    let threadsAuthNote = "발행 채널에 스레드가 없습니다.";
+    let threadsAuthNote = "요청 채널에 스레드가 없습니다.";
     if (channels.includes("스레드")) {
       try {
-        threadsAuth = await resolveThreadsAuth(cfg);
-        threadsAuthNote = `정상 (사용자 ID ${threadsAuth.userId})`;
+        threadsAuthNote = `정상 (사용자 ID ${(await resolveThreadsAuth(cfg)).userId})`;
       } catch (e) {
         threadsAuthNote = message(e);
       }
     }
-
-    if (dryRun) {
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          dryRun: true,
-          pageId,
-          status: currentStatus,
-          channels,
-          imageCount: imageUrls.length,
-          images: imageUrls,
-          caption,
-          captionLength: caption.length,
-          threadsAuth: threadsAuthNote,
-          note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
-        },
-      };
-    }
-
-    const results: Json = {};
-    const failures: string[] = [];
-
-    if (channels.includes("인스타그램")) {
-      try {
-        results.instagram = await publishInstagram(cfg, imageUrls, caption);
-      } catch (e) {
-        failures.push(`인스타그램 — ${message(e)}`);
-      }
-    }
-    if (channels.includes("스레드")) {
-      try {
-        if (!threadsAuth) throw new Error(threadsAuthNote);
-        results.threads = await publishThreads(cfg, threadsAuth, imageUrls, caption);
-      } catch (e) {
-        failures.push(`스레드 — ${message(e)}`);
-      }
-    }
-
-    const properties: Json = {
-      "발행 상태": { select: { name: failures.length === 0 ? "발행 완료" : "발행 실패" } },
-    };
-    if (results.instagram) properties["인스타그램 링크"] = { url: results.instagram };
-    if (results.threads) properties["스레드 링크"] = { url: results.threads };
-    if (failures.length === 0) {
-      properties["date:발행 시각:start"] = new Date().toISOString();
-      properties["date:발행 시각:is_datetime"] = 1;
-    }
-    await updatePage(cfg, pageId, properties);
-
-    if (failures.length > 0) {
-      const note = results.instagram || results.threads
-        ? "일부 채널만 발행되었습니다. 다시 실행하면 이미 올라간 채널에 중복 게시되니, '발행 채널'을 실패한 채널만 남기고 재시도하세요."
-        : "발행된 채널이 없습니다. 원인을 고친 뒤 다시 실행하세요.";
-      await addComment(cfg, pageId, `META 업로드 실패\n\n${failures.join("\n")}\n\n${note}`);
-    }
-
     return {
-      status: 200,
-      body: {
-        ok: failures.length === 0,
-        pageId,
-        imageCount: imageUrls.length,
-        channels,
-        results,
-        failures,
-      },
+      ok: true,
+      dryRun: true,
+      pageId,
+      channels,
+      imageCount: imageUrls.length,
+      images: imageUrls,
+      caption,
+      captionLength: caption.length,
+      threadsAuth: threadsAuthNote,
+      note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
     };
-  } catch (e) {
-    const detail = message(e);
-    if (dryRun) {
-      return { status: 500, body: { ok: false, dryRun: true, pageId, error: detail } };
-    }
-    try {
-      await setPublishStatus(cfg, pageId, "발행 실패");
-    } catch {
-      // 상태 변경까지 실패하면 코멘트로만 남긴다.
-    }
-    try {
-      await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}`);
-    } catch {
-      // 코멘트 실패는 무시하고 응답으로 원인을 돌려준다.
-    }
-    return { status: 500, body: { ok: false, pageId, error: detail } };
   }
+
+  await updatePage(cfg, pageId, {
+    "발행 상태": { select: { name: "발행 중" } },
+    "date:처리 시작 시각:start": new Date().toISOString(),
+    "date:처리 시작 시각:is_datetime": 1,
+  });
+
+  // 이미지는 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
+  let imageUrls: string[] | null = null;
+  const results: Json = {};
+  const failures: string[] = [];
+  let succeeded = false;
+
+  for (const channel of channels) {
+    if (!(await claimJob(cfg, pageId, channel))) {
+      results[channel] = "다른 실행이 처리 중이라 건너뛰었습니다.";
+      continue;
+    }
+    try {
+      await updatePage(cfg, pageId, {
+        [RESULT_PROP[channel]]: { select: { name: "진행중" } },
+      });
+
+      // 한도 초과는 그 채널의 이미지 업로드와 발행보다 앞에서 막는다.
+      const limitError = captionLimitError(caption, [channel]);
+      if (limitError) throw new Error(limitError);
+
+      if (!imageUrls) {
+        const uploaded: string[] = [];
+        for (let index = 0; index < sourceUrls.length; index++) {
+          uploaded.push(await uploadImage(cfg, pageId, index, sourceUrls[index]));
+        }
+        imageUrls = uploaded;
+      }
+
+      let link = "";
+      if (channel === "인스타그램") {
+        link = await publishInstagram(cfg, imageUrls, caption);
+      } else {
+        link = await publishThreads(cfg, await resolveThreadsAuth(cfg), imageUrls, caption);
+      }
+
+      succeeded = true;
+      const patch: Json = {
+        [RESULT_PROP[channel]]: { select: { name: "성공" } },
+        [WORK_PROP[channel]]: { checkbox: false },
+      };
+      if (link) patch[LINK_PROP[channel]] = { url: link };
+      await updatePage(cfg, pageId, patch);
+      results[channel] = link || "성공";
+    } catch (e) {
+      const detail = message(e);
+      failures.push(`${channel} — ${detail}`);
+      results[channel] = detail;
+      try {
+        await updatePage(cfg, pageId, {
+          [RESULT_PROP[channel]]: { select: { name: "실패" } },
+          [WORK_PROP[channel]]: { checkbox: false },
+          "마지막 오류": {
+            rich_text: [{ type: "text", text: { content: truncate(`${channel} — ${detail}`, 1800) } }],
+          },
+        });
+      } catch {
+        // 상태 기록까지 실패하면 코멘트로만 남긴다.
+      }
+    } finally {
+      await releaseJob(cfg, pageId, channel);
+    }
+  }
+
+  if (succeeded) {
+    await updatePage(cfg, pageId, {
+      "date:발행 시각:start": new Date().toISOString(),
+      "date:발행 시각:is_datetime": 1,
+    });
+  }
+
+  // 다시 읽어서 판단한다. 다른 실행이 아직 붙잡고 있는 채널이 남아 있으면 전체 상태를 끝내지 않는다.
+  const after = ((await notion(cfg, `/pages/${pageId}`)).properties ?? {}) as Json;
+  const stillWorking = workingChannels(after);
+  const states = CHANNELS.map((channel) => selectName(after[RESULT_PROP[channel]]));
+
+  const summary: Json = {};
+  if (stillWorking.length > 0) {
+    summary["발행 상태"] = { select: { name: "발행 중" } };
+  } else if (failures.length > 0 || states.includes("실패")) {
+    summary["발행 상태"] = { select: { name: "발행 실패" } };
+  } else {
+    summary["발행 상태"] = { select: { name: "발행 완료" } };
+    summary["마지막 오류"] = { rich_text: [] };
+  }
+  await updatePage(cfg, pageId, summary);
+
+  if (failures.length > 0) {
+    const note = succeeded
+      ? "성공한 채널은 그대로 두었습니다. 실패한 채널만 해당 버튼을 다시 눌러 재시도하세요."
+      : "발행된 채널이 없습니다. 원인을 고친 뒤 다시 실행하세요.";
+    await addComment(cfg, pageId, `META 업로드 실패\n\n${failures.join("\n")}\n\n${note}`);
+  }
+
+  return {
+    ok: failures.length === 0,
+    pageId,
+    channels,
+    imageCount: imageUrls ? imageUrls.length : 0,
+    results,
+    failures,
+    status: selectName(after["발행 상태"]),
+  };
 }
+
+async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
+  const startedAt = Date.now();
+  const queued = await findQueuedPageIds(cfg);
+  if (queued.length === 0) {
+    return {
+      ok: true,
+      queue: true,
+      dryRun,
+      requested: 0,
+      processed: 0,
+      results: [],
+      remaining: [],
+      message: "작업중 체크가 켜진 컨텐츠가 없습니다.",
+    };
+  }
+
+  const results: Json[] = [];
+  const remaining: string[] = [];
+  for (let index = 0; index < queued.length; index++) {
+    // 한 번의 실행이 함수 실행 시간 한도를 넘지 않도록 남은 행은 다음 호출로 미룬다.
+    if (index > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
+      remaining.push(queued[index]);
+      continue;
+    }
+    try {
+      results.push({ pageId: queued[index], ...(await publishRow(cfg, queued[index], dryRun)) });
+    } catch (e) {
+      results.push({ pageId: queued[index], ok: false, error: message(e) });
+    }
+  }
+
+  const body: Json = {
+    ok: results.every((item) => item.ok !== false),
+    queue: true,
+    dryRun,
+    requested: queued.length,
+    processed: results.length,
+    results,
+    remaining,
+  };
+  if (remaining.length > 0) {
+    body.note = "처리 시간이 부족해 남은 행은 그대로 두었습니다. 버튼을 한 번 더 눌러주세요.";
+  }
+  return body;
+}
+
+// ---------- 진입점 ----------
 
 Deno.serve(async (req) => {
   let cfg: Config;
@@ -835,61 +992,51 @@ Deno.serve(async (req) => {
     }
   }
 
-  // 테스트 실행: 이미지 수집과 Storage 업로드까지만 하고 발행하지 않는다.
   const dryRun = payload.dryRun === true || reqUrl.searchParams.get("dryRun") === "true";
-  const target = readTarget(payload, req.url).trim();
+  const wait = reqUrl.searchParams.get("wait") === "1";
+  const target = readTarget(payload, req.url);
 
-  // 페이지를 지정한 호출(수동 테스트, 재시도)은 그 페이지만 처리한다.
+  let pageId = "";
   if (target !== "") {
-    let pageId = "";
     try {
       pageId = parsePageId(target);
     } catch (e) {
       return json({ ok: false, error: message(e) }, 400);
     }
-    const result = await publishOnePage(cfg, pageId, dryRun);
-    return json(result.body, result.status);
   }
 
-  // 큐 모드: 페이지 지정 없이 들어온 호출(노션 '게시' 버튼 웹훅)은 대기 중인 행을 처리한다.
-  const startedAt = Date.now();
-  const queued = await findQueuedPageIds(cfg);
-  if (queued.length === 0) {
+  const task: Promise<Json> = pageId !== ""
+    ? publishRow(cfg, pageId, dryRun)
+    : runQueue(cfg, dryRun);
+
+  // 페이지를 지정한 수동 호출이나 ?wait=1 은 결과를 그대로 돌려준다.
+  if (pageId !== "" || wait) {
+    try {
+      const body = await task;
+      return json(body, body.ok === false ? 500 : 200);
+    } catch (e) {
+      return json({ ok: false, pageId, error: message(e) }, 500);
+    }
+  }
+
+  // 노션 웹훅: 접수만 알려주고 실제 발행은 백그라운드에서 이어간다.
+  const runtime = (globalThis as {
+    EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
+  }).EdgeRuntime;
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task.catch((e) => console.error("백그라운드 처리 실패", message(e))));
     return json({
       ok: true,
-      queue: true,
-      dryRun,
-      requested: 0,
-      processed: 0,
-      results: [],
-      remaining: [],
-      message: "발행 대기 상태인 컨텐츠가 없습니다.",
-    });
+      accepted: true,
+      message: "접수했습니다. 실제 결과는 페이지의 발행 상태와 실시간 처리 상태로 확인하세요.",
+    }, 202);
   }
 
-  const results: Json[] = [];
-  const remaining: string[] = [];
-  for (let index = 0; index < queued.length; index++) {
-    // 한 번의 호출이 함수 실행 시간 한도를 넘지 않도록 남은 행은 다음 호출로 미룬다.
-    if (index > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
-      remaining.push(queued[index]);
-      continue;
-    }
-    const result = await publishOnePage(cfg, queued[index], dryRun);
-    results.push({ pageId: queued[index], ...result.body });
+  // 백그라운드 실행을 못 쓰는 환경이면 그대로 기다린다.
+  try {
+    const body = await task;
+    return json(body, body.ok === false ? 500 : 200);
+  } catch (e) {
+    return json({ ok: false, error: message(e) }, 500);
   }
-
-  const body: Json = {
-    ok: results.every((item) => item.ok !== false),
-    queue: true,
-    dryRun,
-    requested: queued.length,
-    processed: results.length,
-    results,
-    remaining,
-  };
-  if (remaining.length > 0) {
-    body.note = "처리 시간이 부족해 남은 행은 그대로 두었습니다. '게시' 버튼을 한 번 더 눌러주세요.";
-  }
-  return json(body, 200);
 });
