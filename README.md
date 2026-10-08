@@ -76,10 +76,10 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
    `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish`
    입력 후 반드시 **Enter** 를 눌러 태그로 만들어야 저장된다.
 2. 같은 화면에서 앱 역할에 `ha.da_2025` 를 Threads 테스터로 추가한다.
-3. 브라우저에서 아래 주소를 연다.
+3. 브라우저에서 아래 주소를 열면 승인 링크가 나온다. 링크를 눌러 승인한다.
 
    ```
-   https://threads.com/oauth/authorize?client_id=<THREADS_APP_ID>&redirect_uri=<위 리디렉션 URI>&scope=threads_basic,threads_content_publish&response_type=code
+   https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?threads_auth=1
    ```
 
 4. 승인하면 함수로 되돌아오고, 함수가 code 를 60일 토큰으로 바꿔 `meta_tokens` 표에 저장한 뒤 `스레드 인증 완료` 화면을 보여준다.

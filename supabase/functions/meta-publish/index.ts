@@ -3,6 +3,7 @@
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
 // 본문: { "pageUrl": "https://app.notion.com/p/..." }  — pageId/url/id 도 허용
 //
+// 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
 // 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
 //
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
@@ -12,6 +13,7 @@ import {
   IG_CAROUSEL_MIN,
   THREADS_CAROUSEL_MAX,
   THREADS_CAROUSEL_MIN,
+  THREADS_AUTHORIZE_SCOPES,
   THREADS_REFRESH_AFTER_DAYS,
   assertCarouselSize,
   buildCaption,
@@ -24,6 +26,7 @@ import {
   resolveRedirectUri,
   shouldPublish,
   sortCuts,
+  threadsAuthorizeUrl,
   truncate,
 } from "./lib.ts";
 
@@ -450,6 +453,23 @@ async function resolveThreadsAuth(cfg: Config): Promise<ThreadsAuth> {
   return { userId: row.user_id ?? cfg.threadsUserId, token };
 }
 
+/** 브라우저로 열어 승인을 시작하는 안내 페이지. 링크만 보여주므로 인증이 필요 없다. */
+function handleThreadsAuthPage(url: URL, cfg: Config): Response {
+  try {
+    assertThreadsApp(cfg);
+    const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.threadsRedirectUri);
+    const link = threadsAuthorizeUrl(cfg.threadsAppId, redirectUri, THREADS_AUTHORIZE_SCOPES);
+    return htmlPage(
+      "스레드 인증 시작",
+      `아래 링크를 열어 @ha.da_2025 로 승인하세요.<br><br>` +
+        `<a href="${escapeHtml(link)}" style="font-size:16px">스레드 승인 화면 열기</a><br><br>` +
+        `되돌아올 주소: ${escapeHtml(redirectUri)}`,
+    );
+  } catch (e) {
+    return htmlPage("스레드 인증 준비 실패", escapeHtml(message(e)), 500);
+  }
+}
+
 /** 스레드가 브라우저를 되돌려보내는 주소. code 를 장기 토큰으로 바꿔 저장한다. */
 async function handleThreadsCallback(url: URL, cfg: Config): Promise<Response> {
   const denied = url.searchParams.get("error");
@@ -585,11 +605,15 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: message(e) }, 500);
   }
 
-  // 스레드 OAuth 콜백. 스레드가 브라우저를 돌려보내는 주소라 x-admin-key 를 붙일 수 없다.
-  // code 는 1회용·1시간짜리이고 우리 앱의 redirect_uri 로만 돌아오므로 이 경로만 열어둔다.
-  if (req.method === "GET" && (new URL(req.url).searchParams.has("code") ||
-    new URL(req.url).searchParams.has("error"))) {
-    return await handleThreadsCallback(new URL(req.url), cfg);
+  // 인증 없이 열리는 GET 경로 두 개.
+  // - ?threads_auth=1 : 승인 링크를 보여주는 안내 페이지
+  // - ?code=...       : 스레드가 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
+  const reqUrl = new URL(req.url);
+  if (req.method === "GET" && reqUrl.searchParams.has("threads_auth")) {
+    return handleThreadsAuthPage(reqUrl, cfg);
+  }
+  if (req.method === "GET" && (reqUrl.searchParams.has("code") || reqUrl.searchParams.has("error"))) {
+    return await handleThreadsCallback(reqUrl, cfg);
   }
 
   if (req.headers.get("x-admin-key") !== cfg.adminSecret) {
