@@ -62,6 +62,32 @@ export function normalizeChannels(values: string[] | undefined): string[] {
 
 export const PUBLISH_READY_STATUS = "발행 대기";
 
+export const IG_CAPTION_LIMIT = 2200;
+export const THREADS_TEXT_LIMIT = 500;
+
+/** 채널별 캡션 한도. 넘으면 발행하지 않고 멈춘다. */
+export const CAPTION_LIMITS: Record<string, number> = {
+  "인스타그램": IG_CAPTION_LIMIT,
+  "스레드": THREADS_TEXT_LIMIT,
+};
+
+/**
+ * 발행 대상 채널 중 한도를 넘은 것이 있으면 사유를 돌려준다. 없으면 null.
+ * 잘림 판정과 같은 기준(문자열 길이)으로 세어, 잘릴 조건이면 발행 전에 멈춘다.
+ */
+export function captionLimitError(caption: string, channels: string[]): string | null {
+  for (const channel of channels) {
+    const limit = CAPTION_LIMITS[channel];
+    if (limit === undefined) continue;
+    if (caption.length > limit) {
+      return `${channel} 한도(${limit}자)를 넘었습니다. 현재 ${caption.length}자, ${
+        caption.length - limit
+      }자를 줄여야 합니다.`;
+    }
+  }
+  return null;
+}
+
 /** 스레드 토큰은 60일짜리라, 마지막 갱신 후 이 일수가 지나면 미리 갱신한다. */
 export const THREADS_REFRESH_AFTER_DAYS = 30;
 

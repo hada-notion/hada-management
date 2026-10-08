@@ -3,6 +3,7 @@ import {
   THREADS_CAROUSEL_MAX,
   assertCarouselSize,
   buildCaption,
+  captionLimitError,
   contentTypeFor,
   detectImageType,
   expiresAtFrom,
@@ -201,4 +202,26 @@ Deno.test("hexPreview: 앞바이트를 16진수로 보여준다", () => {
   assertEquals(hexPreview(new Uint8Array([0x89, 0x50, 0x4e, 0x47])), "89 50 4e 47");
   assertEquals(hexPreview(new Uint8Array([0x01, 0x0a]), 8), "01 0a");
   assertEquals(hexPreview(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]), 3), "01 02 03");
+});
+
+Deno.test("captionLimitError: 채널 한도를 넘으면 발행 전에 막는다", () => {
+  assertEquals(captionLimitError("가".repeat(500), ["스레드"]), null);
+  assertEquals(
+    captionLimitError("가".repeat(501), ["스레드"]),
+    "스레드 한도(500자)를 넘었습니다. 현재 501자, 1자를 줄여야 합니다.",
+  );
+  assertEquals(captionLimitError("가".repeat(2200), ["인스타그램"]), null);
+  assertEquals(
+    captionLimitError("가".repeat(2201), ["인스타그램"]),
+    "인스타그램 한도(2200자)를 넘었습니다. 현재 2201자, 1자를 줄여야 합니다.",
+  );
+  // 스레드가 대상이 아니면 500자를 넘어도 통과한다.
+  assertEquals(captionLimitError("가".repeat(900), ["인스타그램"]), null);
+  // 두 채널 모두 대상이면 먼저 걸리는 채널에서 멈춘다.
+  assertEquals(
+    captionLimitError("가".repeat(600), ["인스타그램", "스레드"]),
+    "스레드 한도(500자)를 넘었습니다. 현재 600자, 100자를 줄여야 합니다.",
+  );
+  // 한도가 정의되지 않은 채널은 검사하지 않는다.
+  assertEquals(captionLimitError("가".repeat(900), ["기타"]), null);
 });

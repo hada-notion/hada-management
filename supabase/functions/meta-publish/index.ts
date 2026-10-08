@@ -9,14 +9,17 @@
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
 
 import {
+  IG_CAPTION_LIMIT,
   IG_CAROUSEL_MAX,
   IG_CAROUSEL_MIN,
+  THREADS_TEXT_LIMIT,
   THREADS_CAROUSEL_MAX,
   THREADS_CAROUSEL_MIN,
   THREADS_AUTHORIZE_SCOPES,
   THREADS_REFRESH_AFTER_DAYS,
   assertCarouselSize,
   buildCaption,
+  captionLimitError,
   contentTypeFor,
   detectImageType,
   expiresAtFrom,
@@ -34,8 +37,6 @@ import {
 } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
-const IG_CAPTION_LIMIT = 2200;
-const THREADS_TEXT_LIMIT = 500;
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
 const IG_CONTAINER_POLL_INTERVAL_MS = 3000;
 const COMMENT_LIMIT = 1900;
@@ -687,6 +688,11 @@ Deno.serve(async (req) => {
     if (caption.trim() === "") {
       throw new Error("캡션과 대본이 모두 비어 있습니다. 발행 문구를 채워주세요.");
     }
+
+    // 한도 초과는 이미지 업로드와 인스타그램 발행보다 앞에서 막는다.
+    // 뒤에서 막으면 한 채널만 올라간 반쪽 상태가 된다.
+    const limitError = captionLimitError(caption, channels);
+    if (limitError) throw new Error(limitError);
 
     if (!dryRun) await setPublishStatus(cfg, pageId, "발행 중");
 
