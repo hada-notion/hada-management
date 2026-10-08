@@ -21,6 +21,7 @@ import {
   needsRefresh,
   normalizeChannels,
   parsePageId,
+  resolveRedirectUri,
   shouldPublish,
   sortCuts,
   truncate,
@@ -461,9 +462,7 @@ async function handleThreadsCallback(url: URL, cfg: Config): Promise<Response> {
   if (code === "") return htmlPage("스레드 인증 실패", "code 값이 없습니다.", 400);
 
   try {
-    const redirectUri = cfg.threadsRedirectUri !== ""
-      ? cfg.threadsRedirectUri
-      : `${url.origin}${url.pathname}`;
+    const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.threadsRedirectUri);
 
     const short = await exchangeThreadsCode(cfg, code, redirectUri);
     const shortToken = String(short.access_token ?? "");
@@ -588,7 +587,8 @@ Deno.serve(async (req) => {
 
   // 스레드 OAuth 콜백. 스레드가 브라우저를 돌려보내는 주소라 x-admin-key 를 붙일 수 없다.
   // code 는 1회용·1시간짜리이고 우리 앱의 redirect_uri 로만 돌아오므로 이 경로만 열어둔다.
-  if (req.method === "GET" && (new URL(req.url).searchParams.has("code") || new URL(req.url).searchParams.has("error"))) {
+  if (req.method === "GET" && (new URL(req.url).searchParams.has("code") ||
+    new URL(req.url).searchParams.has("error"))) {
     return await handleThreadsCallback(new URL(req.url), cfg);
   }
 

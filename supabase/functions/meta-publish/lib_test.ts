@@ -10,6 +10,7 @@ import {
   needsRefresh,
   normalizeChannels,
   parsePageId,
+  resolveRedirectUri,
   shouldPublish,
   sortCuts,
   threadsAuthorizeUrl,
@@ -115,13 +116,13 @@ Deno.test("extensionFor: content-type 우선, 없으면 주소 확장자", () =>
 
 Deno.test("threadsAuthorizeUrl: 승인 주소를 만든다", () => {
   const url = threadsAuthorizeUrl(
-    "1798018586325",
+    "1798018584846325",
     "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
     ["threads_basic", "threads_content_publish"],
   );
   const parsed = new URL(url);
   assertEquals(parsed.origin + parsed.pathname, "https://threads.com/oauth/authorize");
-  assertEquals(parsed.searchParams.get("client_id"), "1798018586325");
+  assertEquals(parsed.searchParams.get("client_id"), "1798018584846325");
   assertEquals(parsed.searchParams.get("scope"), "threads_basic,threads_content_publish");
   assertEquals(parsed.searchParams.get("response_type"), "code");
   assertEquals(
@@ -136,7 +137,6 @@ Deno.test("needsRefresh: 30일이 지나면 true, 그 전에는 false", () => {
   assertEquals(needsRefresh(now - 29 * day, now, 30), false);
   assertEquals(needsRefresh(now - 30 * day, now, 30), true);
   assertEquals(needsRefresh(now - 45 * day, now, 30), true);
-  // 아직 지나지 않은 미래 시각이거나 값이 깨졌으면 갱신하지 않는다.
   assertEquals(needsRefresh(now + day, now, 30), false);
   assertEquals(needsRefresh(Number.NaN, now, 30), false);
 });
@@ -147,4 +147,23 @@ Deno.test("expiresAtFrom: expires_in 초를 만료 시각으로 바꾼다", () =
   assertEquals(expiresAtFrom(now, "3600"), "2026-08-01T01:00:00.000Z");
   assertEquals(expiresAtFrom(now, undefined), null);
   assertEquals(expiresAtFrom(now, 0), null);
+});
+
+Deno.test("resolveRedirectUri: 내부 주소를 공개 주소로 바꾼다", () => {
+  const base = "https://fkqassnvyakenoslhfgn.supabase.co";
+  // Supabase 함수가 넘겨주는 내부 주소
+  assertEquals(
+    resolveRedirectUri("http://fkqassnvyakenoslhfgn.supabase.co/meta-publish?code=x", base, ""),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+  );
+  // 이미 공개 주소로 들어온 경우
+  assertEquals(
+    resolveRedirectUri(`${base}/functions/v1/meta-publish?code=x`, base, ""),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+  );
+  // 환경값이 있으면 그 값을 그대로 쓴다 (끝 슬래시만 정리)
+  assertEquals(resolveRedirectUri("http://x/meta-publish", base, `${base}/functions/v1/meta-publish/`),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish");
+  // 공개 주소를 모르면 호스트만 https 로 살린다
+  assertEquals(resolveRedirectUri("http://x/meta-publish", "", ""), "https://x/meta-publish");
 });

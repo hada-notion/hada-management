@@ -93,6 +93,25 @@ export function expiresAtFrom(nowMs: number, expiresInSeconds: unknown): string 
   return new Date(nowMs + seconds * 1000).toISOString();
 }
 
+/**
+ * 스레드가 되돌아올 주소를 정한다.
+ * Supabase 함수는 요청 주소를 내부 주소(http://ref.supabase.co/함수이름)로 넘겨주기 때문에
+ * 그대로 쓰면 스레드가 거부한다. 공개 주소(SB_URL)에 함수 경로를 붙여 만든다.
+ * THREADS_REDIRECT_URI 가 있으면 그 값을 그대로 쓴다.
+ */
+export function resolveRedirectUri(requestUrl: string, publicBaseUrl: string, override: string): string {
+  const trimmed = (override ?? "").trim();
+  if (trimmed !== "") return trimmed.replace(/\/+$/, "");
+
+  const parsed = new URL(requestUrl);
+  const base = (publicBaseUrl ?? "").trim().replace(/\/+$/, "");
+  const path = parsed.pathname.replace(/\/+$/, "");
+
+  if (path.startsWith("/functions/v1/")) return `${base}${path}`;
+  if (base !== "") return `${base}/functions/v1${path}`;
+  return `https://${parsed.host}${path}`;
+}
+
 /** 발행 상태가 "발행 대기"일 때만 발행한다. 그 외에는 건너뛴다. */
 export function shouldPublish(currentStatus: string | undefined): boolean {
   return (currentStatus ?? "").trim() === PUBLISH_READY_STATUS;

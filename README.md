@@ -50,13 +50,13 @@ Settings → Secrets and variables → Actions
 | `IG_USER_ID` | 예 | 인스타그램 비즈니스 계정 ID |
 | `IG_ACCESS_TOKEN` | 예 | 인스타그램 액세스 토큰 |
 | `THREADS_APP_ID` | 예 | 메타 앱의 Threads App ID (스레드 인증용) |
-| `THREADS_APP_SECRET` | 예 | 메타 앱의 Threads App secret (스레드 인증용) |
+| `THREADS_APP_SECRET` | 예 | 메타 앱의 Threads App secret (스레드 인증용). 페이스북 앱 시크릿 코드와 다른 값이다 |
 | `PUBLISH_FIXED_COMMENT` | 아니오 | 캡션 뒤에 붙는 고정 멘트 |
 | `META_GRAPH_VERSION` | 아니오 | 기본 `v26.0` |
 | `IG_API_BASE` | 아니오 | 기본 `https://graph.facebook.com`. 인스타그램 로그인 방식이면 `https://graph.instagram.com` |
 | `THREADS_GRAPH_VERSION` | 아니오 | 기본 `v1.0` |
 | `THREADS_OAUTH_BASE` | 아니오 | 기본 `https://graph.threads.com`. 실패하면 `https://graph.threads.net` 을 자동으로 다시 시도한다 |
-| `THREADS_REDIRECT_URI` | 아니오 | 비우면 함수 자신의 주소를 쓴다. 스레드 앱에 등록한 값과 달라야 할 때만 채운다 |
+| `THREADS_REDIRECT_URI` | 아니오 | 비우면 함수가 `SB_URL` 로 공개 주소를 스스로 만든다. 스레드 앱에 등록한 값과 달라야 할 때만 채운다 |
 | `THREADS_USER_ID` | 아니오 | 스레드 인증 전 임시값. 인증하면 `meta_tokens` 표의 값이 우선한다 |
 | `THREADS_ACCESS_TOKEN` | 아니오 | 위와 같다 |
 | `TOKEN_TABLE` | 아니오 | 기본 `meta_tokens` |
@@ -72,9 +72,10 @@ Supabase 대시보드 → SQL Editor 에 `supabase/meta_tokens.sql` 내용을 �
 
 Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 자체 OAuth 를 한 번 거쳐야 한다.
 
-1. 메타 앱 대시보드 → Threads → 설정에 리디렉션 URI 를 등록한다.
+1. 메타 앱 대시보드 → 이용 사례 → Threads API 액세스 → 설정 에서 **리디렉션 콜백 URL** 을 등록한다.
    `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish`
-2. 같은 화면에서 앱 역할에 `ha.da_2025` 를 Threads Tester 로 추가하고, 스레드 앱의 설정 → 웹사이트 권한에서 초대를 수락한다.
+   입력 후 반드시 **Enter** 를 눌러 태그로 만들어야 저장된다.
+2. 같은 화면에서 앱 역할에 `ha.da_2025` 를 Threads 테스터로 추가한다.
 3. 브라우저에서 아래 주소를 연다.
 
    ```
@@ -116,5 +117,6 @@ curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish" 
 
 ## 검증 상태
 
-- 통과: `deno check` 타입 검사, 순수 로직 테스트 12개
-- 미검증: 실제 메타 앱·토큰으로 발행, 스레드 인증 콜백, 노션 자동화 연결, Storage 업로드, 앱 심사
+- 통과: `deno check` 타입 검사, 순수 로직 테스트 13개
+- 통과: 스레드 승인 화면 진입, 승인 code 수신까지 실제 앱으로 확인
+- 미검증: 실제 발행, 노션 자동화 연결, Storage 업로드, 앱 심사
