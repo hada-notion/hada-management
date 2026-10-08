@@ -316,27 +316,13 @@ async function publishInstagram(cfg: Config, imageUrls: string[], caption: strin
 
 const THREADS_OAUTH_FALLBACK = "https://graph.threads.net";
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function htmlPage(title: string, body: string, status = 200): Response {
-  return new Response(
-    `<!doctype html>
-<html lang="ko">
-<meta charset="utf-8">
-<title>${escapeHtml(title)}</title>
-<body style="font-family:system-ui,-apple-system,sans-serif;padding:48px;line-height:1.7;color:#111">
-<h1 style="font-size:20px;margin:0 0 12px">${escapeHtml(title)}</h1>
-<p style="margin:0">${body}</p>
-</body>
-</html>`,
-    { status, headers: { "Content-Type": "text/html; charset=utf-8" } },
-  );
+// Supabase 게이트웨이가 응답의 Content-Type 을 text/plain 으로 덮어써서 HTML 은 렌더링되지 않는다.
+// 그래서 사람이 읽기 좋은 평문으로 돌려주고, 한글이 깨지지 않게 UTF-8 BOM 을 앞에 붙인다.
+function textPage(title: string, body: string, status = 200): Response {
+  return new Response(`\uFEFF${title}\n\n${body}\n`, {
+    status,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
 }
 
 /** OAuth 호스트는 graph.threads.com 과 graph.threads.net 이 혼용되어 있어 둘 다 시도한다. */
@@ -459,14 +445,14 @@ function handleThreadsAuthPage(url: URL, cfg: Config): Response {
     assertThreadsApp(cfg);
     const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.threadsRedirectUri);
     const link = threadsAuthorizeUrl(cfg.threadsAppId, redirectUri, THREADS_AUTHORIZE_SCOPES);
-    return htmlPage(
-      "스레드 인증 시작",
-      `아래 링크를 열어 @ha.da_2025 로 승인하세요.<br><br>` +
-        `<a href="${escapeHtml(link)}" style="font-size:16px">스레드 승인 화면 열기</a><br><br>` +
-        `되돌아올 주소: ${escapeHtml(redirectUri)}`,
+    return textPage(
+      "스레드 인증",
+      `아래 주소를 복사해 브라우저 주소창에 붙여넣고 @ha.da_2025 로 승인하세요.\n\n` +
+        `${link}\n\n` +
+        `되돌아올 주소: ${redirectUri}`,
     );
   } catch (e) {
-    return htmlPage("스레드 인증 준비 실패", escapeHtml(message(e)), 500);
+    return textPage("스레드 인증 준비 실패", message(e), 500);
   }
 }
 
@@ -475,11 +461,11 @@ async function handleThreadsCallback(url: URL, cfg: Config): Promise<Response> {
   const denied = url.searchParams.get("error");
   if (denied) {
     const detail = url.searchParams.get("error_description") ?? denied;
-    return htmlPage("스레드 인증 취소", escapeHtml(detail), 400);
+    return textPage("스레드 인증 취소", detail, 400);
   }
 
   const code = url.searchParams.get("code") ?? "";
-  if (code === "") return htmlPage("스레드 인증 실패", "code 값이 없습니다.", 400);
+  if (code === "") return textPage("스레드 인증 실패", "code 값이 없습니다.", 400);
 
   try {
     const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.threadsRedirectUri);
@@ -502,14 +488,12 @@ async function handleThreadsCallback(url: URL, cfg: Config): Promise<Response> {
       updated_at: new Date(now).toISOString(),
     });
 
-    return htmlPage(
+    return textPage(
       "스레드 인증 완료",
-      `@${escapeHtml(String(me.username ?? ""))} (ID ${
-        escapeHtml(String(me.id ?? ""))
-      }) 연결을 저장했습니다. 이 창은 닫아도 됩니다.`,
+      `@${me.username ?? ""} (ID ${me.id ?? ""}) 연결을 저장했습니다. 이 창은 닫아도 됩니다.`,
     );
   } catch (e) {
-    return htmlPage("스레드 인증 실패", escapeHtml(message(e)), 500);
+    return textPage("스레드 인증 실패", message(e), 500);
   }
 }
 
