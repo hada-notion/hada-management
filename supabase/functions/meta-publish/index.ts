@@ -862,10 +862,6 @@ const RESULT_PROP: Record<Channel, string> = {
   "인스타그램": "인스타그램 상태",
   "스레드": "스레드 상태",
 };
-const LINK_PROP: Record<Channel, string> = {
-  "인스타그램": "인스타그램 링크",
-  "스레드": "스레드 링크",
-};
 
 // 채널 상태 값. 학원관리 다른 DB 와 같은 5단계를 쓴다.
 const STATUS_WAITING = "⚪ 대기";
@@ -1016,6 +1012,72 @@ async function findChannelPageId(cfg: Config, name: string): Promise<string> {
 
 type PostRecord = { channel: string; url: string; created: boolean };
 
+/** 이 산출물·채널의 게시물 기록들. */
+async function findPostRecords(cfg: Config, pageId: string, channelId: string): Promise<Json[]> {
+  return await queryDataSource(cfg, cfg.postDataSourceId, {
+    and: [
+      { property: "산출물", relation: { contains: pageId } },
+      { property: "채널", relation: { contains: channelId } },
+    ],
+  });
+}
+
+async function createPostPage(
+  cfg: Config,
+  pageId: string,
+  title: string,
+  channel: string,
+  channelId: string,
+  extra: Json = {},
+): Promise<Json> {
+  return await notion(cfg, "/pages", {
+    method: "POST",
+    headers: { "Notion-Version": POST_API_VERSION },
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: cfg.postDataSourceId },
+      properties: {
+        "이름": { title: [{ type: "text", text: { content: truncate(`${title} · ${channel}`, 1900) } }] },
+        "채널": { relation: [{ id: channelId }] },
+        "산출물": { relation: [{ id: pageId }] },
+        ...extra,
+      },
+    }),
+  });
+}
+
+/**
+ * 자동 발행에 성공한 채널을 게시물 DB 에 기록한다. 성과 트래킹은 이 게시물 기록에 붙는다.
+ * 같은 산출물·채널 기록 중 게시 링크가 빈 것이 있으면 그 기록을 채우고, 없으면 새로 만든다.
+ * 다시 발행한 경우(상태를 비우고 재발행)에는 이전 기록을 덮어쓰지 않고 새 기록이 생긴다.
+ */
+async function recordPublishedPost(
+  cfg: Config,
+  pageId: string,
+  props: Json,
+  channel: string,
+  link: string,
+): Promise<string> {
+  const channelId = await findChannelPageId(cfg, channel);
+  const fields: Json = {
+    "게시 상태": { select: { name: "게시" } },
+    "게시일": { date: { start: new Date().toISOString() } },
+  };
+  if (link) fields["게시 링크"] = { url: link };
+
+  const existing = await findPostRecords(cfg, pageId, channelId);
+  const empty = existing.find((row) => !((row.properties ?? {}) as Json)["게시 링크"]?.url);
+  if (empty) {
+    await notion(cfg, `/pages/${empty.id}`, {
+      method: "PATCH",
+      headers: { "Notion-Version": POST_API_VERSION },
+      body: JSON.stringify({ properties: fields }),
+    });
+    return (empty.url as string) ?? "";
+  }
+  const page = await createPostPage(cfg, pageId, pageTitle(props) || "제목 없음", channel, channelId, fields);
+  return (page.url as string) ?? "";
+}
+
 /**
  * 채널마다 게시물 DB 에 기록을 하나 만든다.
  * 같은 산출물·채널 기록이 이미 있으면 새로 만들지 않는다. 버튼을 여러 번 눌러도 기록은 하나다.
@@ -1033,28 +1095,12 @@ async function createPostRecords(
   for (const channel of channels) {
     try {
       const channelId = await findChannelPageId(cfg, channel);
-      const existing = await queryDataSource(cfg, cfg.postDataSourceId, {
-        and: [
-          { property: "산출물", relation: { contains: pageId } },
-          { property: "채널", relation: { contains: channelId } },
-        ],
-      });
+      const existing = await findPostRecords(cfg, pageId, channelId);
       if (existing.length > 0) {
         records.push({ channel, url: (existing[0].url as string) ?? "", created: false });
         continue;
       }
-      const page = await notion(cfg, "/pages", {
-        method: "POST",
-        headers: { "Notion-Version": POST_API_VERSION },
-        body: JSON.stringify({
-          parent: { type: "data_source_id", data_source_id: cfg.postDataSourceId },
-          properties: {
-            "이름": { title: [{ type: "text", text: { content: truncate(`${title} · ${channel}`, 1900) } }] },
-            "채널": { relation: [{ id: channelId }] },
-            "산출물": { relation: [{ id: pageId }] },
-          },
-        }),
-      });
+      const page = await createPostPage(cfg, pageId, title, channel, channelId);
       records.push({ channel, url: (page.url as string) ?? "", created: true });
       console.log("게시물 기록 생성", pageId, channel, page.url ?? "");
     } catch (e) {
@@ -1277,6 +1323,7 @@ async function publishRow(
   let uploaded: MediaPlan | null = null;
   const results: Json = {};
   const failures: string[] = [];
+  const postFailures: string[] = [];
   let succeeded = false;
 
   for (const channel of channels) {
@@ -1317,13 +1364,18 @@ async function publishRow(
       }
 
       succeeded = true;
-      const patch: Json = {
+      await updatePage(cfg, pageId, {
         [RESULT_PROP[channel]]: { select: { name: STATUS_DONE } },
-      };
-      if (link) patch[LINK_PROP[channel]] = { url: link };
-      await updatePage(cfg, pageId, patch);
+      });
       console.log("meta-publish 완료", pageId, channel, link || "(링크 없음)");
       results[channel] = link || "성공";
+
+      // 링크는 게시물 기록에 남긴다. 이미 올라간 글이므로 기록 실패는 발행 실패로 치지 않고 따로 알린다.
+      try {
+        await recordPublishedPost(cfg, pageId, props, channel, link);
+      } catch (e) {
+        postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
+      }
     } catch (e) {
       // 메타는 거절한 토큰을 오류 문구에 되돌려준다. 노션에 쓰기 전에 한 번 더 가린다.
       const detail = maskSecrets(message(e), secretsOf(cfg));
@@ -1364,6 +1416,18 @@ async function publishRow(
     await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}\n\n${note}`);
   }
 
+  if (postFailures.length > 0) {
+    try {
+      await addComment(
+        cfg,
+        pageId,
+        `게시물 기록 실패\n\n${postFailures.join("\n")}\n\n발행은 됐습니다. 게시물 DB 에 직접 기록하고 링크를 붙여주세요.`,
+      );
+    } catch (e) {
+      console.error("게시물 기록 실패 코멘트 실패", message(e));
+    }
+  }
+
   return {
     ok: failures.length === 0,
     pageId,
@@ -1374,6 +1438,7 @@ async function publishRow(
     failures,
     records,
     recordFailures,
+    postFailures,
     alreadyDone: doneChannels,
   };
 }
