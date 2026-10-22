@@ -19,6 +19,7 @@ import {
   isVideoUrl,
   maskSecrets,
   mediaKindFor,
+  planDeploy,
   needsRefresh,
   channelHint,
   collectPageCandidates,
@@ -345,9 +346,15 @@ Deno.test("summarizeApiError: 응답을 통째로 남기지 않고 읽을 부분
 Deno.test("mediaKindFor: 형식별 발행 소스를 정한다", () => {
   assertEquals(mediaKindFor("카드뉴스"), "carousel");
   assertEquals(mediaKindFor("이미지"), "image");
+  assertEquals(mediaKindFor("숏폼(9:16)"), "video");
+  assertEquals(mediaKindFor("롱폼(16:9)"), "video");
+  assertEquals(mediaKindFor("짧은글"), "text");
+  // 예전 이름도 받는다.
   assertEquals(mediaKindFor("영상-세로(9:16)"), "video");
   assertEquals(mediaKindFor("영상-가로(16:9)"), "video");
   assertEquals(mediaKindFor("카피"), "text");
+  // 긴글은 블로그용이라 자동 발행하지 않는다.
+  assertEquals(mediaKindFor("긴글"), null);
   assertEquals(mediaKindFor(" 카드뉴스 "), "carousel");
   assertEquals(mediaKindFor("릴스"), null);
   assertEquals(mediaKindFor(""), null);
@@ -401,4 +408,17 @@ Deno.test("isThreadsNotReady/isThreadsNotFound: 메타 전파 지연 오류만 �
   assertEquals(isThreadsNotFound(other), false);
   assertEquals(isThreadsNotFound(new Error("The requested resource does not exist")), true);
   assertEquals(isThreadsNotFound(undefined), false);
+});
+
+Deno.test("planDeploy: 배포 채널을 자동 발행과 기록으로 나눈다", () => {
+  const status: Record<string, string> = { "인스타그램": "✅ 완료", "스레드": "⚠️ 오류" };
+  const plan = planDeploy(["인스타그램", "스레드", "블로그", "유튜브"], (c) => status[c] ?? "", "✅ 완료");
+  assertEquals(plan.publish, ["스레드"]);
+  assertEquals(plan.done, ["인스타그램"]);
+  assertEquals(plan.record, ["블로그", "유튜브"]);
+});
+
+Deno.test("planDeploy: 빈 선택이면 할 일이 없다", () => {
+  const plan = planDeploy([], () => "", "✅ 완료");
+  assertEquals(plan, { publish: [], record: [], done: [] });
 });

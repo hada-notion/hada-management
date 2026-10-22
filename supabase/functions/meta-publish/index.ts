@@ -1,19 +1,24 @@
 // META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 발행한다.
 //
 // 발행 소스는 컨텐츠 DB 의 '형식'으로 정한다.
-//   카드뉴스        → 컷(프롬프트)의 미리보기 이미지 캐러셀
-//   이미지          → 컨텐츠 '미리보기' 한 장
-//   영상-세로(9:16) → 컨텐츠 '미리보기' 영상 (릴스)
-//   영상-가로(16:9) → 컨텐츠 '미리보기' 영상 (릴스)
-//   카피            → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
+//   카드뉴스    → 컷(프롬프트)의 미리보기 이미지 캐러셀
+//   이미지      → 컨텐츠 '미리보기' 한 장
+//   숏폼(9:16)  → 컨텐츠 '미리보기' 영상 (릴스)
+//   롱폼(16:9)  → 컨텐츠 '미리보기' 영상 (릴스)
+//   짧은글      → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
+//   긴글        → 자동 발행하지 않는다(블로그용).
+//   예전 이름(영상-세로(9:16)·영상-가로(16:9)·카피)도 그대로 받는다.
 //
-// '캡션'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '카피' 형식뿐이다).
+// '캡션'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '짧은글' 형식뿐이다).
 // 그래서 이미지·캐러셀 발행에서는 caption·text 파라미터를 아예 빼고 보낸다.
 //
 // 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
 //   본문에 페이지 지정(pageUrl/pageId/url/id)이 있거나 본문 어딘가에 노션 페이지 주소가 실려 있으면
 //   그 페이지만 처리한다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
-//   지정이 없으면 상태가 ⚪ 대기인 채널을 처리하고, 그것도 없으면 큐 조회로 넘어간다.
+//   지정이 없으면 상태가 ⚪ 대기인 채널과 '배포 채널'에 고른 채널을 처리한다.
+//   배포 채널 중 인스타그램·스레드는 발행하고(이미 ✅ 완료면 건너뜀),
+//   블로그·유튜브 같은 나머지 채널은 게시물 DB 에 채널을 연결한 기록만 만든다.
+//   페이지를 찾지 못하면 큐 조회로 넘어간다.
 //
 // 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
 // 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
@@ -56,6 +61,7 @@ import {
   isThreadsNotReady,
   maskSecrets,
   mediaKindFor,
+  planDeploy,
   needsRefresh,
   parsePageId,
   readTarget,
@@ -190,6 +196,12 @@ function buildConfig() {
       "dda5e4d7-d1b1-4c24-a75a-9442ce9664ca",
     contentDatabaseId: optionalEnv("CONTENT_DATABASE_ID") ||
       "ef3145878aba4994af456e11c27c9028",
+    // 배포 채널 중 자동 발행하지 않는 채널(블로그·유튜브 등)의 기록을 만드는 게시물 DB.
+    postDataSourceId: optionalEnv("POST_DATA_SOURCE_ID") ||
+      "3cce3c09-0fa1-422e-a4e4-c81791da2241",
+    // 게시물의 '채널' 관계가 가리키는 채널 DB. 채널 이름으로 페이지를 찾는다.
+    channelDataSourceId: optionalEnv("CHANNEL_DATA_SOURCE_ID") ||
+      "285ba040-586b-80ce-b1d4-000b163952b9",
     metaVersion: optionalEnv("META_GRAPH_VERSION") || "v26.0",
     igApiBase: optionalEnv("IG_API_BASE") || "https://graph.facebook.com",
     igUserId: optionalEnv("IG_USER_ID"),
@@ -308,7 +320,7 @@ async function uploadMedia(
     const detected = detectImageType(bytes);
     if (!detected && !headerType.startsWith("image/")) {
       throw new Error(
-        `이미지가 아닌 파일입니다(${detail}). 영상은 '형식'을 영상-세로(9:16)나 영상-가로(16:9)로 두세요.`,
+        `이미지가 아닌 파일입니다(${detail}). 영상은 '형식'을 숏폼(9:16)이나 롱폼(16:9)으로 두세요.`,
       );
     }
     ext = detected ?? extensionFor(headerType, sourceUrl);
@@ -968,6 +980,107 @@ async function findQueuedPageIds(cfg: Config): Promise<string[]> {
   return await queryQueuedPageIds(cfg);
 }
 
+// ---------- 게시물 기록 ----------
+// 블로그·유튜브처럼 자동 발행하지 않는 채널은 게시물 DB 에 기록만 만든다.
+// 사람이 직접 올린 뒤 그 기록에 게시 링크를 붙인다.
+
+const POST_API_VERSION = "2025-09-03";
+
+function pageTitle(props: Json): string {
+  for (const prop of Object.values(props)) {
+    if ((prop as Json)?.type === "title") return richText(prop as Json).trim();
+  }
+  return "";
+}
+
+async function queryDataSource(cfg: Config, dataSourceId: string, filter: Json): Promise<Json[]> {
+  const res = await notion(cfg, `/data_sources/${dataSourceId}/query`, {
+    method: "POST",
+    headers: { "Notion-Version": POST_API_VERSION },
+    body: JSON.stringify({ filter, page_size: 10 }),
+  });
+  return (res.results ?? []) as Json[];
+}
+
+/** 채널 DB 에서 이름이 같은 채널 페이지를 찾는다. */
+async function findChannelPageId(cfg: Config, name: string): Promise<string> {
+  const rows = await queryDataSource(cfg, cfg.channelDataSourceId, {
+    property: "이름",
+    title: { equals: name },
+  });
+  if (rows.length === 0) {
+    throw new Error(`채널 DB 에 '${name}' 채널이 없습니다. 채널 이름을 '배포 채널' 옵션과 같게 맞춰주세요.`);
+  }
+  return rows[0].id as string;
+}
+
+type PostRecord = { channel: string; url: string; created: boolean };
+
+/**
+ * 채널마다 게시물 DB 에 기록을 하나 만든다.
+ * 같은 산출물·채널 기록이 이미 있으면 새로 만들지 않는다. 버튼을 여러 번 눌러도 기록은 하나다.
+ * 실패해도 발행은 계속 가도록 실패 목록만 돌려준다.
+ */
+async function createPostRecords(
+  cfg: Config,
+  pageId: string,
+  props: Json,
+  channels: string[],
+): Promise<{ records: PostRecord[]; failures: string[] }> {
+  const records: PostRecord[] = [];
+  const failures: string[] = [];
+  const title = pageTitle(props) || "제목 없음";
+  for (const channel of channels) {
+    try {
+      const channelId = await findChannelPageId(cfg, channel);
+      const existing = await queryDataSource(cfg, cfg.postDataSourceId, {
+        and: [
+          { property: "산출물", relation: { contains: pageId } },
+          { property: "채널", relation: { contains: channelId } },
+        ],
+      });
+      if (existing.length > 0) {
+        records.push({ channel, url: (existing[0].url as string) ?? "", created: false });
+        continue;
+      }
+      const page = await notion(cfg, "/pages", {
+        method: "POST",
+        headers: { "Notion-Version": POST_API_VERSION },
+        body: JSON.stringify({
+          parent: { type: "data_source_id", data_source_id: cfg.postDataSourceId },
+          properties: {
+            "이름": { title: [{ type: "text", text: { content: truncate(`${title} · ${channel}`, 1900) } }] },
+            "채널": { relation: [{ id: channelId }] },
+            "산출물": { relation: [{ id: pageId }] },
+          },
+        }),
+      });
+      records.push({ channel, url: (page.url as string) ?? "", created: true });
+      console.log("게시물 기록 생성", pageId, channel, page.url ?? "");
+    } catch (e) {
+      failures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}`);
+    }
+  }
+
+  const lines: string[] = [];
+  for (const record of records) {
+    lines.push(`${record.channel}: ${record.created ? "새로 만들었습니다" : "이미 있습니다"} ${record.url}`);
+  }
+  for (const failure of failures) lines.push(`실패 — ${failure}`);
+  if (lines.length > 0) {
+    try {
+      await addComment(
+        cfg,
+        pageId,
+        `게시물 기록\n\n${lines.join("\n")}\n\n직접 올린 뒤 게시물의 '게시 링크'를 채워주세요.`,
+      );
+    } catch (e) {
+      console.error("게시물 기록 코멘트 실패", message(e));
+    }
+  }
+  return { records, failures };
+}
+
 // ---------- 발행 ----------
 
 /** 컷(프롬프트)에 연결된 컷들의 미리보기 이미지를 컷 순서대로 모은다. */
@@ -994,14 +1107,14 @@ async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> 
   return sourceUrls;
 }
 
-/** 컨텐츠 페이지의 '미리보기' 파일. 영상·이미지·카피처럼 한 덩어리인 형식에서 쓴다. */
+/** 컨텐츠 페이지의 '미리보기' 파일. 영상·이미지·짧은글처럼 한 덩어리인 형식에서 쓴다. */
 function previewFiles(props: Json): any[] {
   return (props["미리보기"]?.files ?? []) as any[];
 }
 
 /**
  * '형식'에 따라 발행 소스를 정한다.
- * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 카피는 글만 올린다.
+ * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 짧은글은 글만 올린다.
  */
 async function collectSources(cfg: Config, props: Json, kind: MediaKind): Promise<MediaPlan> {
   if (kind === "carousel") {
@@ -1045,23 +1158,54 @@ async function publishRow(
   pageId: string,
   dryRun: boolean,
   only: Channel | null = null,
+  useDeployChannels = false,
 ): Promise<Json> {
   const page = await notion(cfg, `/pages/${pageId}`);
   const props = (page.properties ?? {}) as Json;
 
   const requested = requestedChannels(props);
   // only 는 웹훅 주소의 ?channel= 로 지정한 채널이다. 지정이 있으면 그것만 처리한다.
+  // 지정이 없는 배포 버튼은 ⚪ 대기 채널에 '배포 채널'에 고른 채널을 더한다.
+  // 큐 모드는 '배포 채널'을 읽지 않는다. 대기로 남은 채널만 줍는 백업 경로라서다.
+  const wanted = new Set<Channel>(only !== null ? [only] : requested);
+  let recordChannels: string[] = [];
+  let doneChannels: string[] = [];
+  if (only === null && useDeployChannels) {
+    const plan = planDeploy(
+      multiSelectNames(props["배포 채널"]),
+      (channel) => selectName(props[RESULT_PROP[channel as Channel]]),
+      STATUS_DONE,
+    );
+    for (const channel of plan.publish) wanted.add(channel as Channel);
+    recordChannels = plan.record;
+    doneChannels = plan.done;
+  }
+
+  let records: PostRecord[] = [];
+  let recordFailures: string[] = [];
+  if (recordChannels.length > 0 && !dryRun) {
+    ({ records, failures: recordFailures } = await createPostRecords(cfg, pageId, props, recordChannels));
+  }
+
   // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
-  const channels: Channel[] = only !== null
-    ? [only]
-    : (requested.length > 0 ? requested : (dryRun ? [...CHANNELS] : []));
+  let channels: Channel[] = CHANNELS.filter((channel) => wanted.has(channel));
+  if (channels.length === 0 && dryRun && recordChannels.length === 0) channels = [...CHANNELS];
+  if (channels.length === 0 && (recordChannels.length > 0 || doneChannels.length > 0)) {
+    return {
+      ok: recordFailures.length === 0,
+      pageId,
+      dryRun,
+      records: dryRun ? recordChannels : records,
+      recordFailures,
+      alreadyDone: doneChannels,
+    };
+  }
   if (channels.length === 0) {
-    // 버튼 설정이 어긋나면 여기로 온다. 상태를 ⚪ 대기로 바꾸지 않았거나
-    // 웹훅 주소에 ?channel=instagram|threads 가 빠진 경우다.
+    // 버튼 설정이 어긋나면 여기로 온다. '배포 채널'이 비었거나, 예전 버튼이 상태를 ⚪ 대기로 바꾸지 않은 경우다.
     // 예전에는 아무 흔적 없이 끝나서 원인을 찾기 어려웠다. 이제는 로그와 안내를 남긴다.
     console.log("meta-publish 건너뜀", pageId, "요청된 채널 없음");
     const reason = "요청된 채널이 없어 아무것도 하지 않았습니다. " +
-      "배포 버튼이 상태를 ⚪ 대기로 바꾸는지, 웹훅 주소에 ?channel=instagram 또는 ?channel=threads 가 있는지 확인하세요.";
+      "'배포 채널'에서 올릴 채널을 골랐는지 확인하세요.";
     if (!dryRun && only === null) {
       try {
         await addComment(cfg, pageId, `META 업로드 안내\n\n${reason}`);
@@ -1087,13 +1231,13 @@ async function publishRow(
   const scriptText = richText(props["대본"]);
   const caption = buildCaption(captionText, cfg.fixedComment);
   // 캡션이 비어도 막지 않는다. 카드뉴스는 그림이 본체라 글 없이 올리는 편이 낫다.
-  // 글이 본체인 '카피' 형식만 캡션이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
+  // 글이 본체인 '짧은글' 형식만 캡션이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
   if (caption.trim() === "" && kind === "text") {
     const scriptNote = scriptText.trim() === ""
       ? "대본도 비어 있습니다."
       : `대본은 ${scriptText.trim().length}자지만 발행 문구로 쓰지 않습니다(제작 메모가 섞여 있습니다).`;
     throw new Error(
-      `'카피' 형식은 글이 본체라 '캡션'이 필요합니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`,
+      `'${format}' 형식은 글이 본체라 '캡션'이 필요합니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`,
     );
   }
 
@@ -1157,7 +1301,7 @@ async function publishRow(
 
       // 인스타그램은 미디어 없는 발행을 지원하지 않는다. 이 채널만 실패로 남기고 스레드는 계속 간다.
       if (kind === "text" && channel === "인스타그램") {
-        throw new Error("'카피' 형식은 미디어가 없어 인스타그램에 발행할 수 없습니다. '스레드 배포'를 쓰세요.");
+        throw new Error(`'${format}' 형식은 미디어가 없어 인스타그램에 발행할 수 없습니다. '배포 채널'에서 인스타그램을 빼주세요.`);
       }
 
       if (!uploaded) uploaded = await uploadPlan(cfg, pageId, plan);
@@ -1214,7 +1358,7 @@ async function publishRow(
 
   if (failures.length > 0) {
     const note = succeeded
-      ? "성공한 채널은 그대로 두었습니다. 실패한 채널만 해당 버튼을 다시 눌러 재시도하세요."
+      ? "성공한 채널은 그대로 두었습니다. 배포 버튼을 다시 누르면 완료된 채널은 건너뛰고 실패한 채널만 다시 시도합니다."
       : "발행된 채널이 없습니다. 원인을 고친 뒤 다시 실행하세요.";
     const detail = maskSecrets(failures.join("\n"), secretsOf(cfg));
     await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}\n\n${note}`);
@@ -1228,6 +1372,9 @@ async function publishRow(
     mediaKind: kind,
     results,
     failures,
+    records,
+    recordFailures,
+    alreadyDone: doneChannels,
   };
 }
 
@@ -1369,7 +1516,7 @@ Deno.serve(async (req) => {
   console.log("meta-publish 대상", pageId || "(없음: 큐 모드)", "채널", hint ?? "(없음)");
 
   const task: Promise<Json> = pageId !== ""
-    ? publishRow(cfg, pageId, dryRun, hint)
+    ? publishRow(cfg, pageId, dryRun, hint, hint === null)
     : runQueue(cfg, dryRun);
 
   // 수동 호출(?pageId=·?pageUrl=·?url=)이나 ?wait=1 만 결과를 그대로 돌려준다.

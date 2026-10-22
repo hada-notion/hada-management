@@ -47,7 +47,7 @@ export function sortCuts<T extends { order: number; pageId: string }>(cuts: T[])
  * '대본'으로 대체하지 않는 이유: 대본은 제작 메모(컨셉·타겟·사진 지시)가 섞인 작업 문서라
  * 발행 문구로 쓰면 메모가 그대로 게시되고 길이도 한도를 넘는다.
  * 캡션이 비면 고정 멘트만 남고, 둘 다 비면 빈 문구가 된다. 그래도 발행은 막지 않는다.
- * 카드뉴스는 그림이 본체라 글 없이 올릴 수 있고, 글이 꼭 필요한 '카피' 형식만 호출부가 막는다.
+ * 카드뉴스는 그림이 본체라 글 없이 올릴 수 있고, 글이 꼭 필요한 '짧은글' 형식만 호출부가 막는다.
  */
 export function buildCaption(caption: string, fixedComment: string): string {
   const base = (caption ?? "").trim();
@@ -330,9 +330,11 @@ export function extractVideoUrls(files: NotionFile[] | undefined): string[] {
 
 /**
  * 형식별 발행 소스.
- * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 카피는 글만 올린다.
+ * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 짧은글은 글만 올린다.
+ * 긴글(블로그용)은 자동 발행 대상이 아니다.
+ * 예전 이름(영상-세로(9:16)·영상-가로(16:9)·카피)도 그대로 받는다.
  */
-export const FORMAT_NAMES = ["카드뉴스", "영상-세로(9:16)", "영상-가로(16:9)", "이미지", "카피"] as const;
+export const FORMAT_NAMES = ["카드뉴스", "이미지", "숏폼(9:16)", "롱폼(16:9)", "짧은글"] as const;
 export type MediaKind = "carousel" | "image" | "video" | "text";
 
 export function mediaKindFor(format: string): MediaKind | null {
@@ -341,14 +343,53 @@ export function mediaKindFor(format: string): MediaKind | null {
       return "carousel";
     case "이미지":
       return "image";
+    case "숏폼(9:16)":
+    case "롱폼(16:9)":
     case "영상-세로(9:16)":
     case "영상-가로(16:9)":
       return "video";
+    case "짧은글":
     case "카피":
       return "text";
     default:
       return null;
   }
+}
+
+/** 자동 발행하는 채널. 나머지 배포 채널은 게시물 기록만 만든다. */
+export const PUBLISH_CHANNELS = ["인스타그램", "스레드"] as const;
+
+export type DeployPlan = {
+  /** 자동 발행할 채널 */
+  publish: string[];
+  /** 게시물 DB 에 기록만 만들 채널 */
+  record: string[];
+  /** 이미 완료라 건너뛴 채널 */
+  done: string[];
+};
+
+/**
+ * '배포 채널' 다중 선택으로 할 일을 나눈다.
+ * 인스타그램·스레드는 자동 발행하고, 상태가 이미 ✅ 완료면 두 번 올리지 않도록 건너뛴다.
+ * 나머지 채널(블로그·유튜브 등)은 게시물 기록만 만든다.
+ */
+export function planDeploy(
+  deployChannels: string[],
+  statusOf: (channel: string) => string,
+  doneStatus: string,
+): DeployPlan {
+  const plan: DeployPlan = { publish: [], record: [], done: [] };
+  for (const raw of deployChannels) {
+    const channel = raw.trim();
+    if (channel === "") continue;
+    if ((PUBLISH_CHANNELS as readonly string[]).includes(channel)) {
+      if (statusOf(channel) === doneStatus) plan.done.push(channel);
+      else plan.publish.push(channel);
+    } else {
+      plan.record.push(channel);
+    }
+  }
+  return plan;
 }
 
 /**
