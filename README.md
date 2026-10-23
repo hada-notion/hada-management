@@ -1,4 +1,6 @@
-# meta-publish
+# hada-publish
+
+> 2026-10-23 `meta-publish` 에서 이름을 바꿨다. 저장 버킷 이름(`meta-publish`)과 `meta_jobs`·`meta_tokens` 테이블은 그대로 쓴다.
 
 노션에서 카드뉴스를 검수한 뒤 컨텐츠(산출물) DB의 `배포 채널`을 고르고 **`배포` 버튼**을 누르면 인스타그램·스레드에 자동으로 발행하는 시스템이다. 영상(숏폼·롱폼)은 유튜브에도 올린다(숏폼은 Shorts). 블로그처럼 자동 발행하지 않는 채널은 게시물 DB 에 채널을 연결한 기록만 만들고, 사람이 직접 올린 뒤 링크를 붙인다.
 
@@ -6,9 +8,9 @@
 
 | 경로 | 설명 |
 | --- | --- |
-| `supabase/functions/meta-publish/index.ts` | 발행 함수 본체 |
-| `supabase/functions/meta-publish/lib.ts` | 캡션·정렬·장수 검사 등 순수 로직 |
-| `supabase/functions/meta-publish/lib_test.ts` | 순수 로직 테스트 |
+| `supabase/functions/hada-publish/index.ts` | 발행 함수 본체 |
+| `supabase/functions/hada-publish/lib.ts` | 캡션·정렬·장수 검사 등 순수 로직 |
+| `supabase/functions/hada-publish/lib_test.ts` | 순수 로직 테스트 |
 | `supabase/meta_tokens.sql` | 스레드 토큰 보관 표 생성 SQL |
 | `supabase/meta_jobs.sql` | 발행 잠금 표 생성 SQL (중복 게시 방지) |
 | `.github/workflows/deploy-supabase-functions.yml` | 타입 검사·테스트 후 Supabase로 배포 |
@@ -131,13 +133,13 @@ Supabase 대시보드 → SQL Editor 에서 아래 파일 내용을 붙여넣고
 Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 자체 OAuth 를 한 번 거쳐야 한다.
 
 1. 메타 앱 대시보드 → 이용 사례 → Threads API 액세스 → 설정 에서 **리디렉션 콜백 URL** 을 등록한다.
-   `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish`
+   `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish`
    입력 후 반드시 **Enter** 를 눌러 태그로 만들어야 저장된다.
 2. 같은 화면에서 앱 역할에 `ha.da_2025` 를 Threads 테스터로 추가한다.
 3. 브라우저에서 아래 주소를 열면 승인 링크가 나온다. 링크를 눌러 승인한다.
 
    ```
-   https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?threads_auth=1
+   https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?threads_auth=1
    ```
 
 4. 승인하면 함수로 되돌아오고, 함수가 code 를 60일 토큰으로 바꿔 `meta_tokens` 표에 저장한 뒤 `스레드 인증 완료` 안내를 보여준다.
@@ -152,12 +154,12 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 2. OAuth 동의 화면(Google Auth Platform)을 만든다. 사용자 유형 **외부**, 범위에 `youtube.upload`·`youtube.readonly` 를 넣는다.
 3. **게시 상태를 '프로덕션'으로 바꾼다.** '테스트' 상태로 두면 승인이 7일마다 만료된다. 검수(인증)를 받지 않아도 본인 계정은 '확인되지 않은 앱' 경고에서 **고급 → 이동** 을 눌러 승인할 수 있다.
 4. 사용자 인증 정보 → OAuth 클라이언트 ID 만들기 → 유형 **웹 애플리케이션**. 승인된 리디렉션 URI 에 아래 주소를 넣는다.
-   `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish`
+   `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish`
 5. 받은 클라이언트 ID·보안 비밀번호를 Supabase 함수 환경값 `YOUTUBE_CLIENT_ID`·`YOUTUBE_CLIENT_SECRET` 에 넣는다.
 6. 브라우저에서 아래 주소를 열면 승인 링크가 나온다. 영상을 올릴 채널의 계정으로 승인하면 `유튜브 인증 완료` 와 채널 이름이 보인다.
 
    ```
-   https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?youtube_auth=1
+   https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?youtube_auth=1
    ```
 
 **공개 범위 제한.** 2020년 7월 이후 만든 구글 클라우드 프로젝트는 [유튜브 API 감사](https://support.google.com/youtube/contact/yt_api_form)를 통과하기 전까지 API 로 올린 영상이 **비공개로 잠긴다.** 감사 전에는 유튜브 스튜디오에서 공개로 바꾸거나 감사를 신청한다. 요청한 공개 범위와 다르게 올라가면 함수가 컨텐츠 페이지에 `배포 안내` 코멘트를 남긴다.
@@ -169,7 +171,7 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 컨텐츠(산출물) DB → 속성에서 버튼 하나를 만든다.
 
 - 액션: 웹훅 전송
-  - URL: `https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish` (`?channel=` 을 붙이지 않는다)
+  - URL: `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish` (`?channel=` 을 붙이지 않는다)
   - 헤더: `x-admin-key: <ADMIN_SECRET 값>`
   - 본문: 속성 선택은 아무거나 (예: `이름`). 함수는 속성 값을 쓰지 않고 본문에 실려 온 페이지 ID 를 쓴다
 
@@ -187,7 +189,7 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 
 예전 `인스타그램 배포`·`스레드 배포` 버튼(상태를 `⚪ 대기`로 바꾸고 `?channel=instagram|threads` 로 보내는 방식)도 그대로 동작한다. `?channel=` 이 있으면 그 채널만 처리하고 `배포 채널`은 읽지 않는다.
 
-노션 자동화 웹훅은 실행된 페이지를 통째로 실어 보낸다(`data` 안의 페이지 ID 와 속성). 그래서 버튼 Content 에 페이지 URL 을 넣지 않아도 되고, 어느 페이지를 대상으로 잡았는지 함수 로그의 `meta-publish 대상` 줄에서 확인할 수 있다. 페이지가 실려 오지 않으면 `⚪ 대기`로 남은 행을 줍는 큐 모드로 넘어간다.
+노션 자동화 웹훅은 실행된 페이지를 통째로 실어 보낸다(`data` 안의 페이지 ID 와 속성). 그래서 버튼 Content 에 페이지 URL 을 넣지 않아도 되고, 어느 페이지를 대상으로 잡았는지 함수 로그의 `hada-publish 대상` 줄에서 확인할 수 있다. 페이지가 실려 오지 않으면 `⚪ 대기`로 남은 행을 줍는 큐 모드로 넘어간다.
 
 ## 성과 수집
 
@@ -205,10 +207,10 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 - 인스타그램 인사이트 권한이 없으면 좋아요·댓글만 남긴다. 스레드는 인사이트가 유일한 경로라 `threads_manage_insights` 권한이 필요하다. 이 권한은 2026-10-23 에 승인 범위에 추가했으므로 **그 전에 받은 스레드 토큰은 인증(위 5번)을 한 번 다시 해야 한다.**
 - 한 채널이 실패해도 다른 채널은 그대로 기록한다. 실패 내용은 응답의 `channelErrors`·`results` 와 Actions 로그에 남는다.
 
-호출은 `.github/workflows/collect-metrics.yml` 이 매일 새벽 4시(한국 시간)에 `?wait=1` 로 한다. `?wait=1` 이 없으면 접수(202)만 돌려주고 뒤에서 수집하므로 노션 버튼으로도 부를 수 있다(웹훅 URL `…/meta-publish?metrics=1`, 헤더 `x-admin-key`). 결과는 함수 로그의 `성과 수집 결과` 줄과 성과 로그 DB 에서 확인한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
+호출은 `.github/workflows/collect-metrics.yml` 이 매일 새벽 4시(한국 시간)에 `?wait=1` 로 한다. `?wait=1` 이 없으면 접수(202)만 돌려주고 뒤에서 수집하므로 노션 버튼으로도 부를 수 있다(웹훅 URL `…/hada-publish?metrics=1`, 헤더 `x-admin-key`). 결과는 함수 로그의 `성과 수집 결과` 줄과 성과 로그 DB 에서 확인한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
 
 ```bash
-curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?metrics=1&wait=1&dryRun=true" \
+curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?metrics=1&wait=1&dryRun=true" \
   -H "x-admin-key: <ADMIN_SECRET 값>" -H "Content-Type: application/json" -d '{}'
 ```
 
@@ -219,7 +221,7 @@ curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?m
 페이지를 지정하고 `?wait=1` 을 붙이면 접수 응답 대신 실제 결과를 돌려준다. `dryRun` 은 노션 읽기, 컷 정렬, 이미지 업로드, 캡션 조립까지만 하고 발행과 상태 변경은 하지 않는다.
 
 ```bash
-curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?wait=1&dryRun=true" \
+curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?wait=1&dryRun=true" \
   -H "x-admin-key: <ADMIN_SECRET 값>" \
   -H "Content-Type: application/json" \
   -d '{"pageUrl":"<컨텐츠 페이지 주소>"}'
@@ -228,7 +230,7 @@ curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?w
 큐 모드(웹훅이 페이지를 못 실어 왔을 때의 백업 경로)도 `?wait=1` 로 결과를 볼 수 있다. `⚪ 대기`로 남은 행을 전부 처리한다.
 
 ```bash
-curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?wait=1&dryRun=true" \
+curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?wait=1&dryRun=true" \
   -H "x-admin-key: <ADMIN_SECRET 값>" \
   -H "Content-Type: application/json" \
   -d '{}'

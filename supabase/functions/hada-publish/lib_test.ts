@@ -159,7 +159,7 @@ Deno.test("extensionFor: content-type 우선, 없으면 주소 확장자", () =>
 Deno.test("threadsAuthorizeUrl: 승인 주소를 만든다", () => {
   const url = threadsAuthorizeUrl(
     "1798018584846325",
-    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish",
     ["threads_basic", "threads_content_publish"],
   );
   const parsed = new URL(url);
@@ -169,7 +169,7 @@ Deno.test("threadsAuthorizeUrl: 승인 주소를 만든다", () => {
   assertEquals(parsed.searchParams.get("response_type"), "code");
   assertEquals(
     parsed.searchParams.get("redirect_uri"),
-    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish",
   );
 });
 
@@ -195,19 +195,19 @@ Deno.test("resolveRedirectUri: 내부 주소를 공개 주소로 바꾼다", () 
   const base = "https://fkqassnvyakenoslhfgn.supabase.co";
   // Supabase 함수가 넘겨주는 내부 주소
   assertEquals(
-    resolveRedirectUri("http://fkqassnvyakenoslhfgn.supabase.co/meta-publish?code=x", base, ""),
-    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+    resolveRedirectUri("http://fkqassnvyakenoslhfgn.supabase.co/hada-publish?code=x", base, ""),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish",
   );
   // 이미 공개 주소로 들어온 경우
   assertEquals(
-    resolveRedirectUri(`${base}/functions/v1/meta-publish?code=x`, base, ""),
-    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish",
+    resolveRedirectUri(`${base}/functions/v1/hada-publish?code=x`, base, ""),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish",
   );
   // 환경값이 있으면 그 값을 그대로 쓴다 (끝 슬래시만 정리)
-  assertEquals(resolveRedirectUri("http://x/meta-publish", base, `${base}/functions/v1/meta-publish/`),
-    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish");
+  assertEquals(resolveRedirectUri("http://x/hada-publish", base, `${base}/functions/v1/hada-publish/`),
+    "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish");
   // 공개 주소를 모르면 호스트만 https 로 살린다
-  assertEquals(resolveRedirectUri("http://x/meta-publish", "", ""), "https://x/meta-publish");
+  assertEquals(resolveRedirectUri("http://x/hada-publish", "", ""), "https://x/hada-publish");
 });
 
 Deno.test("detectImageType: 앞바이트로 실제 형식을 판별한다", () => {
@@ -265,7 +265,7 @@ Deno.test("captionLimitError: 채널 한도를 넘으면 발행 전에 막는다
 });
 
 Deno.test("readTarget: 페이지 지정이 있으면 그 값을 쓴다", () => {
-  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish";
+  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish";
   assertEquals(readTarget({ pageUrl: "https://app.notion.com/p/abc" }, base), "https://app.notion.com/p/abc");
   assertEquals(readTarget({ pageId: "abc" }, base), "abc");
   assertEquals(readTarget({ url: "https://app.notion.com/p/abc" }, base), "https://app.notion.com/p/abc");
@@ -276,7 +276,7 @@ Deno.test("readTarget: 페이지 지정이 있으면 그 값을 쓴다", () => {
 });
 
 Deno.test("readTarget: 페이지 지정이 없으면 빈 값이 되어 큐 모드로 넘어간다", () => {
-  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/meta-publish";
+  const base = "https://fkqassnvyakenoslhfgn.supabase.co/functions/v1/hada-publish";
   // 노션 버튼 웹훅은 DB 속성만 보낸다. 페이지 URL 이 없으므로 큐 모드다.
   assertEquals(readTarget({ "발행 상태": "발행 대기" }, base), "");
   assertEquals(readTarget({}, base), "");
@@ -488,7 +488,7 @@ Deno.test("kstDate: 한국 시간 날짜", () => {
 });
 
 Deno.test("youtubeAuthorizeUrl: 오프라인 접근과 state 를 붙인다", () => {
-  const url = new URL(youtubeAuthorizeUrl("id.apps", "https://x.supabase.co/functions/v1/meta-publish", YOUTUBE_SCOPES));
+  const url = new URL(youtubeAuthorizeUrl("id.apps", "https://x.supabase.co/functions/v1/hada-publish", YOUTUBE_SCOPES));
   assertEquals(url.searchParams.get("access_type"), "offline");
   assertEquals(url.searchParams.get("prompt"), "consent");
   assertEquals(url.searchParams.get("state"), "youtube");
