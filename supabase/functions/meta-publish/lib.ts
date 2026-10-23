@@ -651,3 +651,25 @@ export function splitYoutube(
   if (!picked || !enabled || kind !== "video") return { youtube: false, rest: deployChannels };
   return { youtube: true, rest: deployChannels.filter((channel) => channel.trim() !== YOUTUBE_CHANNEL) };
 }
+
+/** 채널 DB 페이지 이름. 계정에서 찾은 게시물의 기록을 만들 때 채널 관계를 이 이름으로 찾는다. */
+export const METRIC_CHANNEL_LABELS: Record<MetricChannel, string> = {
+  instagram: "인스타그램",
+  threads: "스레드",
+  youtube: "유튜브",
+};
+
+/** 계정에서 가져온 게시물의 기록 이름. 글의 첫 줄(해시태그 줄 제외)을 40자로 자르고 채널을 붙인다. */
+export function importedPostTitle(text: string, channelLabel: string): string {
+  const line = text.split("\n").map((part) => part.trim()).find((part) => part !== "" && !part.startsWith("#")) ?? "";
+  const head = [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
+  return `${head || "제목 없는 게시물"} · ${channelLabel}`;
+}
+
+/** 게시 시각이 since(한국 시간 날짜 YYYY-MM-DD) 이후인가. since 가 비면 항상 참, 게시 시각을 모르면 거짓. */
+export function publishedOnOrAfter(publishedAt: string, since: string): boolean {
+  if (since === "") return true;
+  const ms = Date.parse(publishedAt);
+  if (!Number.isFinite(ms)) return false;
+  return kstDate(ms) >= since;
+}
