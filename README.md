@@ -12,7 +12,7 @@
 | `supabase/meta_tokens.sql` | 스레드 토큰 보관 표 생성 SQL |
 | `supabase/meta_jobs.sql` | 발행 잠금 표 생성 SQL (중복 게시 방지) |
 | `.github/workflows/deploy-supabase-functions.yml` | 타입 검사·테스트 후 Supabase로 배포 |
-| `.github/workflows/collect-metrics.yml` | 매일 오전 9시(한국 시간) 성과 수집 호출 |
+| `.github/workflows/collect-metrics.yml` | 매일 새벽 4시(한국 시간) 성과 수집 호출 |
 
 ## 동작
 
@@ -106,6 +106,7 @@ Settings → Secrets and variables → Actions
 | `TOKEN_TABLE` | 아니오 | 기본 `meta_tokens` |
 | `YOUTUBE_API_KEY` | 성과 수집 | 유튜브 공개 통계(조회수·좋아요·댓글)를 읽는 API 키. 없으면 유튜브만 건너뛴다 |
 | `METRIC_LOG_DATA_SOURCE_ID` | 아니오 | 성과 로그 DB 데이터 소스 ID. 기본값 내장 |
+| `YOUTUBE_CHANNEL_ID` | 아니오 | 업로드 목록을 볼 유튜브 채널 ID. 비우면 게시물 DB 에 있는 영상의 채널을 쓴다 |
 | `PUBLISH_BUCKET` | 아니오 | 기본 `meta-publish` |
 
 값은 저장소에 넣지 않는다.
@@ -172,14 +173,15 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 | 유튜브 | YouTube Data API `videos.statistics` | 조회수·좋아요·댓글 |
 
 - 채널은 게시 링크 주소로 정하고, 게시물은 링크 속 코드(인스타 `/p/`·`/reel/` 뒤, 스레드 `/post/` 뒤, 유튜브 영상 ID)로 계정 목록과 맞춘다. 계정 최근 게시물 500개 안에서 찾는다.
+- **계정에만 있는 게시물**(노션을 거치지 않고 직접 올린 것 등)은 게시물 DB 에 기록을 새로 만든 뒤 함께 수집한다. 이름은 글 첫 줄(해시태그 줄 제외) 40자 + 채널, `게시 상태` = `게시`, 메모에 자동 생성 표시. 산출물은 사람이 연결한다. 인스타그램·스레드는 계정 최근 500개, 유튜브는 채널 업로드 최근 250개 안에서 찾는다. 스레드 리포스트는 제외한다. `게시 상태`를 `내림`으로 둔 기록은 수집하지 않고 다시 만들지도 않는다.
 - 새 행: `이름` = `게시물 이름 · 날짜`, `기록일` = 한국 시간 오늘, `수집 방식` = `자동 수집`, `게시물` 연결.
 - 인스타그램 인사이트 권한이 없으면 좋아요·댓글만 남긴다. 스레드는 인사이트가 유일한 경로라 `threads_manage_insights` 권한이 필요하다. 이 권한은 2026-10-23 에 승인 범위에 추가했으므로 **그 전에 받은 스레드 토큰은 인증(위 5번)을 한 번 다시 해야 한다.**
 - 한 채널이 실패해도 다른 채널은 그대로 기록한다. 실패 내용은 응답의 `channelErrors`·`results` 와 Actions 로그에 남는다.
 
-호출은 `.github/workflows/collect-metrics.yml` 이 매일 한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
+호출은 `.github/workflows/collect-metrics.yml` 이 매일 새벽 4시(한국 시간)에 `?wait=1` 로 한다. `?wait=1` 이 없으면 접수(202)만 돌려주고 뒤에서 수집하므로 노션 버튼으로도 부를 수 있다(웹훅 URL `…/meta-publish?metrics=1`, 헤더 `x-admin-key`). 결과는 함수 로그의 `성과 수집 결과` 줄과 성과 로그 DB 에서 확인한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
 
 ```bash
-curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?metrics=1&dryRun=true" \
+curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?metrics=1&wait=1&dryRun=true" \
   -H "x-admin-key: <ADMIN_SECRET 값>" -H "Content-Type: application/json" -d '{}'
 ```
 

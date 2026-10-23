@@ -72,7 +72,9 @@ import {
   threadsLength,
   threadsAuthorizeUrl,
   truncate,
+  METRIC_CHANNEL_LABELS,
   METRIC_FIELDS,
+  importedPostTitle,
   kstDate,
   metricChannelOf,
   metricDelta,
@@ -233,6 +235,8 @@ function buildConfig() {
     metricLogDataSourceId: optionalEnv("METRIC_LOG_DATA_SOURCE_ID") ||
       "b7759760-49e5-425a-89f2-022232c576c3",
     youtubeApiKey: optionalEnv("YOUTUBE_API_KEY"),
+    // 유튜브 업로드 목록을 볼 채널. 비우면 게시물 DB 에 있는 영상의 채널을 쓴다.
+    youtubeChannelId: optionalEnv("YOUTUBE_CHANNEL_ID"),
   };
 }
 
@@ -1521,7 +1525,9 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 //   인스타그램 → 미디어 목록(like_count·comments_count) + 인사이트(views·saved·shares)
 //   스레드     → 게시물 인사이트(views·likes·replies·reposts·quotes·shares). threads_manage_insights 권한 필요
 //   유튜브     → YouTube Data API videos.statistics (YOUTUBE_API_KEY, 공개 통계라 OAuth 불필요)
-// 호출: POST /functions/v1/meta-publish?metrics=1   (헤더 x-admin-key, GitHub Actions 가 매일 부른다)
+// 계정에는 있는데 게시물 DB 에 없는 게시물(직접 올린 것 등)은 게시물 기록을 새로 만든 뒤 함께 수집한다.
+// 호출: POST /functions/v1/meta-publish?metrics=1   (헤더 x-admin-key)
+//   GitHub Actions 는 매일 새벽 ?wait=1 로 결과를 기다리고, 노션 버튼은 접수(202)만 받는다.
 
 const METRICS_TIME_BUDGET_MS = 110000;
 const MEDIA_LIST_PAGES = 5;
@@ -1542,25 +1548,6 @@ async function queryAll(cfg: Config, dataSourceId: string, filter?: Json): Promi
     cursor = res.has_more ? res.next_cursor : undefined;
   } while (cursor);
   return rows;
-}
-
-/** 게시 링크가 있고 내리지 않은 게시물만 대상으로 잡는다. */
-async function findMetricTargets(cfg: Config): Promise<PostTarget[]> {
-  const rows = await queryAll(cfg, cfg.postDataSourceId, {
-    property: "게시 링크",
-    url: { is_not_empty: true },
-  });
-  const targets: PostTarget[] = [];
-  for (const row of rows) {
-    const props = (row.properties ?? {}) as Json;
-    if (selectName(props["게시 상태"]) === "내림") continue;
-    const link = String(props["게시 링크"]?.url ?? "").trim();
-    const channel = metricChannelOf(link);
-    const code = postCodeOf(link);
-    if (channel === null || code === "") continue;
-    targets.push({ id: row.id, title: pageTitle(props), link, channel, code });
-  }
-  return targets;
 }
 
 /** 성과 로그에 이미 쌓인 값을 게시물별로 합친다. 직접 입력한 행도 합계에 들어간다. */
@@ -1666,23 +1653,159 @@ async function createMetricLog(cfg: Config, target: PostTarget, delta: Metrics, 
   });
 }
 
+/** 게시물 DB 에서 게시 링크가 있는 기록을 읽는다. 내린 기록은 수집하지 않지만, 다시 만들지 않도록 알고는 있는다. */
+async function findMetricTargets(cfg: Config): Promise<{ targets: PostTarget[]; known: Set<string> }> {
+  const rows = await queryAll(cfg, cfg.postDataSourceId, {
+    property: "게시 링크",
+    url: { is_not_empty: true },
+  });
+  const targets: PostTarget[] = [];
+  const known = new Set<string>();
+  for (const row of rows) {
+    const props = (row.properties ?? {}) as Json;
+    const link = String(props["게시 링크"]?.url ?? "").trim();
+    const channel = metricChannelOf(link);
+    const code = postCodeOf(link);
+    if (channel === null || code === "") continue;
+    known.add(`${channel}:${code}`);
+    if (selectName(props["게시 상태"]) === "내림") continue;
+    targets.push({ id: row.id, title: pageTitle(props), link, channel, code });
+  }
+  return { targets, known };
+}
+
+/** 계정에서 찾은 게시물 하나. 게시물 DB 에 없으면 이걸로 새 기록을 만든다. */
+type AccountPost = { channel: MetricChannel; code: string; link: string; text: string; publishedAt: string };
+
+/**
+ * 계정에는 있는데 게시물 DB 에 없는 게시물(직접 올린 것 등)의 게시물 기록을 만든다.
+ * 산출물은 연결하지 않는다(어느 산출물인지 알 수 없다). 메모로 자동 생성임을 남긴다.
+ */
+async function importPost(cfg: Config, post: AccountPost, channelIds: Map<MetricChannel, string>): Promise<PostTarget> {
+  const label = METRIC_CHANNEL_LABELS[post.channel];
+  let channelId = channelIds.get(post.channel);
+  if (channelId === undefined) {
+    channelId = await findChannelPageId(cfg, label);
+    channelIds.set(post.channel, channelId);
+  }
+  const title = importedPostTitle(post.text, label);
+  const page = await notion(cfg, "/pages", {
+    method: "POST",
+    headers: { "Notion-Version": POST_API_VERSION },
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: cfg.postDataSourceId },
+      properties: {
+        "이름": { title: [{ type: "text", text: { content: title } }] },
+        "채널": { relation: [{ id: channelId }] },
+        "게시 링크": { url: post.link },
+        "게시 상태": { select: { name: "게시" } },
+        ...(post.publishedAt ? { "게시일": { date: { start: post.publishedAt } } } : {}),
+        "메모": {
+          rich_text: [{ type: "text", text: { content: "성과 수집이 계정에서 찾아 자동으로 만든 기록. 산출물은 직접 연결하세요." } }],
+        },
+      },
+    }),
+  });
+  return { id: page.id, title, link: post.link, channel: post.channel, code: post.code };
+}
+
+/** 유튜브 채널 업로드 목록. 채널은 게시물 DB 에 이미 있는 영상에서 알아낸다(YOUTUBE_CHANNEL_ID 가 있으면 그것도). */
+async function youtubeUploads(cfg: Config, knownIds: string[]): Promise<AccountPost[]> {
+  const yt = async (path: string, params: Record<string, string>) => {
+    const query = new URLSearchParams({ ...params, key: cfg.youtubeApiKey });
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/${path}?${query}`);
+    const text = await res.text();
+    if (!res.ok) throw apiError(cfg, "유튜브 API", res.status, text);
+    return JSON.parse(text) as Json;
+  };
+  const channels = new Set<string>(cfg.youtubeChannelId ? [cfg.youtubeChannelId] : []);
+  if (knownIds.length > 0) {
+    const res = await yt("videos", { part: "snippet", id: knownIds.slice(0, 50).join(",") });
+    for (const item of (res.items ?? []) as Json[]) if (item.snippet?.channelId) channels.add(item.snippet.channelId);
+  }
+  if (channels.size === 0) return [];
+  const posts: AccountPost[] = [];
+  const res = await yt("channels", { part: "contentDetails", id: [...channels].join(",") });
+  for (const channel of (res.items ?? []) as Json[]) {
+    const playlistId = channel.contentDetails?.relatedPlaylists?.uploads;
+    if (!playlistId) continue;
+    let pageToken = "";
+    for (let page = 0; page < MEDIA_LIST_PAGES; page++) {
+      const list = await yt("playlistItems", {
+        part: "snippet",
+        playlistId,
+        maxResults: "50",
+        ...(pageToken ? { pageToken } : {}),
+      });
+      for (const item of (list.items ?? []) as Json[]) {
+        const videoId = item.snippet?.resourceId?.videoId;
+        if (!videoId) continue;
+        posts.push({
+          channel: "youtube",
+          code: videoId,
+          link: `https://www.youtube.com/watch?v=${videoId}`,
+          text: String(item.snippet?.title ?? ""),
+          publishedAt: String(item.snippet?.publishedAt ?? ""),
+        });
+      }
+      pageToken = String(list.nextPageToken ?? "");
+      if (pageToken === "") break;
+    }
+  }
+  return posts;
+}
+
 async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
   const started = Date.now();
   const date = kstDate(started);
-  const targets = await findMetricTargets(cfg);
+  const { targets, known } = await findMetricTargets(cfg);
   const logged = await loggedTotals(cfg);
   const results: CollectResult[] = [];
-  const has = (channel: MetricChannel) => targets.some((t) => t.channel === channel);
+  const channelIds = new Map<MetricChannel, string>();
+  const imported: string[] = [];
+
+  // 계정에서 찾은 게시물 중 게시물 DB 에 없는 것은 기록을 새로 만들어 대상에 더한다.
+  // dryRun 이면 만들지 않고 만들 목록만 돌려준다.
+  const addMissing = async (posts: AccountPost[]) => {
+    for (const post of posts) {
+      const key = `${post.channel}:${post.code}`;
+      if (known.has(key)) continue;
+      known.add(key);
+      const title = importedPostTitle(post.text, METRIC_CHANNEL_LABELS[post.channel]);
+      if (dryRun) {
+        imported.push(title);
+        continue;
+      }
+      try {
+        targets.push(await importPost(cfg, post, channelIds));
+        imported.push(title);
+      } catch (e) {
+        results.push({ post: title, channel: post.channel, status: "실패", error: `게시물 기록 생성 실패: ${message(e)}` });
+      }
+    }
+  };
 
   // 채널별로 현재 누적값을 먼저 모은다. 한 채널이 실패해도 나머지 채널은 그대로 기록한다.
   const current = new Map<string, Metrics>();
   const channelError = new Map<MetricChannel, string>();
 
-  if (has("instagram")) {
+  if (cfg.igUserId && cfg.igToken) {
     try {
       const media = await listByShortcode((after) =>
-        igGet(cfg, `${cfg.igUserId}/media?fields=id,shortcode,permalink,like_count,comments_count&limit=100${after ? `&after=${after}` : ""}`)
+        igGet(
+          cfg,
+          `${cfg.igUserId}/media?fields=id,shortcode,permalink,caption,timestamp,like_count,comments_count&limit=100${
+            after ? `&after=${after}` : ""
+          }`,
+        )
       );
+      await addMissing([...media.entries()].map(([code, item]) => ({
+        channel: "instagram" as const,
+        code,
+        link: String(item.permalink ?? `https://www.instagram.com/p/${code}/`),
+        text: String(item.caption ?? ""),
+        publishedAt: String(item.timestamp ?? ""),
+      })));
       for (const target of targets.filter((t) => t.channel === "instagram")) {
         const item = media.get(target.code);
         if (item) current.set(target.id, await instagramMetrics(cfg, item));
@@ -1692,40 +1815,55 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
     }
   }
 
-  if (has("threads")) {
-    try {
-      const auth = await resolveThreadsAuth(cfg);
-      const media = await listByShortcode((after) =>
-        threadsGet(cfg, auth, `${auth.userId || "me"}/threads?fields=id,shortcode,permalink&limit=100${after ? `&after=${after}` : ""}`)
-      );
-      for (const target of targets.filter((t) => t.channel === "threads")) {
-        const item = media.get(target.code);
-        if (!item) continue;
-        try {
-          current.set(target.id, await threadsMetrics(cfg, auth, item.id));
-        } catch (e) {
-          results.push({ post: target.title, channel: "threads", status: "실패", error: message(e) });
-        }
+  try {
+    const auth = await resolveThreadsAuth(cfg);
+    const media = await listByShortcode((after) =>
+      threadsGet(
+        cfg,
+        auth,
+        `${auth.userId || "me"}/threads?fields=id,shortcode,permalink,text,timestamp,media_type&limit=100${
+          after ? `&after=${after}` : ""
+        }`,
+      )
+    );
+    // 다른 사람 글을 리포스트한 항목은 내 게시물이 아니다.
+    for (const [code, item] of media) if (item.media_type === "REPOST_FACADE") media.delete(code);
+    await addMissing([...media.entries()].map(([code, item]) => ({
+      channel: "threads" as const,
+      code,
+      link: String(item.permalink ?? ""),
+      text: String(item.text ?? ""),
+      publishedAt: String(item.timestamp ?? ""),
+    })));
+    for (const target of targets.filter((t) => t.channel === "threads")) {
+      const item = media.get(target.code);
+      if (!item) continue;
+      try {
+        current.set(target.id, await threadsMetrics(cfg, auth, item.id));
+      } catch (e) {
+        results.push({ post: target.title, channel: "threads", status: "실패", error: message(e) });
       }
-    } catch (e) {
-      channelError.set("threads", message(e));
     }
+  } catch (e) {
+    channelError.set("threads", message(e));
   }
 
-  if (has("youtube")) {
-    if (cfg.youtubeApiKey === "") {
+  if (cfg.youtubeApiKey === "") {
+    if (targets.some((t) => t.channel === "youtube")) {
       channelError.set("youtube", "환경값 YOUTUBE_API_KEY 가 없어 유튜브는 건너뜁니다.");
-    } else {
-      try {
-        const yt = targets.filter((t) => t.channel === "youtube");
-        const stats = await youtubeStats(cfg, [...new Set(yt.map((t) => t.code))]);
-        for (const target of yt) {
-          const metrics = stats.get(target.code);
-          if (metrics) current.set(target.id, metrics);
-        }
-      } catch (e) {
-        channelError.set("youtube", message(e));
+    }
+  } else {
+    try {
+      const knownIds = [...known].filter((key) => key.startsWith("youtube:")).map((key) => key.slice(8));
+      await addMissing(await youtubeUploads(cfg, knownIds));
+      const yt = targets.filter((t) => t.channel === "youtube");
+      const stats = await youtubeStats(cfg, [...new Set(yt.map((t) => t.code))]);
+      for (const target of yt) {
+        const metrics = stats.get(target.code);
+        if (metrics) current.set(target.id, metrics);
       }
+    } catch (e) {
+      channelError.set("youtube", message(e));
     }
   }
 
@@ -1770,6 +1908,7 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
     date,
     targets: targets.length,
     created,
+    imported: { count: imported.length, titles: imported },
     failures,
     channelErrors: Object.fromEntries(channelError),
     results,
@@ -1846,10 +1985,23 @@ Deno.serve(async (req) => {
 
   const dryRun = payload.dryRun === true || reqUrl.searchParams.get("dryRun") === "true";
 
-  // 성과 수집은 GitHub Actions 가 결과를 기다리며 부르므로 바로 실행하고 결과를 돌려준다.
+  // 성과 수집. GitHub Actions 는 ?wait=1 로 결과를 기다리고,
+  // 노션 버튼은 10초 안에 답을 받아야 하므로 접수(202)만 돌려주고 뒤에서 수집한다.
   if (reqUrl.searchParams.get("metrics") === "1") {
+    const metricsTask = runMetrics(cfg, dryRun);
+    const runtime = (globalThis as {
+      EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
+    }).EdgeRuntime;
+    if (reqUrl.searchParams.get("wait") !== "1" && runtime?.waitUntil) {
+      runtime.waitUntil(
+        metricsTask
+          .then((body) => console.log("성과 수집 결과", JSON.stringify({ ...body, results: undefined })))
+          .catch((e) => console.error("성과 수집 실패", message(e))),
+      );
+      return json({ ok: true, accepted: true, message: "성과 수집을 시작했습니다. 1분쯤 뒤 성과 로그를 확인하세요." }, 202);
+    }
     try {
-      const body = await runMetrics(cfg, dryRun);
+      const body = await metricsTask;
       return json(body, body.ok === false ? 500 : 200);
     } catch (e) {
       console.error("성과 수집 실패", message(e));
