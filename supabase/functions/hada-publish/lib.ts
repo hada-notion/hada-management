@@ -682,3 +682,21 @@ export function metricChannelByLabel(label: string): MetricChannel | null {
   }
   return null;
 }
+
+/**
+ * 성과 수집 결과에서 채널 페이지의 '마지막 오류'에 남길 문장을 만든다. 문제가 없으면 빈 문자열.
+ * 채널 오류(토큰·권한 등)와 기록 실패 건수를 한 줄씩 적는다.
+ */
+export function metricsErrorSummary(body: {
+  channelErrors?: Record<string, unknown>;
+  failures?: unknown;
+}): string {
+  const lines: string[] = [];
+  for (const [channel, error] of Object.entries(body.channelErrors ?? {})) {
+    const label = METRIC_CHANNEL_LABELS[channel as MetricChannel] ?? channel;
+    lines.push(`${label} — ${String(error)}`);
+  }
+  const failures = typeof body.failures === "number" ? body.failures : 0;
+  if (failures > 0) lines.push(`성과 로그 기록 실패 ${failures}건 (함수 로그 확인)`);
+  return lines.join("\n");
+}

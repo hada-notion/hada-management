@@ -35,6 +35,7 @@ import {
   importedPostTitle,
   kstDate,
   metricChannelByLabel,
+  metricsErrorSummary,
   publishedOnOrAfter,
   metricChannelOf,
   metricDelta,
@@ -558,4 +559,13 @@ Deno.test("metricChannelByLabel: 채널 페이지 이름으로 수집 채널을 
   assertEquals(metricChannelByLabel(" 유튜브 "), "youtube");
   assertEquals(metricChannelByLabel("블로그"), null);
   assertEquals(metricChannelByLabel(""), null);
+});
+
+Deno.test("metricsErrorSummary: 채널 오류와 기록 실패만 적는다", () => {
+  assertEquals(metricsErrorSummary({ channelErrors: {}, failures: 0 }), "");
+  assertEquals(metricsErrorSummary({}), "");
+  assertEquals(
+    metricsErrorSummary({ channelErrors: { threads: "403 권한 없음" }, failures: 2 }),
+    "스레드 — 403 권한 없음\n성과 로그 기록 실패 2건 (함수 로그 확인)",
+  );
 });

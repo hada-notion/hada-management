@@ -79,6 +79,7 @@ import {
   METRIC_FIELDS,
   importedPostTitle,
   metricChannelByLabel,
+  metricsErrorSummary,
   publishedOnOrAfter,
   kstDate,
   metricChannelOf,
@@ -2183,6 +2184,40 @@ async function runMetrics(cfg: Config, dryRun: boolean, only: MetricChannel | nu
   };
 }
 
+// 채널 DB 버튼으로 부른 수집은 그 채널 페이지에 진행 상태를 남긴다.
+// 버튼이 '수집 상태'를 ⚪ 대기로 바꾸고 웹훅을 보내면, 여기서 🔄 작업중 → ✅ 완료 / ⚠️ 오류로 바꾼다.
+// 상태 칸이 없는 페이지여도 수집은 그대로 한다(상태 기록 실패는 로그만 남긴다).
+async function runMetricsWithStatus(cfg: Config, pageId: string, only: MetricChannel | null): Promise<Json> {
+  const mark = async (properties: Json) => {
+    try {
+      await updatePage(cfg, pageId, properties);
+    } catch (e) {
+      console.error("수집 상태 기록 실패", pageId, message(e));
+    }
+  };
+  await mark({
+    "수집 상태": { select: { name: STATUS_WORKING } },
+    "처리 시작 시각": { date: { start: new Date().toISOString() } },
+  });
+  try {
+    const body = await runMetrics(cfg, false, only);
+    const summary = maskSecrets(metricsErrorSummary(body), secretsOf(cfg));
+    await mark({
+      "수집 상태": { select: { name: summary === "" ? STATUS_DONE : STATUS_ERROR } },
+      "마지막 오류": { rich_text: summary === "" ? [] : [{ type: "text", text: { content: truncate(summary, 1800) } }] },
+      "마지막 수집": { date: { start: new Date().toISOString() } },
+    });
+    return body;
+  } catch (e) {
+    const detail = truncate(maskSecrets(message(e), secretsOf(cfg)), 1800);
+    await mark({
+      "수집 상태": { select: { name: STATUS_ERROR } },
+      "마지막 오류": { rich_text: [{ type: "text", text: { content: detail } }] },
+    });
+    throw e;
+  }
+}
+
 async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string): Promise<string> {
   const explicit = readTarget(payload, requestUrl);
   if (explicit !== "") return parsePageId(explicit);
@@ -2267,7 +2302,10 @@ Deno.serve(async (req) => {
     const data = (payload.data ?? {}) as Json;
     const only = data.object === "page" ? metricChannelByLabel(pageTitle((data.properties ?? {}) as Json)) : null;
     console.log("성과 수집 채널", only ?? "(전체)");
-    const metricsTask = runMetrics(cfg, dryRun, only);
+    const statusPage = data.object === "page" && typeof data.id === "string" && !dryRun ? data.id as string : "";
+    const metricsTask = statusPage === ""
+      ? runMetrics(cfg, dryRun, only)
+      : runMetricsWithStatus(cfg, statusPage, only);
     const runtime = (globalThis as {
       EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
     }).EdgeRuntime;
