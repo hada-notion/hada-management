@@ -34,6 +34,7 @@ import {
   truncate,
   importedPostTitle,
   kstDate,
+  metricChannelByLabel,
   publishedOnOrAfter,
   metricChannelOf,
   metricDelta,
@@ -550,4 +551,11 @@ Deno.test("publishedOnOrAfter: 한국 시간 날짜로 비교한다", () => {
   assertEquals(publishedOnOrAfter("2026-09-30T14:00:00+0000", "2026-10-01"), false);
   assertEquals(publishedOnOrAfter("", "2026-10-01"), false);
   assertEquals(publishedOnOrAfter("", ""), true);
+});
+
+Deno.test("metricChannelByLabel: 채널 페이지 이름으로 수집 채널을 찾는다", () => {
+  assertEquals(metricChannelByLabel("스레드"), "threads");
+  assertEquals(metricChannelByLabel(" 유튜브 "), "youtube");
+  assertEquals(metricChannelByLabel("블로그"), null);
+  assertEquals(metricChannelByLabel(""), null);
 });
