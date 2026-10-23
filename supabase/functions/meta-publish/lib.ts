@@ -546,3 +546,17 @@ export function readInsights(response: Record<string, any>): Record<string, numb
 export function kstDate(nowMs: number): string {
   return new Date(nowMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
+
+/** 채널 DB 페이지 이름. 계정에서 찾은 게시물의 기록을 만들 때 채널 관계를 이 이름으로 찾는다. */
+export const METRIC_CHANNEL_LABELS: Record<MetricChannel, string> = {
+  instagram: "인스타그램",
+  threads: "스레드",
+  youtube: "유튜브",
+};
+
+/** 계정에서 가져온 게시물의 기록 이름. 글의 첫 줄(해시태그 줄 제외)을 40자로 자르고 채널을 붙인다. */
+export function importedPostTitle(text: string, channelLabel: string): string {
+  const line = text.split("\n").map((part) => part.trim()).find((part) => part !== "" && !part.startsWith("#")) ?? "";
+  const head = [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
+  return `${head || "제목 없는 게시물"} · ${channelLabel}`;
+}

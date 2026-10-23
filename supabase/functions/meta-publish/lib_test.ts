@@ -32,6 +32,7 @@ import {
   threadsLength,
   threadsAuthorizeUrl,
   truncate,
+  importedPostTitle,
   kstDate,
   metricChannelOf,
   metricDelta,
@@ -473,4 +474,10 @@ Deno.test("readInsights: values 와 total_value 둘 다 읽는다", () => {
 Deno.test("kstDate: 한국 시간 날짜", () => {
   assertEquals(kstDate(Date.parse("2026-10-22T15:30:00Z")), "2026-10-23");
   assertEquals(kstDate(Date.parse("2026-10-22T14:59:00Z")), "2026-10-22");
+});
+
+Deno.test("importedPostTitle: 첫 줄을 40자로 자르고 채널을 붙인다", () => {
+  assertEquals(importedPostTitle("\n#학원관리 #노션\n수업 중 상담 전화\n둘째 줄", "스레드"), "수업 중 상담 전화 · 스레드");
+  assertEquals(importedPostTitle("", "인스타그램"), "제목 없는 게시물 · 인스타그램");
+  assertEquals(importedPostTitle("가".repeat(45), "유튜브"), `${"가".repeat(40)}… · 유튜브`);
 });
