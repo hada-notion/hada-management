@@ -38,6 +38,8 @@ import {
   metricsErrorSummary,
   metricsResultSummary,
   kstDateTime,
+  applyMetricScope,
+  autoCollectDue,
   publishedOnOrAfter,
   metricChannelOf,
   metricDelta,
@@ -590,4 +592,29 @@ Deno.test("metricsResultSummary: 시각·건수·오류를 줄마다 적는다",
     metricsResultSummary({ targets: 0, created: 0, channelErrors: { youtube: "키 없음" } }, now, "전체"),
     "2026-10-23 11:52 수집 · 전체\n게시물 0건 확인 · 새 기록 0건 · 변화 없음 0건\n유튜브 — 키 없음",
   );
+});
+
+Deno.test("applyMetricScope: 기간과 최근 개수로 갱신 대상을 줄인다", () => {
+  const now = Date.parse("2026-10-23T03:00:00Z");
+  const posts = [
+    { id: "a", publishedAt: "2026-10-22T10:00:00Z" },
+    { id: "b", publishedAt: "2026-10-01T10:00:00Z" },
+    { id: "c", publishedAt: "2026-07-01" },
+    { id: "d", publishedAt: "" },
+  ];
+  const ids = (xs: { id: string }[]) => xs.map((x) => x.id);
+  assertEquals(ids(applyMetricScope(posts, { days: null, latest: null }, now)), ["a", "b", "c", "d"]);
+  assertEquals(ids(applyMetricScope(posts, { days: 30, latest: null }, now)), ["a", "b"]);
+  assertEquals(ids(applyMetricScope(posts, { days: null, latest: 2 }, now)), ["a", "b"]);
+  assertEquals(ids(applyMetricScope(posts, { days: 7, latest: 5 }, now)), ["a"]);
+});
+
+Deno.test("autoCollectDue: 정한 시각이 지났고 오늘 아직 안 했으면 수집한다", () => {
+  const at = (iso: string) => Date.parse(iso);
+  // 03:00Z = 한국 12시
+  assertEquals(autoCollectDue(4, "", at("2026-10-23T03:00:00Z")), true);
+  assertEquals(autoCollectDue(13, "", at("2026-10-23T03:00:00Z")), false);
+  assertEquals(autoCollectDue(4, "2026-10-23T05:00:00+09:00", at("2026-10-23T03:00:00Z")), false);
+  assertEquals(autoCollectDue(4, "2026-10-22T04:05:00+09:00", at("2026-10-23T03:00:00Z")), true);
+  assertEquals(autoCollectDue(null, "", at("2026-10-23T03:00:00Z")), false);
 });

@@ -14,7 +14,7 @@
 | `supabase/meta_tokens.sql` | 스레드 토큰 보관 표 생성 SQL |
 | `supabase/meta_jobs.sql` | 발행 잠금 표 생성 SQL (중복 게시 방지) |
 | `.github/workflows/deploy-supabase-functions.yml` | 타입 검사·테스트 후 Supabase로 배포 |
-| `.github/workflows/collect-metrics.yml` | 매일 새벽 4시(한국 시간) 성과 수집 호출 |
+| `.github/workflows/collect-metrics.yml` | 매시 호출, 채널 DB `자동 수집 시각`이 된 채널만 성과 수집 |
 
 ## 동작
 
@@ -207,7 +207,7 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 - 인스타그램 인사이트 권한이 없으면 좋아요·댓글만 남긴다. 스레드는 인사이트가 유일한 경로라 `threads_manage_insights` 권한이 필요하다. 이 권한은 2026-10-23 에 승인 범위에 추가했으므로 **그 전에 받은 스레드 토큰은 인증(위 5번)을 한 번 다시 해야 한다.**
 - 한 채널이 실패해도 다른 채널은 그대로 기록한다. 실패 내용은 응답의 `channelErrors`·`results` 와 Actions 로그에 남는다.
 
-호출은 `.github/workflows/collect-metrics.yml` 이 매일 새벽 4시(한국 시간)에 `?wait=1` 로 한다. `?wait=1` 이 없으면 접수(202)만 돌려주고 뒤에서 수집하므로 노션 버튼으로도 부를 수 있다(웹훅 URL `…/hada-publish?metrics=1`, 헤더 `x-admin-key`). 채널 DB 버튼은 먼저 `수집 상태`를 `⚪ 대기`로 바꾸고 웹훅을 보낸다. 함수가 그 페이지의 `수집 상태`를 `🔄 작업중` → `✅ 완료`/`⚠️ 오류`로 바꾸고 `처리 시작 시각`·`마지막 수집`과 `처리 결과`(시각·확인한 게시물·새 기록 건수·오류)를 남기며, `실시간 처리 상태` 수식이 이를 보여 준다. 결과는 함수 로그의 `성과 수집 결과` 줄과 성과 로그 DB 에서 확인한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
+호출은 `.github/workflows/collect-metrics.yml` 이 매시 `?wait=1&scheduled=1` 로 한다. 함수는 채널 DB 의 `자동 수집 시각`(한국 시간 0~23, 비우면 자동 수집 안 함)이 지났고 오늘 아직 `마지막 수집`이 없는 채널만 돌린다. 한 번에 갱신할 게시물은 채널 DB 의 `갱신 기간(일)`(게시일이 며칠 안인 것만)과 `갱신 개수`(게시일 최신순 N개만)로 줄인다. 비우면 제한 없음이고 버튼 수집에도 같이 적용된다. 새 게시물 가져오기는 이와 별개로 `METRICS_IMPORT_SINCE` 를 따른다. `?wait=1` 이 없으면 접수(202)만 돌려주고 뒤에서 수집하므로 노션 버튼으로도 부를 수 있다(웹훅 URL `…/hada-publish?metrics=1`, 헤더 `x-admin-key`). 채널 DB 버튼은 먼저 `수집 상태`를 `⚪ 대기`로 바꾸고 웹훅을 보낸다. 함수가 그 페이지의 `수집 상태`를 `🔄 작업중` → `✅ 완료`/`⚠️ 오류`로 바꾸고 `처리 시작 시각`·`마지막 수집`과 `처리 결과`(시각·확인한 게시물·새 기록 건수·오류)를 남기며, `실시간 처리 상태` 수식이 이를 보여 준다. 결과는 함수 로그의 `성과 수집 결과` 줄과 성과 로그 DB 에서 확인한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
 
 ```bash
 curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?metrics=1&wait=1&dryRun=true" \
