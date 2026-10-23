@@ -700,3 +700,34 @@ export function metricsErrorSummary(body: {
   if (failures > 0) lines.push(`성과 로그 기록 실패 ${failures}건 (함수 로그 확인)`);
   return lines.join("\n");
 }
+
+/** 한국 시간 "YYYY-MM-DD HH:mm". */
+export function kstDateTime(nowMs: number): string {
+  return new Date(nowMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
+
+/**
+ * 채널 페이지의 '처리 결과'에 남길 요약. 첫 줄은 시각과 범위, 둘째 줄은 건수,
+ * 그 아래에 새로 가져온 게시물과 오류(있을 때만)를 적는다.
+ */
+export function metricsResultSummary(body: {
+  targets?: unknown;
+  created?: unknown;
+  imported?: { count?: unknown };
+  results?: { status?: unknown }[];
+  channelErrors?: Record<string, unknown>;
+  failures?: unknown;
+}, nowMs: number, scope: string): string {
+  const num = (v: unknown) => (typeof v === "number" ? v : 0);
+  const statuses = (body.results ?? []).map((r) => r.status);
+  const unchanged = statuses.filter((s) => s === "변화 없음").length;
+  const deferred = statuses.filter((s) => s === "시간 초과로 다음에").length;
+  const counts = [`게시물 ${num(body.targets)}건 확인`, `새 기록 ${num(body.created)}건`, `변화 없음 ${unchanged}건`];
+  if (deferred > 0) counts.push(`다음으로 미룸 ${deferred}건`);
+  const lines = [`${kstDateTime(nowMs)} 수집 · ${scope}`, counts.join(" · ")];
+  const imported = num(body.imported?.count);
+  if (imported > 0) lines.push(`계정에서 새로 가져온 게시물 ${imported}건`);
+  const errors = metricsErrorSummary(body);
+  if (errors !== "") lines.push(errors);
+  return lines.join("\n");
+}
