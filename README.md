@@ -152,6 +152,9 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 
 1. [구글 클라우드 콘솔](https://console.cloud.google.com/)에서 프로젝트를 만들고 **YouTube Data API v3** 를 사용 설정한다.
 2. OAuth 동의 화면(Google Auth Platform)을 만든다. 사용자 유형 **외부**, 범위에 `youtube.upload`·`youtube.readonly` 를 넣는다.
+   브랜딩 페이지에는 앱 이름·지원 이메일·개발자 연락처와 함께 아래 두 주소를 넣는다(승인된 도메인은 `<프로젝트 ref>.supabase.co`). 함수가 직접 보여주는 앱 소개·개인정보처리방침 페이지다.
+   - 홈페이지: `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?page=home`
+   - 개인정보처리방침: `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish?page=privacy`
 3. **게시 상태를 '프로덕션'으로 바꾼다.** '테스트' 상태로 두면 승인이 7일마다 만료된다. 검수(인증)를 받지 않아도 본인 계정은 '확인되지 않은 앱' 경고에서 **고급 → 이동** 을 눌러 승인할 수 있다.
 4. 사용자 인증 정보 → OAuth 클라이언트 ID 만들기 → 유형 **웹 애플리케이션**. 승인된 리디렉션 URI 에 아래 주소를 넣는다.
    `https://<프로젝트 ref>.supabase.co/functions/v1/hada-publish`

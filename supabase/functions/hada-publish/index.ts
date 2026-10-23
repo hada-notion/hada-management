@@ -33,6 +33,7 @@
 // 스레드 인증 콜백: GET /functions/v1/hada-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
 // 유튜브 인증 안내: GET /functions/v1/hada-publish?youtube_auth=1
 // 유튜브 인증 콜백: GET /functions/v1/hada-publish?code=...&state=youtube  (구글이 돌려보내는 주소)
+// 앱 소개·개인정보처리방침: GET /functions/v1/hada-publish?page=home | privacy  (구글 동의 화면 브랜딩용)
 //
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
 
@@ -572,6 +573,29 @@ const THREADS_OAUTH_FALLBACK = "https://graph.threads.net";
 
 // Supabase 게이트웨이가 응답의 Content-Type 을 text/plain 으로 덮어써서 HTML 은 렌더링되지 않는다.
 // 그래서 사람이 읽기 좋은 평문으로 돌려주고, 한글이 깨지지 않게 UTF-8 BOM 을 앞에 붙인다.
+// 구글 OAuth 앱을 프로덕션으로 게시하려면 홈페이지·개인정보처리방침 주소가 필요하다.
+// 이미 승인된 도메인인 이 함수 주소에 붙여 둔다.
+const HOME_PAGE_TEXT =
+  "하다(HADA)가 직접 만든 콘텐츠를 자기 계정에 발행하고 성과를 기록하는 내부 도구입니다.\n\n" +
+  "- 노션에 정리한 콘텐츠를 하다의 인스타그램·스레드·유튜브 계정에 발행합니다.\n" +
+  "- 발행한 게시물의 조회수·좋아요·댓글 등 성과를 하다의 노션에 기록합니다.\n\n" +
+  "외부 사용자에게 제공하는 서비스가 아니며, 하다 운영자 본인의 계정에만 연결됩니다.\n" +
+  "개인정보처리방침: ?page=privacy";
+
+const PRIVACY_PAGE_TEXT =
+  "하다(HADA) 발행 도구는 하다 운영자 본인의 계정에만 연결해 쓰는 내부 도구입니다.\n\n" +
+  "1. 받는 정보\n" +
+  "   - 유튜브: 영상 업로드와 채널 확인에 필요한 권한(youtube.upload, youtube.readonly)의 인증 토큰\n" +
+  "   - 인스타그램·스레드: 게시물 발행과 성과 조회에 필요한 인증 토큰\n\n" +
+  "2. 쓰는 곳\n" +
+  "   - 운영자가 노션에서 고른 콘텐츠를 운영자 본인의 채널에 발행하고, 그 게시물의 공개 성과 지표를 노션에 기록하는 데만 씁니다.\n\n" +
+  "3. 보관과 공유\n" +
+  "   - 토큰은 하다의 Supabase 데이터베이스에 저장하며 제3자에게 제공하거나 판매하지 않습니다.\n" +
+  "   - 다른 사람의 개인정보는 수집하지 않습니다.\n\n" +
+  "4. 삭제\n" +
+  "   - 구글 계정 설정(https://myaccount.google.com/permissions)에서 언제든 연결을 끊을 수 있으며, 요청하면 저장된 토큰을 삭제합니다.\n\n" +
+  "YouTube API 서비스를 사용하며, YouTube 서비스 약관(https://www.youtube.com/t/terms)과 Google 개인정보처리방침(https://policies.google.com/privacy)이 함께 적용됩니다.";
+
 function textPage(title: string, body: string, status = 200): Response {
   return new Response(`\uFEFF${title}\n\n${body}\n`, {
     status,
@@ -2369,9 +2393,16 @@ Deno.serve(async (req) => {
   }
 
   // 인증 없이 열리는 GET 경로.
+  // - ?page=home / ?page=privacy : 구글 동의 화면에 적는 앱 소개·개인정보처리방침
   // - ?threads_auth=1 / ?youtube_auth=1 : 승인 링크를 보여주는 안내 페이지
   // - ?code=...       : 스레드·구글이 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
   const reqUrl = new URL(req.url);
+  if (req.method === "GET" && reqUrl.searchParams.get("page") === "home") {
+    return textPage("하다 발행 도구", HOME_PAGE_TEXT);
+  }
+  if (req.method === "GET" && reqUrl.searchParams.get("page") === "privacy") {
+    return textPage("하다 발행 도구 개인정보처리방침", PRIVACY_PAGE_TEXT);
+  }
   if (req.method === "GET" && reqUrl.searchParams.has("threads_auth")) {
     return handleThreadsAuthPage(reqUrl, cfg);
   }
