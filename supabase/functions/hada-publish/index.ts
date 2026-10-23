@@ -80,6 +80,8 @@ import {
   importedPostTitle,
   metricChannelByLabel,
   metricsErrorSummary,
+  metricsResultSummary,
+  kstDateTime,
   publishedOnOrAfter,
   kstDate,
   metricChannelOf,
@@ -2185,7 +2187,8 @@ async function runMetrics(cfg: Config, dryRun: boolean, only: MetricChannel | nu
 }
 
 // 채널 DB 버튼으로 부른 수집은 그 채널 페이지에 진행 상태를 남긴다.
-// 버튼이 '수집 상태'를 ⚪ 대기로 바꾸고 웹훅을 보내면, 여기서 🔄 작업중 → ✅ 완료 / ⚠️ 오류로 바꾼다.
+// 버튼이 '수집 상태'를 ⚪ 대기로 바꾸고 웹훅을 보내면, 여기서 🔄 작업중 → ✅ 완료 / ⚠️ 오류로 바꾸고
+// '처리 결과'에 시각·건수·오류를 남긴다.
 // 상태 칸이 없는 페이지여도 수집은 그대로 한다(상태 기록 실패는 로그만 남긴다).
 async function runMetricsWithStatus(cfg: Config, pageId: string, only: MetricChannel | null): Promise<Json> {
   const mark = async (properties: Json) => {
@@ -2201,18 +2204,20 @@ async function runMetricsWithStatus(cfg: Config, pageId: string, only: MetricCha
   });
   try {
     const body = await runMetrics(cfg, false, only);
-    const summary = maskSecrets(metricsErrorSummary(body), secretsOf(cfg));
+    const failed = metricsErrorSummary(body) !== "";
+    const scope = only === null ? "전체" : METRIC_CHANNEL_LABELS[only];
+    const summary = maskSecrets(metricsResultSummary(body, Date.now(), scope), secretsOf(cfg));
     await mark({
-      "수집 상태": { select: { name: summary === "" ? STATUS_DONE : STATUS_ERROR } },
-      "마지막 오류": { rich_text: summary === "" ? [] : [{ type: "text", text: { content: truncate(summary, 1800) } }] },
+      "수집 상태": { select: { name: failed ? STATUS_ERROR : STATUS_DONE } },
+      "처리 결과": { rich_text: [{ type: "text", text: { content: truncate(summary, 1800) } }] },
       "마지막 수집": { date: { start: new Date().toISOString() } },
     });
     return body;
   } catch (e) {
-    const detail = truncate(maskSecrets(message(e), secretsOf(cfg)), 1800);
+    const detail = truncate(`${kstDateTime(Date.now())} 수집 실패\n${maskSecrets(message(e), secretsOf(cfg))}`, 1800);
     await mark({
       "수집 상태": { select: { name: STATUS_ERROR } },
-      "마지막 오류": { rich_text: [{ type: "text", text: { content: detail } }] },
+      "처리 결과": { rich_text: [{ type: "text", text: { content: detail } }] },
     });
     throw e;
   }

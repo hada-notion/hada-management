@@ -36,6 +36,8 @@ import {
   kstDate,
   metricChannelByLabel,
   metricsErrorSummary,
+  metricsResultSummary,
+  kstDateTime,
   publishedOnOrAfter,
   metricChannelOf,
   metricDelta,
@@ -567,5 +569,25 @@ Deno.test("metricsErrorSummary: 채널 오류와 기록 실패만 적는다", ()
   assertEquals(
     metricsErrorSummary({ channelErrors: { threads: "403 권한 없음" }, failures: 2 }),
     "스레드 — 403 권한 없음\n성과 로그 기록 실패 2건 (함수 로그 확인)",
+  );
+});
+
+Deno.test("metricsResultSummary: 시각·건수·오류를 줄마다 적는다", () => {
+  const now = Date.parse("2026-10-23T02:52:00Z");
+  assertEquals(kstDateTime(now), "2026-10-23 11:52");
+  assertEquals(
+    metricsResultSummary({
+      targets: 9,
+      created: 3,
+      imported: { count: 1 },
+      results: [{ status: "기록" }, { status: "변화 없음" }, { status: "변화 없음" }],
+      channelErrors: {},
+      failures: 0,
+    }, now, "스레드"),
+    "2026-10-23 11:52 수집 · 스레드\n게시물 9건 확인 · 새 기록 3건 · 변화 없음 2건\n계정에서 새로 가져온 게시물 1건",
+  );
+  assertEquals(
+    metricsResultSummary({ targets: 0, created: 0, channelErrors: { youtube: "키 없음" } }, now, "전체"),
+    "2026-10-23 11:52 수집 · 전체\n게시물 0건 확인 · 새 기록 0건 · 변화 없음 0건\n유튜브 — 키 없음",
   );
 });
