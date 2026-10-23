@@ -111,7 +111,8 @@ export function captionLimitError(caption: string, channels: string[]): string |
 /** 스레드 토큰은 60일짜리라, 마지막 갱신 후 이 일수가 지나면 미리 갱신한다. */
 export const THREADS_REFRESH_AFTER_DAYS = 30;
 
-export const THREADS_AUTHORIZE_SCOPES = ["threads_basic", "threads_content_publish"];
+// threads_manage_insights 는 성과 수집(조회수·좋아요·답글)에 필요하다. 이 권한이 없던 토큰은 인증을 다시 해야 한다.
+export const THREADS_AUTHORIZE_SCOPES = ["threads_basic", "threads_content_publish", "threads_manage_insights"];
 
 /** 스레드 승인 화면 주소를 만든다. 브라우저에서 열면 code 를 받아 되돌아온다. */
 export function threadsAuthorizeUrl(appId: string, redirectUri: string, scopes: string[]): string {
@@ -458,4 +459,90 @@ export function isThreadsNotFound(e: unknown): boolean {
   const failure = (e ?? {}) as ApiFailureLike;
   if (failure.code === 24 || failure.subcode === 4279009) return true;
   return /does not exist/i.test(failure.message ?? "");
+}
+
+// ---------- 성과 수집 ----------
+
+export type MetricChannel = "instagram" | "threads" | "youtube";
+
+/** 게시 링크의 주소로 채널을 정한다. 채널 관계를 따로 읽지 않아도 된다. */
+export function metricChannelOf(link: string): MetricChannel | null {
+  let host = "";
+  try {
+    host = new URL(link).hostname.toLowerCase().replace(/^(www|m)\./, "");
+  } catch {
+    return null;
+  }
+  if (host === "instagram.com") return "instagram";
+  if (host === "threads.com" || host === "threads.net") return "threads";
+  if (host === "youtube.com" || host === "youtu.be") return "youtube";
+  return null;
+}
+
+/**
+ * 게시 링크에서 게시물 고유 코드를 꺼낸다.
+ * 인스타그램 /p/{코드}/·/reel/{코드}/, 스레드 /post/{코드}, 유튜브 영상 ID.
+ * 메타 API 의 permalink 는 /p/ 와 /reel/ 이 섞여 오고 스레드는 threads.net 으로 오기도 해서
+ * 주소 전체가 아니라 이 코드로 맞춘다.
+ */
+export function postCodeOf(link: string): string {
+  let url: URL;
+  try {
+    url = new URL(link);
+  } catch {
+    return "";
+  }
+  const parts = url.pathname.split("/").filter((part) => part !== "");
+  const after = (key: string) => {
+    const index = parts.indexOf(key);
+    return index >= 0 && index + 1 < parts.length ? parts[index + 1] : "";
+  };
+  switch (metricChannelOf(link)) {
+    case "instagram":
+      return after("p") || after("reel") || after("reels") || after("tv");
+    case "threads":
+      return after("post");
+    case "youtube":
+      if (url.hostname.endsWith("youtu.be")) return parts[0] ?? "";
+      return url.searchParams.get("v") || after("shorts") || after("live") || after("embed");
+    default:
+      return "";
+  }
+}
+
+export const METRIC_FIELDS = ["조회수", "좋아요", "댓글", "저장", "공유"] as const;
+export type MetricField = typeof METRIC_FIELDS[number];
+export type Metrics = Partial<Record<MetricField, number>>;
+
+/**
+ * 채널이 돌려준 누적값에서 지금까지 성과 로그에 쌓인 합을 빼 이번 기간 증가분을 만든다.
+ * 채널이 주지 않은 지표는 빼고, 모든 증가분이 0 이면 null(기록할 것 없음)을 돌려준다.
+ * 좋아요 취소처럼 줄어든 값도 그대로 음수로 남겨 합계가 채널 값과 같게 한다.
+ */
+export function metricDelta(current: Metrics, logged: Metrics): Metrics | null {
+  const delta: Metrics = {};
+  let changed = false;
+  for (const field of METRIC_FIELDS) {
+    const now = current[field];
+    if (typeof now !== "number" || !Number.isFinite(now)) continue;
+    const diff = now - (logged[field] ?? 0);
+    delta[field] = diff;
+    if (diff !== 0) changed = true;
+  }
+  return changed ? delta : null;
+}
+
+/** 인스타그램·스레드 인사이트 응답(data[].name·values[0].value 또는 total_value.value)을 이름별 숫자로 편다. */
+export function readInsights(response: Record<string, any>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const item of (response.data ?? []) as Record<string, any>[]) {
+    const value = item.total_value?.value ?? item.values?.[0]?.value;
+    if (typeof item.name === "string" && typeof value === "number") out[item.name] = value;
+  }
+  return out;
+}
+
+/** 한국 시간 기준 오늘 날짜(YYYY-MM-DD). 성과 로그 '기록일'에 쓴다. */
+export function kstDate(nowMs: number): string {
+  return new Date(nowMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }

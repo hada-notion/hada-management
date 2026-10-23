@@ -32,6 +32,11 @@ import {
   threadsLength,
   threadsAuthorizeUrl,
   truncate,
+  kstDate,
+  metricChannelOf,
+  metricDelta,
+  postCodeOf,
+  readInsights,
 } from "./lib.ts";
 
 function assertEquals(actual: unknown, expected: unknown, label = "값이 다릅니다") {
@@ -421,4 +426,51 @@ Deno.test("planDeploy: 배포 채널을 자동 발행과 기록으로 나눈다"
 Deno.test("planDeploy: 빈 선택이면 할 일이 없다", () => {
   const plan = planDeploy([], () => "", "✅ 완료");
   assertEquals(plan, { publish: [], record: [], done: [] });
+});
+
+Deno.test("metricChannelOf: 게시 링크 주소로 채널을 정한다", () => {
+  assertEquals(metricChannelOf("https://www.instagram.com/reel/DezfDNViJHb/"), "instagram");
+  assertEquals(metricChannelOf("https://www.threads.com/@ha.da_2025/post/DezfK__DRww"), "threads");
+  assertEquals(metricChannelOf("https://www.threads.net/@ha.da_2025/post/DezfK__DRww"), "threads");
+  assertEquals(metricChannelOf("https://youtube.com/shorts/62xB31O73Rg"), "youtube");
+  assertEquals(metricChannelOf("https://youtu.be/62xB31O73Rg"), "youtube");
+  assertEquals(metricChannelOf("https://blog.naver.com/x/1"), null);
+  assertEquals(metricChannelOf("링크 아님"), null);
+});
+
+Deno.test("postCodeOf: 채널별 게시물 코드를 꺼낸다", () => {
+  assertEquals(postCodeOf("https://www.instagram.com/p/DeRjHMXGbph/?img_index=1"), "DeRjHMXGbph");
+  assertEquals(postCodeOf("https://www.instagram.com/reel/DezfDNViJHb/"), "DezfDNViJHb");
+  assertEquals(postCodeOf("https://www.threads.com/@ha.da_2025/post/DezfK__DRww"), "DezfK__DRww");
+  assertEquals(postCodeOf("https://youtube.com/shorts/62xB31O73Rg"), "62xB31O73Rg");
+  assertEquals(postCodeOf("https://www.youtube.com/watch?v=62xB31O73Rg&t=3"), "62xB31O73Rg");
+  assertEquals(postCodeOf("https://youtu.be/62xB31O73Rg"), "62xB31O73Rg");
+  assertEquals(postCodeOf("https://www.instagram.com/ha.da_2025/"), "");
+});
+
+Deno.test("metricDelta: 누적값에서 쌓인 합을 빼고, 변화가 없으면 null", () => {
+  assertEquals(metricDelta({ 조회수: 120, 좋아요: 5 }, { 조회수: 100, 좋아요: 5 }), { 조회수: 20, 좋아요: 0 });
+  assertEquals(metricDelta({ 조회수: 30 }, {}), { 조회수: 30 });
+  assertEquals(metricDelta({ 좋아요: 4 }, { 좋아요: 5 }), { 좋아요: -1 });
+  assertEquals(metricDelta({ 조회수: 100 }, { 조회수: 100, 댓글: 3 }), null);
+  assertEquals(metricDelta({}, {}), null);
+});
+
+Deno.test("readInsights: values 와 total_value 둘 다 읽는다", () => {
+  assertEquals(
+    readInsights({
+      data: [
+        { name: "views", values: [{ value: 321 }] },
+        { name: "likes", total_value: { value: 7 } },
+        { name: "broken" },
+      ],
+    }),
+    { views: 321, likes: 7 },
+  );
+  assertEquals(readInsights({}), {});
+});
+
+Deno.test("kstDate: 한국 시간 날짜", () => {
+  assertEquals(kstDate(Date.parse("2026-10-22T15:30:00Z")), "2026-10-23");
+  assertEquals(kstDate(Date.parse("2026-10-22T14:59:00Z")), "2026-10-22");
 });
