@@ -19,6 +19,7 @@
 //   배포 채널 중 인스타그램·스레드는 발행하고(이미 ✅ 완료면 건너뜀),
 //   유튜브는 연결 설정(YOUTUBE_CLIENT_ID)이 있고 영상 형식이면 업로드한다(세로 영상은 Shorts).
 //   블로그 같은 나머지 채널은 게시물 DB 에 채널을 연결한 기록만 만든다.
+//   (네이버 블로그는 Aside 브라우저가 그 기록을 보고 올린 뒤 게시 링크를 채운다. 성과는 ?metrics=1 이 공감·댓글·공유를 모은다.)
 //   페이지를 찾지 못하면 큐 조회로 넘어간다.
 //
 // 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
@@ -90,6 +91,9 @@ import {
   publishedOnOrAfter,
   kstDate,
   metricChannelOf,
+  naverBlogIdOf,
+  naverBlogMetrics,
+  naverBlogPostUrl,
   metricDelta,
   postCodeOf,
   readInsights,
@@ -2151,6 +2155,57 @@ async function youtubeUploads(cfg: Config, knownIds: string[]): Promise<AccountP
   return posts;
 }
 
+/** 네이버 블로그 아이디. 채널 DB '블로그' 행의 URL 과 게시물 DB 에 이미 있는 블로그 글 주소에서 찾는다. */
+async function naverBlogIds(cfg: Config, knownCodes: string[]): Promise<string[]> {
+  const ids = new Set(knownCodes.map((code) => code.split("/")[0]).filter((id) => id !== ""));
+  const rows = await queryDataSource(cfg, cfg.channelDataSourceId, {
+    property: "이름",
+    title: { equals: METRIC_CHANNEL_LABELS.naver_blog },
+  });
+  for (const row of rows) {
+    const id = naverBlogIdOf(String(((row.properties ?? {}) as Json)["URL"]?.url ?? ""));
+    if (id) ids.add(id);
+  }
+  return [...ids];
+}
+
+/**
+ * 블로그 글 목록(최근 것부터 MEDIA_LIST_PAGES 쪽). 공개 모바일 API 라 인증이 필요 없다.
+ * 코드("아이디/글번호") → { 계정 게시물, 누적 지표 }.
+ */
+async function naverBlogPosts(blogId: string): Promise<Map<string, { post: AccountPost; metrics: Metrics }>> {
+  const out = new Map<string, { post: AccountPost; metrics: Metrics }>();
+  for (let page = 1; page <= MEDIA_LIST_PAGES; page++) {
+    const params = new URLSearchParams({ categoryNo: "0", itemCount: "30", page: String(page) });
+    const res = await fetch(`https://m.blog.naver.com/api/blogs/${encodeURIComponent(blogId)}/post-list?${params}`, {
+      headers: { Referer: `https://m.blog.naver.com/${blogId}`, "User-Agent": "Mozilla/5.0" },
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`네이버 블로그 목록 HTTP ${res.status}: ${truncate(text, 300)}`);
+    const body = JSON.parse(text) as Json;
+    if (body.isSuccess === false) throw new Error(`네이버 블로그 목록 실패: ${truncate(text, 300)}`);
+    const items = (body.result?.items ?? []) as Json[];
+    for (const item of items) {
+      if (item.logNo === undefined || item.logNo === null) continue;
+      const code = `${blogId}/${item.logNo}`;
+      const added = Number(item.addDate);
+      out.set(code, {
+        post: {
+          channel: "naver_blog",
+          code,
+          link: naverBlogPostUrl(blogId, item.logNo),
+          text: String(item.titleWithInspectMessage ?? ""),
+          publishedAt: Number.isFinite(added) && added > 0 ? new Date(added).toISOString() : "",
+          mediaType: "",
+        },
+        metrics: naverBlogMetrics(item),
+      });
+    }
+    if (items.length < 30) break;
+  }
+  return out;
+}
+
 /** only 가 있으면 그 채널만 수집한다(채널 DB 의 버튼). 없으면 전체. */
 async function runMetrics(
   cfg: Config,
@@ -2330,6 +2385,23 @@ async function runMetrics(
     }
   }
 
+  if (wants("naver_blog")) try {
+    const knownCodes = [...known].filter((key) => key.startsWith("naver_blog:")).map((key) => key.slice(11));
+    const blogIds = await naverBlogIds(cfg, knownCodes);
+    if (blogIds.length === 0 && targets.some((t) => t.channel === "naver_blog")) {
+      channelError.set("naver_blog", "채널 DB '블로그' 행의 URL(https://blog.naver.com/아이디)이 비어 있습니다.");
+    }
+    const all = new Map<string, { post: AccountPost; metrics: Metrics }>();
+    for (const blogId of blogIds) for (const [code, entry] of await naverBlogPosts(blogId)) all.set(code, entry);
+    await addMissing([...all.values()].map((entry) => entry.post));
+    for (const target of targets.filter((t) => t.channel === "naver_blog")) {
+      const entry = all.get(target.code);
+      if (entry) current.set(target.id, entry.metrics);
+    }
+  } catch (e) {
+    channelError.set("naver_blog", message(e));
+  }
+
   let created = 0;
   for (const target of targets) {
     if (results.some((r) => r.post === target.title && r.channel === target.channel)) continue;
@@ -2484,7 +2556,7 @@ async function runMetricsWithStatus(
 /**
  * 성과 수집 요청을 실행할 작업으로 바꾼다.
  * - scheduled: 매시 예약 실행. 채널 DB '자동 수집 시각'이 된 채널만 돌린다. 없으면 null.
- * - 채널 페이지 버튼: 그 채널만(블로그 등 다른 행이면 전체) 돌리고 그 페이지에 상태를 남긴다.
+ * - 채널 페이지 버튼: 그 채널만(수집 채널이 아닌 행이면 전체) 돌리고 그 페이지에 상태를 남긴다.
  * - 그 밖(손으로 부른 실행): 전체를 돌린다.
  * 어느 경우든 채널 DB 의 갱신 범위를 적용한다.
  */

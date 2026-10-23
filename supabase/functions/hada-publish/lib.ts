@@ -463,7 +463,7 @@ export function isThreadsNotFound(e: unknown): boolean {
 
 // ---------- 성과 수집 ----------
 
-export type MetricChannel = "instagram" | "threads" | "youtube";
+export type MetricChannel = "instagram" | "threads" | "youtube" | "naver_blog";
 
 /** 게시 링크의 주소로 채널을 정한다. 채널 관계를 따로 읽지 않아도 된다. */
 export function metricChannelOf(link: string): MetricChannel | null {
@@ -476,6 +476,7 @@ export function metricChannelOf(link: string): MetricChannel | null {
   if (host === "instagram.com") return "instagram";
   if (host === "threads.com" || host === "threads.net") return "threads";
   if (host === "youtube.com" || host === "youtu.be") return "youtube";
+  if (host === "blog.naver.com") return "naver_blog";
   return null;
 }
 
@@ -505,6 +506,12 @@ export function postCodeOf(link: string): string {
     case "youtube":
       if (url.hostname.endsWith("youtu.be")) return parts[0] ?? "";
       return url.searchParams.get("v") || after("shorts") || after("live") || after("embed");
+    case "naver_blog": {
+      // blog.naver.com/{아이디}/{글번호} 또는 PostView.naver?blogId=…&logNo=… → "아이디/글번호"
+      const blogId = url.searchParams.get("blogId") ?? (parts.length >= 2 ? parts[0] : "");
+      const logNo = url.searchParams.get("logNo") ?? (parts.length >= 2 ? parts[1] : "");
+      return /^\d+$/.test(logNo) && blogId !== "" ? `${blogId}/${logNo}` : "";
+    }
     default:
       return "";
   }
@@ -657,7 +664,44 @@ export const METRIC_CHANNEL_LABELS: Record<MetricChannel, string> = {
   instagram: "인스타그램",
   threads: "스레드",
   youtube: "유튜브",
+  naver_blog: "블로그",
 };
+
+// ---------- 네이버 블로그 ----------
+// 블로그는 글쓰기 API 가 없어 발행은 사람이(또는 Aside 브라우저가) 하고, 함수는 성과만 모은다.
+// 공개 모바일 목록 API 가 공감·댓글·공유 수를 준다. 조회수는 블로그 주인만 볼 수 있어 받지 않는다.
+
+/** 블로그 주소(https://blog.naver.com/아이디, m.blog…, PostList.naver?blogId=…)에서 아이디를 꺼낸다. */
+export function naverBlogIdOf(link: string): string {
+  let url: URL;
+  try {
+    url = new URL(link.trim());
+  } catch {
+    return "";
+  }
+  if (url.hostname.toLowerCase().replace(/^(www|m)\./, "") !== "blog.naver.com") return "";
+  const fromQuery = url.searchParams.get("blogId");
+  if (fromQuery) return fromQuery;
+  const first = url.pathname.split("/").filter((part) => part !== "")[0] ?? "";
+  return /^[A-Za-z0-9_-]+$/.test(first) && !first.endsWith(".naver") ? first : "";
+}
+
+/** 모바일 목록 API 의 글 하나에서 누적 지표를 읽는다. 공감 → 좋아요. */
+export function naverBlogMetrics(item: Record<string, any>): Metrics {
+  const metrics: Metrics = {};
+  const num = (v: unknown) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN);
+  const likes = num(item.sympathyCnt);
+  const comments = num(item.commentCnt);
+  const shares = num(item.shareCnt);
+  if (Number.isFinite(likes)) metrics["좋아요"] = likes;
+  if (Number.isFinite(comments)) metrics["댓글"] = comments;
+  if (Number.isFinite(shares)) metrics["공유"] = shares;
+  return metrics;
+}
+
+export function naverBlogPostUrl(blogId: string, logNo: string | number): string {
+  return `https://blog.naver.com/${blogId}/${logNo}`;
+}
 
 /** 계정에서 가져온 게시물의 기록 이름. 글의 첫 줄(해시태그 줄 제외)을 40자로 자르고 채널을 붙인다. */
 export function importedPostTitle(text: string, channelLabel: string): string {
@@ -678,6 +722,7 @@ export function postHeadline(text: string): string {
 export function contentFormatFor(channel: MetricChannel, mediaType: string, link = ""): string {
   const type = mediaType.toUpperCase();
   if (channel === "youtube") return /\/shorts\//.test(link) ? "숏폼(9:16)" : "";
+  if (channel === "naver_blog") return "긴글";
   if (type === "REELS" || type === "VIDEO") return "숏폼(9:16)";
   if (type === "CAROUSEL_ALBUM") return "카드뉴스";
   if (type === "IMAGE") return "이미지";
