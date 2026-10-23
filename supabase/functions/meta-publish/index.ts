@@ -75,6 +75,7 @@ import {
   METRIC_CHANNEL_LABELS,
   METRIC_FIELDS,
   importedPostTitle,
+  publishedOnOrAfter,
   kstDate,
   metricChannelOf,
   metricDelta,
@@ -237,6 +238,9 @@ function buildConfig() {
     youtubeApiKey: optionalEnv("YOUTUBE_API_KEY"),
     // 유튜브 업로드 목록을 볼 채널. 비우면 게시물 DB 에 있는 영상의 채널을 쓴다.
     youtubeChannelId: optionalEnv("YOUTUBE_CHANNEL_ID"),
+    // 계정에서 찾은 게시물 중 이 날짜(한국 시간) 이후에 올린 것만 게시물 기록을 새로 만든다.
+    // 예전 게시물까지 한꺼번에 가져오면 노션에 수백 행이 생기기 때문이다. 비우면 날짜 제한 없음.
+    metricsImportSince: optionalEnv("METRICS_IMPORT_SINCE") || "2026-10-01",
   };
 }
 
@@ -1770,6 +1774,9 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
     for (const post of posts) {
       const key = `${post.channel}:${post.code}`;
       if (known.has(key)) continue;
+      if (!publishedOnOrAfter(post.publishedAt, cfg.metricsImportSince)) continue;
+      // 한 번에 많이 만들면 함수 시간 한도에 걸린다. 남은 것은 다음 실행이 이어서 만든다.
+      if (!dryRun && Date.now() - started > METRICS_TIME_BUDGET_MS / 2) break;
       known.add(key);
       const title = importedPostTitle(post.text, METRIC_CHANNEL_LABELS[post.channel]);
       if (dryRun) {
