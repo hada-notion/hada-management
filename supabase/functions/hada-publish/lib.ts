@@ -661,9 +661,28 @@ export const METRIC_CHANNEL_LABELS: Record<MetricChannel, string> = {
 
 /** 계정에서 가져온 게시물의 기록 이름. 글의 첫 줄(해시태그 줄 제외)을 40자로 자르고 채널을 붙인다. */
 export function importedPostTitle(text: string, channelLabel: string): string {
+  return `${postHeadline(text) || "제목 없는 게시물"} · ${channelLabel}`;
+}
+
+/** 게시물 글의 첫 줄(해시태그 줄 제외)을 40자까지. 산출물 이름으로도 쓴다. */
+export function postHeadline(text: string): string {
   const line = text.split("\n").map((part) => part.trim()).find((part) => part !== "" && !part.startsWith("#")) ?? "";
-  const head = [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
-  return `${head || "제목 없는 게시물"} · ${channelLabel}`;
+  return [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
+}
+
+/**
+ * 계정에서 가져온 게시물로 산출물을 만들 때 쓸 형식. API 의 미디어 종류로 고르고, 모르면 빈 문자열.
+ * 인스타그램은 media_product_type(REELS 등)·media_type, 스레드는 media_type(TEXT_POST 등)을 준다.
+ * 유튜브 업로드 목록은 Shorts 여부를 알려주지 않아 링크가 /shorts/ 일 때만 숏폼으로 본다.
+ */
+export function contentFormatFor(channel: MetricChannel, mediaType: string, link = ""): string {
+  const type = mediaType.toUpperCase();
+  if (channel === "youtube") return /\/shorts\//.test(link) ? "숏폼(9:16)" : "";
+  if (type === "REELS" || type === "VIDEO") return "숏폼(9:16)";
+  if (type === "CAROUSEL_ALBUM") return "카드뉴스";
+  if (type === "IMAGE") return "이미지";
+  if (channel === "threads" && type === "TEXT_POST") return "짧은글";
+  return "";
 }
 
 /** 게시 시각이 since(한국 시간 날짜 YYYY-MM-DD) 이후인가. since 가 비면 항상 참, 게시 시각을 모르면 거짓. */
@@ -749,6 +768,7 @@ export function metricsResultSummary(body: {
   targets?: unknown;
   created?: unknown;
   imported?: { count?: unknown };
+  contents?: { linked?: unknown; created?: unknown };
   results?: { status?: unknown }[];
   channelErrors?: Record<string, unknown>;
   failures?: unknown;
@@ -762,6 +782,9 @@ export function metricsResultSummary(body: {
   const lines = [`${kstDateTime(nowMs)} 수집 · ${scope}`, counts.join(" · ")];
   const imported = num(body.imported?.count);
   if (imported > 0) lines.push(`계정에서 새로 가져온 게시물 ${imported}건`);
+  const linked = num(body.contents?.linked);
+  const madeContents = num(body.contents?.created);
+  if (linked + madeContents > 0) lines.push(`산출물 연결 ${linked}건 · 새로 만든 산출물 ${madeContents}건`);
   const errors = metricsErrorSummary(body);
   if (errors !== "") lines.push(errors);
   return lines.join("\n");

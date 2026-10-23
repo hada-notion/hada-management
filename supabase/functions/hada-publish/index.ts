@@ -79,6 +79,8 @@ import {
   METRIC_CHANNEL_LABELS,
   METRIC_FIELDS,
   importedPostTitle,
+  contentFormatFor,
+  postHeadline,
   metricChannelByLabel,
   metricsErrorSummary,
   metricsResultSummary,
@@ -1942,35 +1944,131 @@ async function createMetricLog(cfg: Config, target: PostTarget, delta: Metrics, 
 }
 
 /** 게시물 DB 에서 게시 링크가 있는 기록을 읽는다. 내린 기록은 수집하지 않지만, 다시 만들지 않도록 알고는 있는다. */
-async function findMetricTargets(cfg: Config): Promise<{ targets: PostTarget[]; known: Set<string> }> {
+type MetricTargets = {
+  targets: PostTarget[];
+  known: Set<string>;
+  // 산출물이 연결된 게시물: 채널:코드 → 산출물 id. 같은 게시물의 다른 기록을 이 산출물에 붙인다.
+  contentByKey: Map<string, string>;
+  // 산출물이 비어 있는 게시물 기록(내림 제외). 같은 게시물 기록이 둘 이상일 수 있다.
+  unlinked: Map<string, { id: string; title: string }[]>;
+};
+
+async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
   const rows = await queryAll(cfg, cfg.postDataSourceId, {
     property: "게시 링크",
     url: { is_not_empty: true },
   });
   const targets: PostTarget[] = [];
   const known = new Set<string>();
+  const contentByKey = new Map<string, string>();
+  const unlinked = new Map<string, { id: string; title: string }[]>();
   for (const row of rows) {
     const props = (row.properties ?? {}) as Json;
     const link = String(props["게시 링크"]?.url ?? "").trim();
     const channel = metricChannelOf(link);
     const code = postCodeOf(link);
     if (channel === null || code === "") continue;
-    known.add(`${channel}:${code}`);
+    const key = `${channel}:${code}`;
+    known.add(key);
+    const contentId = relationIds(props["산출물"])[0];
+    if (contentId) contentByKey.set(key, contentId);
     if (selectName(props["게시 상태"]) === "내림") continue;
+    if (!contentId) unlinked.set(key, [...(unlinked.get(key) ?? []), { id: row.id, title: pageTitle(props) }]);
     const publishedAt = String(props["게시일"]?.date?.start ?? "");
     targets.push({ id: row.id, title: pageTitle(props), link, channel, code, publishedAt });
   }
-  return { targets, known };
+  return { targets, known, contentByKey, unlinked };
+}
+
+/** 산출물 DB 의 인스타그램 링크·스레드 링크로 채널:코드 → 산출물 id 를 더한다(게시물 DB 에서 이미 찾은 것은 그대로). */
+async function loadContentLinks(cfg: Config, contentByKey: Map<string, string>): Promise<void> {
+  const rows = await queryAll(cfg, cfg.contentDataSourceId, {
+    or: [
+      { property: "인스타그램 링크", url: { is_not_empty: true } },
+      { property: "스레드 링크", url: { is_not_empty: true } },
+    ],
+  });
+  for (const row of rows) {
+    const props = (row.properties ?? {}) as Json;
+    for (const name of ["인스타그램 링크", "스레드 링크"]) {
+      const link = String(props[name]?.url ?? "").trim();
+      const channel = metricChannelOf(link);
+      const code = postCodeOf(link);
+      if (channel === null || code === "") continue;
+      const key = `${channel}:${code}`;
+      if (!contentByKey.has(key)) contentByKey.set(key, row.id);
+    }
+  }
+}
+
+/**
+ * 산출물이 없는 게시물로 산출물을 만든다. 이미 올라간 글이므로 상태는 게시, 그 채널 상태는 ✅ 완료로 둬서
+ * 누가 배포 버튼을 눌러도 다시 올리지 않게 한다. 캡션에는 게시물 글을 그대로 담는다.
+ */
+async function createContentForPost(cfg: Config, post: AccountPost): Promise<string> {
+  const label = METRIC_CHANNEL_LABELS[post.channel];
+  const format = contentFormatFor(post.channel, post.mediaType, post.link);
+  const channelLink: Json = post.channel === "instagram"
+    ? { "인스타그램 링크": { url: post.link }, "인스타그램 상태": { select: { name: "✅ 완료" } } }
+    : post.channel === "threads"
+    ? { "스레드 링크": { url: post.link }, "스레드 상태": { select: { name: "✅ 완료" } } }
+    : {};
+  const page = await notion(cfg, "/pages", {
+    method: "POST",
+    headers: { "Notion-Version": POST_API_VERSION },
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: cfg.contentDataSourceId },
+      properties: {
+        "이름": { title: [{ type: "text", text: { content: postHeadline(post.text) || `${label} 게시물` } }] },
+        "유형": { select: { name: "컨텐츠" } },
+        "상태": { select: { name: "게시" } },
+        ...(format ? { "형식": { select: { name: format } } } : {}),
+        "배포 채널": { multi_select: [{ name: label }] },
+        ...(post.text.trim() ? { "캡션": { rich_text: [{ type: "text", text: { content: truncate(post.text, 2000) } }] } } : {}),
+        ...(post.publishedAt ? { "발행 시각": { date: { start: post.publishedAt } } } : {}),
+        ...channelLink,
+      },
+    }),
+  });
+  return page.id;
+}
+
+const MEMO_CONTENT_LINKED = "성과 수집이 같은 링크의 산출물을 찾아 자동으로 연결함.";
+const MEMO_CONTENT_CREATED = "성과 수집이 산출물이 없어 게시물 글로 산출물을 자동으로 만들어 연결함.";
+
+async function linkPostToContent(cfg: Config, postId: string, contentId: string, created: boolean): Promise<void> {
+  await notion(cfg, `/pages/${postId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      properties: {
+        "산출물": { relation: [{ id: contentId }] },
+        "메모": { rich_text: [{ type: "text", text: { content: created ? MEMO_CONTENT_CREATED : MEMO_CONTENT_LINKED } }] },
+      },
+    }),
+  });
 }
 
 /** 계정에서 찾은 게시물 하나. 게시물 DB 에 없으면 이걸로 새 기록을 만든다. */
-type AccountPost = { channel: MetricChannel; code: string; link: string; text: string; publishedAt: string };
+type AccountPost = {
+  channel: MetricChannel;
+  code: string;
+  link: string;
+  text: string;
+  publishedAt: string;
+  // API 의 미디어 종류(REELS·CAROUSEL_ALBUM·TEXT_POST 등). 산출물 형식을 고를 때 쓴다.
+  mediaType: string;
+};
 
 /**
  * 계정에는 있는데 게시물 DB 에 없는 게시물(직접 올린 것 등)의 게시물 기록을 만든다.
- * 산출물은 연결하지 않는다(어느 산출물인지 알 수 없다). 메모로 자동 생성임을 남긴다.
+ * content 가 있으면 그 산출물을 연결한다. 메모로 자동 생성임을 남긴다.
  */
-async function importPost(cfg: Config, post: AccountPost, channelIds: Map<MetricChannel, string>): Promise<PostTarget> {
+async function importPost(
+  cfg: Config,
+  post: AccountPost,
+  channelIds: Map<MetricChannel, string>,
+  content?: { id: string; created: boolean },
+): Promise<PostTarget> {
   const label = METRIC_CHANNEL_LABELS[post.channel];
   let channelId = channelIds.get(post.channel);
   if (channelId === undefined) {
@@ -1989,8 +2087,16 @@ async function importPost(cfg: Config, post: AccountPost, channelIds: Map<Metric
         "게시 링크": { url: post.link },
         "게시 상태": { select: { name: "게시" } },
         ...(post.publishedAt ? { "게시일": { date: { start: post.publishedAt } } } : {}),
+        ...(content ? { "산출물": { relation: [{ id: content.id }] } } : {}),
         "메모": {
-          rich_text: [{ type: "text", text: { content: "성과 수집이 계정에서 찾아 자동으로 만든 기록. 산출물은 직접 연결하세요." } }],
+          rich_text: [{
+            type: "text",
+            text: {
+              content: content
+                ? `성과 수집이 계정에서 찾아 자동으로 만든 기록. ${content.created ? MEMO_CONTENT_CREATED : MEMO_CONTENT_LINKED}`
+                : "성과 수집이 계정에서 찾아 자동으로 만든 기록. 산출물은 직접 연결하세요.",
+            },
+          }],
         },
       },
     }),
@@ -2035,6 +2141,7 @@ async function youtubeUploads(cfg: Config, knownIds: string[]): Promise<AccountP
           link: `https://www.youtube.com/watch?v=${videoId}`,
           text: String(item.snippet?.title ?? ""),
           publishedAt: String(item.snippet?.publishedAt ?? ""),
+          mediaType: "",
         });
       }
       pageToken = String(list.nextPageToken ?? "");
@@ -2068,24 +2175,68 @@ async function runMetrics(
   const results: CollectResult[] = [];
   const channelIds = new Map<MetricChannel, string>();
   const imported: string[] = [];
+  const contents = { linked: [] as MetricChannel[], created: [] as MetricChannel[], errors: [] as string[] };
+  let contentLinksLoaded = false;
+
+  // 게시물에 붙일 산출물: 같은 링크의 산출물이 있으면 그것, 없으면 새로 만든다(dryRun 이면 만들지 않는다).
+  const resolveContent = async (post: AccountPost): Promise<{ id: string; created: boolean }> => {
+    const key = `${post.channel}:${post.code}`;
+    if (!contentLinksLoaded) {
+      await loadContentLinks(cfg, found.contentByKey);
+      contentLinksLoaded = true;
+    }
+    const existing = found.contentByKey.get(key);
+    if (existing) return { id: existing, created: false };
+    const id = dryRun ? "" : await createContentForPost(cfg, post);
+    if (id) found.contentByKey.set(key, id);
+    return { id, created: true };
+  };
 
   // 계정에서 찾은 게시물 중 게시물 DB 에 없는 것은 기록을 새로 만들어 대상에 더한다.
   // dryRun 이면 만들지 않고 만들 목록만 돌려준다.
   const addMissing = async (posts: AccountPost[]) => {
     for (const post of posts) {
       const key = `${post.channel}:${post.code}`;
-      if (known.has(key)) continue;
-      if (!publishedOnOrAfter(post.publishedAt, cfg.metricsImportSince)) continue;
       // 한 번에 많이 만들면 함수 시간 한도에 걸린다. 남은 것은 다음 실행이 이어서 만든다.
       if (!dryRun && Date.now() - started > METRICS_TIME_BUDGET_MS / 2) break;
+      if (known.has(key)) {
+        // 이미 있는 게시물 기록 중 산출물이 빈 것은 산출물을 찾아 붙이거나 새로 만든다.
+        const rows = found.unlinked.get(key);
+        if (!rows) continue;
+        found.unlinked.delete(key);
+        try {
+          const content = await resolveContent(post);
+          if (!dryRun) for (const row of rows) await linkPostToContent(cfg, row.id, content.id, content.created);
+          (content.created ? contents.created : contents.linked).push(post.channel);
+        } catch (e) {
+          console.warn("산출물 연결 실패", rows[0].title, message(e));
+          contents.errors.push(`${rows[0].title}: ${message(e)}`);
+        }
+        continue;
+      }
+      if (!publishedOnOrAfter(post.publishedAt, cfg.metricsImportSince)) continue;
       known.add(key);
       const title = importedPostTitle(post.text, METRIC_CHANNEL_LABELS[post.channel]);
       if (dryRun) {
         imported.push(title);
+        try {
+          const content = await resolveContent(post);
+          (content.created ? contents.created : contents.linked).push(post.channel);
+        } catch (e) {
+          contents.errors.push(`${title}: ${message(e)}`);
+        }
         continue;
       }
+      let content: { id: string; created: boolean } | undefined;
       try {
-        targets.push(await importPost(cfg, post, channelIds));
+        content = await resolveContent(post);
+        (content.created ? contents.created : contents.linked).push(post.channel);
+      } catch (e) {
+        console.warn("산출물 연결 실패", title, message(e));
+        contents.errors.push(`${title}: ${message(e)}`);
+      }
+      try {
+        targets.push(await importPost(cfg, post, channelIds, content));
         imported.push(title);
       } catch (e) {
         results.push({ post: title, channel: post.channel, status: "실패", error: `게시물 기록 생성 실패: ${message(e)}` });
@@ -2102,7 +2253,7 @@ async function runMetrics(
       const media = await listByShortcode((after) =>
         igGet(
           cfg,
-          `${cfg.igUserId}/media?fields=id,shortcode,permalink,caption,timestamp,like_count,comments_count&limit=100${
+          `${cfg.igUserId}/media?fields=id,shortcode,permalink,caption,timestamp,media_type,media_product_type,like_count,comments_count&limit=100${
             after ? `&after=${after}` : ""
           }`,
         )
@@ -2113,6 +2264,7 @@ async function runMetrics(
         link: String(item.permalink ?? `https://www.instagram.com/p/${code}/`),
         text: String(item.caption ?? ""),
         publishedAt: String(item.timestamp ?? ""),
+        mediaType: String(item.media_product_type === "REELS" ? "REELS" : item.media_type ?? ""),
       })));
       for (const target of targets.filter((t) => t.channel === "instagram")) {
         const item = media.get(target.code);
@@ -2142,6 +2294,7 @@ async function runMetrics(
       link: String(item.permalink ?? ""),
       text: String(item.text ?? ""),
       publishedAt: String(item.timestamp ?? ""),
+      mediaType: String(item.media_type ?? ""),
     })));
     for (const target of targets.filter((t) => t.channel === "threads")) {
       const item = media.get(target.code);
@@ -2219,6 +2372,13 @@ async function runMetrics(
     targets: targets.length,
     created,
     imported: { count: imported.length, titles: imported },
+    contents: {
+      linked: contents.linked.length,
+      created: contents.created.length,
+      linkedChannels: contents.linked,
+      createdChannels: contents.created,
+      errors: contents.errors,
+    },
     failures,
     channelErrors: Object.fromEntries(channelError),
     results,
@@ -2257,10 +2417,15 @@ function bodyForChannel(body: Json, channel: MetricChannel | null): Json {
   const errors = Object.entries((body.channelErrors ?? {}) as Json).filter(([c]) => c === channel);
   const label = METRIC_CHANNEL_LABELS[channel];
   const titles = (((body.imported ?? {}) as Json).titles ?? []) as string[];
+  const contentsOf = (body.contents ?? {}) as Json;
   return {
     targets: results.filter((r) => r.status !== "실패" || !String(r.error ?? "").startsWith("게시물 기록 생성 실패")).length,
     created: results.filter((r) => r.status === "기록").length,
     imported: { count: titles.filter((t) => t.endsWith(` · ${label}`)).length },
+    contents: {
+      linked: ((contentsOf.linkedChannels ?? []) as string[]).filter((c) => c === channel).length,
+      created: ((contentsOf.createdChannels ?? []) as string[]).filter((c) => c === channel).length,
+    },
     results,
     channelErrors: Object.fromEntries(errors),
     failures: results.filter((r) => r.status === "실패").length,

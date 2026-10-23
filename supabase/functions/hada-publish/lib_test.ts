@@ -4,6 +4,7 @@ import {
   assertCarouselSize,
   buildCaption,
   captionLimitError,
+  contentFormatFor,
   cleanToken,
   contentTypeFor,
   detectImageType,
@@ -37,6 +38,7 @@ import {
   metricChannelByLabel,
   metricsErrorSummary,
   metricsResultSummary,
+  postHeadline,
   kstDateTime,
   applyMetricScope,
   autoCollectDue,
@@ -592,6 +594,31 @@ Deno.test("metricsResultSummary: 시각·건수·오류를 줄마다 적는다",
     metricsResultSummary({ targets: 0, created: 0, channelErrors: { youtube: "키 없음" } }, now, "전체"),
     "2026-10-23 11:52 수집 · 전체\n게시물 0건 확인 · 새 기록 0건 · 변화 없음 0건\n유튜브 — 키 없음",
   );
+});
+
+Deno.test("metricsResultSummary: 산출물 연결·생성 건수를 적는다", () => {
+  const now = Date.parse("2026-10-23T02:52:00Z");
+  assertEquals(
+    metricsResultSummary({ targets: 2, created: 0, contents: { linked: 1, created: 3 } }, now, "스레드"),
+    "2026-10-23 11:52 수집 · 스레드\n게시물 2건 확인 · 새 기록 0건 · 변화 없음 0건\n산출물 연결 1건 · 새로 만든 산출물 3건",
+  );
+});
+
+Deno.test("postHeadline: 해시태그 줄을 건너뛴 첫 줄 40자", () => {
+  assertEquals(postHeadline("#노션\n\n  수업 끝나고 노션에 오늘 한 걸 적어요.\n둘째 줄"), "수업 끝나고 노션에 오늘 한 걸 적어요.");
+  assertEquals(postHeadline(""), "");
+  assertEquals(postHeadline("가".repeat(45)), `${"가".repeat(40)}…`);
+});
+
+Deno.test("contentFormatFor: 미디어 종류로 산출물 형식을 고른다", () => {
+  assertEquals(contentFormatFor("instagram", "REELS"), "숏폼(9:16)");
+  assertEquals(contentFormatFor("instagram", "CAROUSEL_ALBUM"), "카드뉴스");
+  assertEquals(contentFormatFor("instagram", "IMAGE"), "이미지");
+  assertEquals(contentFormatFor("threads", "TEXT_POST"), "짧은글");
+  assertEquals(contentFormatFor("threads", "VIDEO"), "숏폼(9:16)");
+  assertEquals(contentFormatFor("threads", ""), "");
+  assertEquals(contentFormatFor("youtube", "", "https://youtube.com/shorts/abc"), "숏폼(9:16)");
+  assertEquals(contentFormatFor("youtube", "", "https://www.youtube.com/watch?v=abc"), "");
 });
 
 Deno.test("applyMetricScope: 기간과 최근 개수로 갱신 대상을 줄인다", () => {
