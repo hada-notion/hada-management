@@ -1,10 +1,11 @@
 name: Collect Post Metrics
 
-# 매일 한국 시간 새벽 4시에 인스타그램·스레드·유튜브 성과를 모아 노션 성과 로그에 쌓는다.
-# 매일 함수를 부르므로 Supabase 무료 플랜이 쉬다가 일시정지되는 것도 막는다.
+# 매시 함수를 불러, 노션 채널 DB 의 '자동 수집 시각'(한국 시간, 0~23시)이 된 채널의 성과를 모은다.
+# 시각이 안 된 시간엔 채널 설정만 읽고 바로 끝난다. 손으로 돌리면(Run workflow) 시각과 상관없이 전체를 모은다.
+# 자주 함수를 부르므로 Supabase 무료 플랜이 쉬다가 일시정지되는 것도 막는다.
 on:
   schedule:
-    - cron: '0 19 * * *'
+    - cron: '5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -21,6 +22,7 @@ jobs:
           SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          SCHEDULED: ${{ github.event_name == 'schedule' && '1' || '0' }}
         run: |
           set -e
           if [ -z "$ADMIN_SECRET" ]; then
@@ -28,7 +30,7 @@ jobs:
             exit 1
           fi
           STATUS=$(curl -sS -o result.json -w '%{http_code}' --max-time 170 -X POST \
-            "https://${SUPABASE_PROJECT_ID}.supabase.co/functions/v1/hada-publish?metrics=1&wait=1&dryRun=${DRY_RUN}" \
+            "https://${SUPABASE_PROJECT_ID}.supabase.co/functions/v1/hada-publish?metrics=1&wait=1&scheduled=${SCHEDULED}&dryRun=${DRY_RUN}" \
             -H "x-admin-key: ${ADMIN_SECRET}" \
             -H "Content-Type: application/json" \
             -d '{}')

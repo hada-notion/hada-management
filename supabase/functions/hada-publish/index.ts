@@ -81,6 +81,8 @@ import {
   metricChannelByLabel,
   metricsErrorSummary,
   metricsResultSummary,
+  applyMetricScope,
+  autoCollectDue,
   kstDateTime,
   publishedOnOrAfter,
   kstDate,
@@ -99,7 +101,7 @@ import {
   YOUTUBE_OAUTH_STATE,
   YOUTUBE_SCOPES,
 } from "./lib.ts";
-import type { MediaKind, MetricChannel, Metrics } from "./lib.ts";
+import type { MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
@@ -1794,7 +1796,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 const METRICS_TIME_BUDGET_MS = 110000;
 const MEDIA_LIST_PAGES = 5;
 
-type PostTarget = { id: string; title: string; link: string; channel: MetricChannel; code: string };
+type PostTarget = { id: string; title: string; link: string; channel: MetricChannel; code: string; publishedAt: string };
 type CollectResult = { post: string; channel: MetricChannel; status: string; delta?: Metrics; error?: string };
 
 async function queryAll(cfg: Config, dataSourceId: string, filter?: Json): Promise<Json[]> {
@@ -1931,7 +1933,8 @@ async function findMetricTargets(cfg: Config): Promise<{ targets: PostTarget[]; 
     if (channel === null || code === "") continue;
     known.add(`${channel}:${code}`);
     if (selectName(props["게시 상태"]) === "내림") continue;
-    targets.push({ id: row.id, title: pageTitle(props), link, channel, code });
+    const publishedAt = String(props["게시일"]?.date?.start ?? "");
+    targets.push({ id: row.id, title: pageTitle(props), link, channel, code, publishedAt });
   }
   return { targets, known };
 }
@@ -1968,7 +1971,7 @@ async function importPost(cfg: Config, post: AccountPost, channelIds: Map<Metric
       },
     }),
   });
-  return { id: page.id, title, link: post.link, channel: post.channel, code: post.code };
+  return { id: page.id, title, link: post.link, channel: post.channel, code: post.code, publishedAt: post.publishedAt };
 }
 
 /** 유튜브 채널 업로드 목록. 채널은 게시물 DB 에 이미 있는 영상에서 알아낸다(YOUTUBE_CHANNEL_ID 가 있으면 그것도). */
@@ -2018,12 +2021,24 @@ async function youtubeUploads(cfg: Config, knownIds: string[]): Promise<AccountP
 }
 
 /** only 가 있으면 그 채널만 수집한다(채널 DB 의 버튼). 없으면 전체. */
-async function runMetrics(cfg: Config, dryRun: boolean, only: MetricChannel | null = null): Promise<Json> {
+async function runMetrics(
+  cfg: Config,
+  dryRun: boolean,
+  channels: MetricChannel[] | null = null,
+  scopes: Map<MetricChannel, MetricScope> = new Map(),
+): Promise<Json> {
   const started = Date.now();
   const date = kstDate(started);
-  const wants = (channel: MetricChannel) => only === null || only === channel;
+  const wants = (channel: MetricChannel) => channels === null || channels.includes(channel);
   const found = await findMetricTargets(cfg);
-  const targets = found.targets.filter((t) => wants(t.channel));
+  // 채널 DB 의 '갱신 기간(일)'·'갱신 개수'로 채널마다 갱신할 게시물을 줄인다.
+  const targets = (Object.keys(METRIC_CHANNEL_LABELS) as MetricChannel[])
+    .filter(wants)
+    .flatMap((channel) => {
+      const mine = found.targets.filter((t) => t.channel === channel);
+      const scope = scopes.get(channel);
+      return scope ? applyMetricScope(mine, scope, started) : mine;
+    });
   const known = found.known;
   const logged = await loggedTotals(cfg);
   const results: CollectResult[] = [];
@@ -2186,41 +2201,132 @@ async function runMetrics(cfg: Config, dryRun: boolean, only: MetricChannel | nu
   };
 }
 
-// 채널 DB 버튼으로 부른 수집은 그 채널 페이지에 진행 상태를 남긴다.
+/** 채널 DB 한 행의 수집 설정. */
+type ChannelSetting = { pageId: string; hour: number | null; scope: MetricScope; lastCollected: string };
+
+function numberProp(props: Json, name: string): number | null {
+  const value = props[name]?.number;
+  return typeof value === "number" ? value : null;
+}
+
+/** 채널 DB 에서 인스타그램·스레드·유튜브 행의 수집 설정을 읽는다. */
+async function loadChannelSettings(cfg: Config): Promise<Map<MetricChannel, ChannelSetting>> {
+  const settings = new Map<MetricChannel, ChannelSetting>();
+  for (const row of await queryAll(cfg, cfg.channelDataSourceId)) {
+    const props = (row.properties ?? {}) as Json;
+    const channel = metricChannelByLabel(pageTitle(props));
+    if (channel === null || settings.has(channel)) continue;
+    settings.set(channel, {
+      pageId: row.id as string,
+      hour: numberProp(props, "자동 수집 시각"),
+      scope: { days: numberProp(props, "갱신 기간(일)"), latest: numberProp(props, "갱신 개수") },
+      lastCollected: String(props["마지막 수집"]?.date?.start ?? ""),
+    });
+  }
+  return settings;
+}
+
+/** 전체 수집 결과에서 한 채널 몫만 떼어 낸다. 채널 페이지마다 자기 결과를 남기기 위해서다. */
+function bodyForChannel(body: Json, channel: MetricChannel | null): Json {
+  if (channel === null) return body;
+  const results = ((body.results ?? []) as Json[]).filter((r) => r.channel === channel);
+  const errors = Object.entries((body.channelErrors ?? {}) as Json).filter(([c]) => c === channel);
+  const label = METRIC_CHANNEL_LABELS[channel];
+  const titles = (((body.imported ?? {}) as Json).titles ?? []) as string[];
+  return {
+    targets: results.filter((r) => r.status !== "실패" || !String(r.error ?? "").startsWith("게시물 기록 생성 실패")).length,
+    created: results.filter((r) => r.status === "기록").length,
+    imported: { count: titles.filter((t) => t.endsWith(` · ${label}`)).length },
+    results,
+    channelErrors: Object.fromEntries(errors),
+    failures: results.filter((r) => r.status === "실패").length,
+  };
+}
+
+// 채널 DB 버튼이나 예약 실행으로 부른 수집은 그 채널 페이지에 진행 상태를 남긴다.
 // 버튼이 '수집 상태'를 ⚪ 대기로 바꾸고 웹훅을 보내면, 여기서 🔄 작업중 → ✅ 완료 / ⚠️ 오류로 바꾸고
-// '처리 결과'에 시각·건수·오류를 남긴다.
+// '처리 결과'에 시각·건수·오류를 남긴다. 여러 채널을 한 번에 돌리면 페이지마다 자기 채널 몫을 적는다.
 // 상태 칸이 없는 페이지여도 수집은 그대로 한다(상태 기록 실패는 로그만 남긴다).
-async function runMetricsWithStatus(cfg: Config, pageId: string, only: MetricChannel | null): Promise<Json> {
-  const mark = async (properties: Json) => {
+async function runMetricsWithStatus(
+  cfg: Config,
+  pages: { pageId: string; channel: MetricChannel | null }[],
+  channels: MetricChannel[] | null,
+  scopes: Map<MetricChannel, MetricScope>,
+): Promise<Json> {
+  const mark = async (pageId: string, properties: Json) => {
     try {
       await updatePage(cfg, pageId, properties);
     } catch (e) {
       console.error("수집 상태 기록 실패", pageId, message(e));
     }
   };
-  await mark({
-    "수집 상태": { select: { name: STATUS_WORKING } },
-    "처리 시작 시각": { date: { start: new Date().toISOString() } },
-  });
-  try {
-    const body = await runMetrics(cfg, false, only);
-    const failed = metricsErrorSummary(body) !== "";
-    const scope = only === null ? "전체" : METRIC_CHANNEL_LABELS[only];
-    const summary = maskSecrets(metricsResultSummary(body, Date.now(), scope), secretsOf(cfg));
-    await mark({
-      "수집 상태": { select: { name: failed ? STATUS_ERROR : STATUS_DONE } },
-      "처리 결과": { rich_text: [{ type: "text", text: { content: truncate(summary, 1800) } }] },
-      "마지막 수집": { date: { start: new Date().toISOString() } },
+  for (const page of pages) {
+    await mark(page.pageId, {
+      "수집 상태": { select: { name: STATUS_WORKING } },
+      "처리 시작 시각": { date: { start: new Date().toISOString() } },
     });
+  }
+  try {
+    const body = await runMetrics(cfg, false, channels, scopes);
+    for (const page of pages) {
+      const mine = bodyForChannel(body, page.channel);
+      const failed = metricsErrorSummary(mine) !== "";
+      const label = page.channel === null ? "전체" : METRIC_CHANNEL_LABELS[page.channel];
+      const summary = maskSecrets(metricsResultSummary(mine, Date.now(), label), secretsOf(cfg));
+      await mark(page.pageId, {
+        "수집 상태": { select: { name: failed ? STATUS_ERROR : STATUS_DONE } },
+        "처리 결과": { rich_text: [{ type: "text", text: { content: truncate(summary, 1800) } }] },
+        "마지막 수집": { date: { start: new Date().toISOString() } },
+      });
+    }
     return body;
   } catch (e) {
     const detail = truncate(`${kstDateTime(Date.now())} 수집 실패\n${maskSecrets(message(e), secretsOf(cfg))}`, 1800);
-    await mark({
-      "수집 상태": { select: { name: STATUS_ERROR } },
-      "처리 결과": { rich_text: [{ type: "text", text: { content: detail } }] },
-    });
+    for (const page of pages) {
+      await mark(page.pageId, {
+        "수집 상태": { select: { name: STATUS_ERROR } },
+        "처리 결과": { rich_text: [{ type: "text", text: { content: detail } }] },
+      });
+    }
     throw e;
   }
+}
+
+/**
+ * 성과 수집 요청을 실행할 작업으로 바꾼다.
+ * - scheduled: 매시 예약 실행. 채널 DB '자동 수집 시각'이 된 채널만 돌린다. 없으면 null.
+ * - 채널 페이지 버튼: 그 채널만(블로그 등 다른 행이면 전체) 돌리고 그 페이지에 상태를 남긴다.
+ * - 그 밖(손으로 부른 실행): 전체를 돌린다.
+ * 어느 경우든 채널 DB 의 갱신 범위를 적용한다.
+ */
+async function planMetrics(cfg: Config, data: Json, scheduled: boolean, dryRun: boolean): Promise<(() => Promise<Json>) | null> {
+  let settings = new Map<MetricChannel, ChannelSetting>();
+  try {
+    settings = await loadChannelSettings(cfg);
+  } catch (e) {
+    // 설정을 못 읽어도 수집은 한다(범위 제한 없이). 예약 실행만은 시각을 알 수 없어 건너뛴다.
+    console.error("채널 설정 읽기 실패", message(e));
+    if (scheduled) throw e;
+  }
+  const scopes = new Map([...settings].map(([channel, s]) => [channel, s.scope] as const));
+
+  if (scheduled) {
+    const now = Date.now();
+    const due = [...settings].filter(([, s]) => autoCollectDue(s.hour, s.lastCollected, now));
+    console.log("예약 수집 대상", due.map(([c]) => c).join(",") || "(없음)");
+    if (due.length === 0) return null;
+    const channels = due.map(([channel]) => channel);
+    if (dryRun) return () => runMetrics(cfg, true, channels, scopes);
+    return () => runMetricsWithStatus(cfg, due.map(([channel, s]) => ({ pageId: s.pageId, channel })), channels, scopes);
+  }
+
+  // 채널 DB 의 버튼으로 부르면 웹훅 본문에 그 채널 페이지가 실려 온다. 그 채널만 수집한다.
+  const isPage = data.object === "page" && typeof data.id === "string";
+  const only = isPage ? metricChannelByLabel(pageTitle((data.properties ?? {}) as Json)) : null;
+  const channels = only === null ? null : [only];
+  console.log("성과 수집 채널", only ?? "(전체)");
+  if (!isPage || dryRun) return () => runMetrics(cfg, dryRun, channels, scopes);
+  return () => runMetricsWithStatus(cfg, [{ pageId: data.id as string, channel: only }], channels, scopes);
 }
 
 async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string): Promise<string> {
@@ -2303,14 +2409,18 @@ Deno.serve(async (req) => {
   // 성과 수집. GitHub Actions 는 ?wait=1 로 결과를 기다리고,
   // 노션 버튼은 10초 안에 답을 받아야 하므로 접수(202)만 돌려주고 뒤에서 수집한다.
   if (reqUrl.searchParams.get("metrics") === "1") {
-    // 채널 DB 의 버튼으로 부르면 웹훅 본문에 그 채널 페이지가 실려 온다. 그 채널만 수집한다.
     const data = (payload.data ?? {}) as Json;
-    const only = data.object === "page" ? metricChannelByLabel(pageTitle((data.properties ?? {}) as Json)) : null;
-    console.log("성과 수집 채널", only ?? "(전체)");
-    const statusPage = data.object === "page" && typeof data.id === "string" && !dryRun ? data.id as string : "";
-    const metricsTask = statusPage === ""
-      ? runMetrics(cfg, dryRun, only)
-      : runMetricsWithStatus(cfg, statusPage, only);
+    const scheduled = reqUrl.searchParams.get("scheduled") === "1";
+    let plan: (() => Promise<Json>) | null;
+    try {
+      plan = await planMetrics(cfg, data, scheduled, dryRun);
+    } catch (e) {
+      return json({ ok: false, error: message(e) }, 500);
+    }
+    if (plan === null) {
+      return json({ ok: true, skipped: true, message: "자동 수집 시각이 된 채널이 없습니다." });
+    }
+    const metricsTask = plan();
     const runtime = (globalThis as {
       EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
     }).EdgeRuntime;

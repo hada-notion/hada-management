@@ -701,6 +701,41 @@ export function metricsErrorSummary(body: {
   return lines.join("\n");
 }
 
+/** 한 번 수집할 때 갱신할 게시물 범위. null 이면 제한 없음. */
+export type MetricScope = { days: number | null; latest: number | null };
+
+/**
+ * 갱신 범위를 적용한다. days 는 게시일이 오늘부터 며칠 안인 게시물만, latest 는 게시일 최신순 N개만 남긴다.
+ * 둘 다 있으면 둘 다 적용한다. 범위를 걸면 게시일이 없는 게시물은 오래된 것으로 보고 뺀다.
+ */
+export function applyMetricScope<T extends { publishedAt: string }>(items: T[], scope: MetricScope, nowMs: number): T[] {
+  const time = (item: T) => {
+    const t = Date.parse(item.publishedAt);
+    return Number.isNaN(t) ? -Infinity : t;
+  };
+  let kept = items;
+  if (scope.days !== null && scope.days > 0) {
+    const since = nowMs - scope.days * 24 * 60 * 60 * 1000;
+    kept = kept.filter((item) => time(item) >= since);
+  }
+  if (scope.latest !== null && scope.latest > 0) {
+    kept = [...kept].filter((item) => time(item) !== -Infinity).sort((a, b) => time(b) - time(a)).slice(0, scope.latest);
+  }
+  return kept;
+}
+
+/**
+ * 자동 수집 시각이 됐는지. 매시 부르는 예약 실행이 쓴다.
+ * 한국 시간으로 그 시각이 지났고 오늘 아직 수집하지 않았으면 true(한 번 놓쳐도 다음 시간에 따라잡는다).
+ */
+export function autoCollectDue(hour: number | null, lastCollected: string, nowMs: number): boolean {
+  if (hour === null || hour < 0 || hour > 23) return false;
+  const kstHour = new Date(nowMs + 9 * 60 * 60 * 1000).getUTCHours();
+  if (kstHour < hour) return false;
+  const last = Date.parse(lastCollected);
+  return Number.isNaN(last) || kstDate(last) !== kstDate(nowMs);
+}
+
 /** 한국 시간 "YYYY-MM-DD HH:mm". */
 export function kstDateTime(nowMs: number): string {
   return new Date(nowMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 16).replace("T", " ");
