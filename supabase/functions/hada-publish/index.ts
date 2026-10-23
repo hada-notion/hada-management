@@ -2417,7 +2417,14 @@ Deno.serve(async (req) => {
     return await handleThreadsCallback(reqUrl, cfg);
   }
 
-  if (req.headers.get("x-admin-key") !== cfg.adminSecret) {
+  // Supabase pg_cron 의 매시 호출은 x-cron-key 로 들어온다. 값은 meta_tokens 표(channel = cron)에만 있고,
+  // 예약 성과 수집(?metrics=1&scheduled=1)에만 통한다.
+  const cronKey = req.headers.get("x-cron-key") ?? "";
+  const cronOk = cronKey !== "" &&
+    reqUrl.searchParams.get("metrics") === "1" &&
+    reqUrl.searchParams.get("scheduled") === "1" &&
+    (await readToken(cfg, "cron").catch(() => null))?.access_token === cronKey;
+  if (!cronOk && req.headers.get("x-admin-key") !== cfg.adminSecret) {
     return json({ ok: false, error: "인증에 실패했습니다. x-admin-key 헤더를 확인하세요." }, 401);
   }
 
