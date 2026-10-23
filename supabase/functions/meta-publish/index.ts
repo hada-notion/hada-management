@@ -17,7 +17,8 @@
 //   그 페이지만 처리한다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
 //   지정이 없으면 상태가 ⚪ 대기인 채널과 '배포 채널'에 고른 채널을 처리한다.
 //   배포 채널 중 인스타그램·스레드는 발행하고(이미 ✅ 완료면 건너뜀),
-//   블로그·유튜브 같은 나머지 채널은 게시물 DB 에 채널을 연결한 기록만 만든다.
+//   유튜브는 연결 설정(YOUTUBE_CLIENT_ID)이 있고 영상 형식이면 업로드한다(세로 영상은 Shorts).
+//   블로그 같은 나머지 채널은 게시물 DB 에 채널을 연결한 기록만 만든다.
 //   페이지를 찾지 못하면 큐 조회로 넘어간다.
 //
 // 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
@@ -30,6 +31,8 @@
 //
 // 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
 // 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
+// 유튜브 인증 안내: GET /functions/v1/meta-publish?youtube_auth=1
+// 유튜브 인증 콜백: GET /functions/v1/meta-publish?code=...&state=youtube  (구글이 돌려보내는 주소)
 //
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
 
@@ -81,6 +84,16 @@ import {
   metricDelta,
   postCodeOf,
   readInsights,
+  isShortsFormat,
+  splitYoutube,
+  youtubeAuthorizeUrl,
+  youtubeDescription,
+  youtubePrivacy,
+  youtubeTitle,
+  youtubeWatchUrl,
+  YOUTUBE_CHANNEL,
+  YOUTUBE_OAUTH_STATE,
+  YOUTUBE_SCOPES,
 } from "./lib.ts";
 import type { MediaKind, MetricChannel, Metrics } from "./lib.ts";
 
@@ -151,6 +164,7 @@ function secretsOf(cfg: Config): string[] {
     cfg.storageKey,
     cfg.adminSecret,
     cfg.youtubeApiKey,
+    cfg.youtubeClientSecret,
   ];
 }
 
@@ -236,6 +250,12 @@ function buildConfig() {
     metricLogDataSourceId: optionalEnv("METRIC_LOG_DATA_SOURCE_ID") ||
       "b7759760-49e5-425a-89f2-022232c576c3",
     youtubeApiKey: optionalEnv("YOUTUBE_API_KEY"),
+    youtubeClientId: optionalEnv("YOUTUBE_CLIENT_ID"),
+    youtubeClientSecret: optionalEnv("YOUTUBE_CLIENT_SECRET"),
+    youtubeRedirectUri: optionalEnv("YOUTUBE_REDIRECT_URI"),
+    youtubePrivacy: youtubePrivacy(optionalEnv("YOUTUBE_PRIVACY")),
+    // 22 = 인물/블로그, 27 = 교육
+    youtubeCategoryId: optionalEnv("YOUTUBE_CATEGORY_ID") || "27",
     // 유튜브 업로드 목록을 볼 채널. 비우면 게시물 DB 에 있는 영상의 채널을 쓴다.
     youtubeChannelId: optionalEnv("YOUTUBE_CHANNEL_ID"),
     // 계정에서 찾은 게시물 중 이 날짜(한국 시간) 이후에 올린 것만 게시물 기록을 새로 만든다.
@@ -311,17 +331,10 @@ async function addComment(cfg: Config, pageId: string, content: string): Promise
 
 type MediaRole = "image" | "video";
 
-async function uploadMedia(
-  cfg: Config,
-  pageId: string,
-  index: number,
-  sourceUrl: string,
-  role: MediaRole,
-): Promise<string> {
-  if (!cfg.storageUrl || !cfg.storageKey) {
-    throw new Error("미디어 저장소 설정(SB_URL, SB_SERVICE_ROLE_KEY)이 없습니다.");
-  }
+type MediaFile = { bytes: Uint8Array; ext: string; contentType: string };
 
+/** 노션 파일을 내려받아 실제 형식을 확인한다. */
+async function downloadMedia(sourceUrl: string, role: MediaRole): Promise<MediaFile> {
   const download = await fetch(sourceUrl);
   if (!download.ok) throw new Error(`파일 내려받기 실패(${download.status})`);
   const bytes = new Uint8Array(await download.arrayBuffer());
@@ -351,8 +364,21 @@ async function uploadMedia(
     }
     ext = detected ?? extensionFor(headerType, sourceUrl);
   }
-  const contentType = contentTypeFor(ext);
+  return { bytes, ext, contentType: contentTypeFor(ext) };
+}
 
+async function uploadMedia(
+  cfg: Config,
+  pageId: string,
+  index: number,
+  sourceUrl: string,
+  role: MediaRole,
+): Promise<string> {
+  if (!cfg.storageUrl || !cfg.storageKey) {
+    throw new Error("미디어 저장소 설정(SB_URL, SB_SERVICE_ROLE_KEY)이 없습니다.");
+  }
+
+  const { bytes, ext, contentType } = await downloadMedia(sourceUrl, role);
   const path = `${pageId}/${String(index + 1).padStart(2, "0")}.${ext}`;
   const upload = await fetch(`${cfg.storageUrl}/storage/v1/object/${cfg.bucket}/${path}`, {
     method: "POST",
@@ -879,6 +905,147 @@ async function publishThreads(
   return info.permalink ?? "";
 }
 
+// ---------- 유튜브 ----------
+// 구글 OAuth 로 한 번 승인해 refresh token 을 받아 meta_tokens 표(channel = youtube)에 담아둔다.
+// refresh token 은 만료가 없으므로(앱이 '프로덕션' 상태일 때) 업로드할 때마다 1시간짜리 접근 토큰을 새로 받는다.
+// 표의 access_token 칸에 refresh token 을, user_id 칸에 유튜브 채널 ID 를 넣는다.
+
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const YOUTUBE_API = "https://www.googleapis.com/youtube/v3";
+const YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos";
+
+function youtubeReady(cfg: Config): boolean {
+  return cfg.youtubeClientId !== "" && cfg.youtubeClientSecret !== "";
+}
+
+async function googleToken(cfg: Config, params: Json): Promise<Json> {
+  const res = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: formBody({ client_id: cfg.youtubeClientId, client_secret: cfg.youtubeClientSecret, ...params }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw apiError(cfg, "구글 토큰", res.status, text, 300);
+  return text ? JSON.parse(text) : {};
+}
+
+async function youtubeFetch(cfg: Config, accessToken: string, path: string): Promise<Json> {
+  const res = await fetch(`${YOUTUBE_API}/${path}`, { headers: { "Authorization": `Bearer ${accessToken}` } });
+  const text = await res.text();
+  if (!res.ok) throw apiError(cfg, "유튜브 API", res.status, text);
+  return text ? JSON.parse(text) : {};
+}
+
+/** 저장된 refresh token 으로 접근 토큰을 받는다. */
+async function youtubeAccessToken(cfg: Config): Promise<string> {
+  const row = await readToken(cfg, "youtube");
+  if (!row) throw new Error("유튜브 인증 정보가 없습니다. 브라우저에서 유튜브 인증(?youtube_auth=1)을 먼저 진행하세요.");
+  try {
+    const token = await googleToken(cfg, { grant_type: "refresh_token", refresh_token: row.access_token });
+    const access = String(token.access_token ?? "");
+    if (access === "") throw new Error("접근 토큰을 받지 못했습니다.");
+    return access;
+  } catch (e) {
+    // invalid_grant 는 승인이 취소됐거나, 구글 앱이 '테스트' 상태라 7일이 지나 만료된 경우다.
+    throw new Error(`유튜브 인증이 만료되었습니다. 유튜브 인증(?youtube_auth=1)을 다시 진행하세요. (${message(e)})`);
+  }
+}
+
+function handleYoutubeAuthPage(url: URL, cfg: Config): Response {
+  if (!youtubeReady(cfg)) {
+    return textPage("유튜브 인증 준비 실패", "환경값 YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET 이 없습니다.", 500);
+  }
+  const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.youtubeRedirectUri);
+  const link = youtubeAuthorizeUrl(cfg.youtubeClientId, redirectUri, YOUTUBE_SCOPES);
+  return textPage(
+    "유튜브 인증",
+    `아래 주소를 복사해 브라우저 주소창에 붙여넣고, 영상을 올릴 유튜브 채널의 구글 계정으로 승인하세요.\n\n` +
+      `${link}\n\n` +
+      `되돌아올 주소(구글 클라우드 '승인된 리디렉션 URI'에 같은 값을 넣어야 합니다): ${redirectUri}`,
+  );
+}
+
+async function handleYoutubeCallback(url: URL, cfg: Config): Promise<Response> {
+  const denied = url.searchParams.get("error");
+  if (denied) return textPage("유튜브 인증 취소", denied, 400);
+  const code = url.searchParams.get("code") ?? "";
+  if (code === "") return textPage("유튜브 인증 실패", "code 값이 없습니다.", 400);
+
+  try {
+    const redirectUri = resolveRedirectUri(url.toString(), cfg.storageUrl, cfg.youtubeRedirectUri);
+    const token = await googleToken(cfg, { grant_type: "authorization_code", code, redirect_uri: redirectUri });
+    const refresh = String(token.refresh_token ?? "");
+    if (refresh === "") {
+      throw new Error("refresh token 을 받지 못했습니다. 구글 계정 > 보안 > 서드파티 연결에서 이 앱을 지운 뒤 다시 승인하세요.");
+    }
+    const me = await youtubeFetch(cfg, String(token.access_token ?? ""), "channels?part=snippet&mine=true");
+    const channel = ((me.items ?? []) as Json[])[0];
+    if (!channel) throw new Error("이 구글 계정에 유튜브 채널이 없습니다. 채널이 있는 계정으로 다시 승인하세요.");
+
+    await saveToken(cfg, {
+      channel: "youtube",
+      access_token: refresh,
+      user_id: String(channel.id),
+      expires_at: null,
+      updated_at: new Date().toISOString(),
+    });
+    return textPage(
+      "유튜브 인증 완료",
+      `'${channel.snippet?.title ?? ""}' 채널(ID ${channel.id}) 연결을 저장했습니다. 이 창은 닫아도 됩니다.`,
+    );
+  } catch (e) {
+    return textPage("유튜브 인증 실패", message(e), 500);
+  }
+}
+
+type YoutubeUpload = { id: string; privacy: string };
+
+/**
+ * 영상을 올린다. 재개 가능 업로드로 메타데이터를 먼저 보내고 받은 주소에 파일을 PUT 한다.
+ * 유튜브는 업로드 직후 영상 ID 를 돌려주고 처리는 나중에 하므로 기다리지 않는다.
+ */
+async function uploadYoutube(
+  cfg: Config,
+  file: MediaFile,
+  title: string,
+  description: string,
+): Promise<YoutubeUpload> {
+  const accessToken = await youtubeAccessToken(cfg);
+  const start = await fetch(`${YOUTUBE_UPLOAD_URL}?uploadType=resumable&part=snippet,status`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+      "X-Upload-Content-Length": String(file.bytes.byteLength),
+      "X-Upload-Content-Type": file.contentType,
+    },
+    body: JSON.stringify({
+      snippet: { title, description, categoryId: cfg.youtubeCategoryId },
+      status: { privacyStatus: cfg.youtubePrivacy, selfDeclaredMadeForKids: false },
+    }),
+  });
+  if (!start.ok) throw apiError(cfg, "유튜브 업로드 준비", start.status, await start.text());
+  const location = start.headers.get("location");
+  if (!location) throw new Error("유튜브가 업로드 주소를 돌려주지 않았습니다.");
+
+  const put = await fetch(location, {
+    method: "PUT",
+    headers: { "Content-Type": file.contentType },
+    body: file.bytes,
+  });
+  const text = await put.text();
+  if (!put.ok) throw apiError(cfg, "유튜브 업로드", put.status, text);
+  const video = JSON.parse(text) as Json;
+  return { id: String(video.id ?? ""), privacy: String(video.status?.privacyStatus ?? "") };
+}
+
+/** 이 산출물의 유튜브 게시물 기록 중 게시 링크가 있는 것이 있으면 이미 올린 것으로 본다. */
+async function youtubeAlreadyPosted(cfg: Config, pageId: string): Promise<boolean> {
+  const channelId = await findChannelPageId(cfg, YOUTUBE_CHANNEL);
+  const rows = await findPostRecords(cfg, pageId, channelId);
+  return rows.some((row) => Boolean(((row.properties ?? {}) as Json)["게시 링크"]?.url));
+}
+
 // ---------- 채널 ----------
 
 const CHANNELS = ["인스타그램", "스레드"] as const;
@@ -913,7 +1080,7 @@ function requestedChannels(props: Json): Channel[] {
 
 const JOB_STALE_MS = 15 * 60 * 1000;
 
-async function claimJob(cfg: Config, pageId: string, channel: Channel): Promise<boolean> {
+async function claimJob(cfg: Config, pageId: string, channel: string): Promise<boolean> {
   if (!storageReady(cfg)) return true;
   const now = new Date().toISOString();
   const key = `page_id=eq.${encodeURIComponent(pageId)}&channel=eq.${encodeURIComponent(channel)}`;
@@ -947,7 +1114,7 @@ async function claimJob(cfg: Config, pageId: string, channel: Channel): Promise<
   }
 }
 
-async function releaseJob(cfg: Config, pageId: string, channel: Channel): Promise<void> {
+async function releaseJob(cfg: Config, pageId: string, channel: string): Promise<void> {
   if (!storageReady(cfg)) return;
   const key = `page_id=eq.${encodeURIComponent(pageId)}&channel=eq.${encodeURIComponent(channel)}`;
   try {
@@ -1236,15 +1403,21 @@ async function publishRow(
   const props = (page.properties ?? {}) as Json;
 
   const requested = requestedChannels(props);
+  const format = selectName(props["형식"]);
+  const kind = mediaKindFor(format);
   // only 는 웹훅 주소의 ?channel= 로 지정한 채널이다. 지정이 있으면 그것만 처리한다.
   // 지정이 없는 배포 버튼은 ⚪ 대기 채널에 '배포 채널'에 고른 채널을 더한다.
   // 큐 모드는 '배포 채널'을 읽지 않는다. 대기로 남은 채널만 줍는 백업 경로라서다.
   const wanted = new Set<Channel>(only !== null ? [only] : requested);
   let recordChannels: string[] = [];
   let doneChannels: string[] = [];
+  // 유튜브는 연결 설정이 있고 영상 형식일 때 업로드한다. 아니면 다른 채널처럼 기록만 만든다.
+  let youtube = false;
   if (only === null && useDeployChannels) {
+    const split = splitYoutube(multiSelectNames(props["배포 채널"]), youtubeReady(cfg), kind);
+    youtube = split.youtube;
     const plan = planDeploy(
-      multiSelectNames(props["배포 채널"]),
+      split.rest,
       (channel) => selectName(props[RESULT_PROP[channel as Channel]]),
       STATUS_DONE,
     );
@@ -1261,8 +1434,8 @@ async function publishRow(
 
   // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
   let channels: Channel[] = CHANNELS.filter((channel) => wanted.has(channel));
-  if (channels.length === 0 && dryRun && recordChannels.length === 0) channels = [...CHANNELS];
-  if (channels.length === 0 && (recordChannels.length > 0 || doneChannels.length > 0)) {
+  if (channels.length === 0 && dryRun && recordChannels.length === 0 && !youtube) channels = [...CHANNELS];
+  if (channels.length === 0 && !youtube && (recordChannels.length > 0 || doneChannels.length > 0)) {
     return {
       ok: recordFailures.length === 0,
       pageId,
@@ -1272,7 +1445,7 @@ async function publishRow(
       alreadyDone: doneChannels,
     };
   }
-  if (channels.length === 0) {
+  if (channels.length === 0 && !youtube) {
     // 버튼 설정이 어긋나면 여기로 온다. '배포 채널'이 비었거나, 예전 버튼이 상태를 ⚪ 대기로 바꾸지 않은 경우다.
     // 예전에는 아무 흔적 없이 끝나서 원인을 찾기 어려웠다. 이제는 로그와 안내를 남긴다.
     console.log("meta-publish 건너뜀", pageId, "요청된 채널 없음");
@@ -1288,8 +1461,6 @@ async function publishRow(
     return { ok: true, pageId, skipped: true, reason };
   }
 
-  const format = selectName(props["형식"]);
-  const kind = mediaKindFor(format);
   if (kind === null) {
     throw new Error(
       `'형식' 값을 확인하세요. 지금 값: '${format || "비어 있음"}'. 쓸 수 있는 값: ${FORMAT_NAMES.join(" / ")}`,
@@ -1324,11 +1495,30 @@ async function publishRow(
         threadsAuthNote = message(e);
       }
     }
+    let youtubeNote = "배포 채널에 유튜브가 없거나 업로드 대상이 아닙니다.";
+    if (youtube) {
+      try {
+        await youtubeAccessToken(cfg);
+        youtubeNote = "정상";
+      } catch (e) {
+        youtubeNote = message(e);
+      }
+    }
+    const shorts = isShortsFormat(format);
     return {
       ok: true,
       dryRun: true,
       pageId,
       channels,
+      youtube: youtube
+        ? {
+          auth: youtubeNote,
+          shorts,
+          privacy: cfg.youtubePrivacy,
+          title: youtubeTitle(richText(props["유튜브 제목"]), pageTitle(props)),
+          description: youtubeDescription(caption, shorts),
+        }
+        : youtubeNote,
       format,
       mediaKind: kind,
       media: uploaded,
@@ -1350,7 +1540,63 @@ async function publishRow(
   const results: Json = {};
   const failures: string[] = [];
   const postFailures: string[] = [];
+  const notices: string[] = [];
   let succeeded = false;
+
+  // 유튜브는 업로드만 하면 처리를 기다리지 않아 금방 끝난다. 영상 처리를 기다리는 메타 채널보다 먼저 해서
+  // 함수 실행 한도에 밀려 잘리지 않게 한다. 채널 상태 칸이 없으므로 '이미 올렸는지'는 게시물 기록의 게시 링크로 본다.
+  if (youtube && plan.kind === "video") {
+    if (!(await claimJob(cfg, pageId, YOUTUBE_CHANNEL))) {
+      results[YOUTUBE_CHANNEL] = "다른 실행이 처리 중이라 건너뛰었습니다.";
+    } else {
+      try {
+        if (await youtubeAlreadyPosted(cfg, pageId)) {
+          doneChannels.push(YOUTUBE_CHANNEL);
+          results[YOUTUBE_CHANNEL] = "이미 올린 기록(게시 링크)이 있어 건너뛰었습니다.";
+        } else {
+          const shorts = isShortsFormat(format);
+          const file = await downloadMedia(plan.url, "video");
+          const video = await uploadYoutube(
+            cfg,
+            file,
+            youtubeTitle(richText(props["유튜브 제목"]), pageTitle(props)),
+            youtubeDescription(caption, shorts),
+          );
+          const link = youtubeWatchUrl(video.id, shorts);
+          succeeded = true;
+          results[YOUTUBE_CHANNEL] = link;
+          console.log("meta-publish 완료", pageId, YOUTUBE_CHANNEL, link, video.privacy);
+          if (video.privacy !== "" && video.privacy !== cfg.youtubePrivacy) {
+            notices.push(
+              `유튜브: '${cfg.youtubePrivacy}'로 요청했지만 '${video.privacy}'로 올라갔습니다. ` +
+                "구글 클라우드 프로젝트가 유튜브 API 감사를 받기 전에는 API 로 올린 영상이 비공개로 묶입니다. " +
+                "유튜브 스튜디오에서 공개 범위를 바꿔주세요.",
+            );
+          }
+          try {
+            await recordPublishedPost(cfg, pageId, props, YOUTUBE_CHANNEL, link);
+          } catch (e) {
+            postFailures.push(`${YOUTUBE_CHANNEL} — ${maskSecrets(message(e), secretsOf(cfg))} (링크: ${link})`);
+          }
+        }
+      } catch (e) {
+        const detail = maskSecrets(message(e), secretsOf(cfg));
+        failures.push(`${YOUTUBE_CHANNEL} — ${detail}`);
+        results[YOUTUBE_CHANNEL] = detail;
+        try {
+          await updatePage(cfg, pageId, {
+            "마지막 오류": {
+              rich_text: [{ type: "text", text: { content: truncate(`${YOUTUBE_CHANNEL} — ${detail}`, 1800) } }],
+            },
+          });
+        } catch {
+          // 아래 실패 코멘트로 남는다.
+        }
+      } finally {
+        await releaseJob(cfg, pageId, YOUTUBE_CHANNEL);
+      }
+    }
+  }
 
   for (const channel of channels) {
     if (!(await claimJob(cfg, pageId, channel))) {
@@ -1442,6 +1688,14 @@ async function publishRow(
     await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}\n\n${note}`);
   }
 
+  if (notices.length > 0) {
+    try {
+      await addComment(cfg, pageId, `배포 안내\n\n${notices.join("\n")}`);
+    } catch (e) {
+      console.error("배포 안내 코멘트 실패", message(e));
+    }
+  }
+
   if (postFailures.length > 0) {
     try {
       await addComment(
@@ -1457,7 +1711,7 @@ async function publishRow(
   return {
     ok: failures.length === 0,
     pageId,
-    channels,
+    channels: youtube ? [...channels, YOUTUBE_CHANNEL] : channels,
     format,
     mediaKind: kind,
     results,
@@ -1961,12 +2215,19 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: message(e) }, 500);
   }
 
-  // 인증 없이 열리는 GET 경로 두 개.
-  // - ?threads_auth=1 : 승인 링크를 보여주는 안내 페이지
-  // - ?code=...       : 스레드가 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
+  // 인증 없이 열리는 GET 경로.
+  // - ?threads_auth=1 / ?youtube_auth=1 : 승인 링크를 보여주는 안내 페이지
+  // - ?code=...       : 스레드·구글이 브라우저를 돌려보내는 콜백 (1회용 code 라서 이것만 열어둔다)
   const reqUrl = new URL(req.url);
   if (req.method === "GET" && reqUrl.searchParams.has("threads_auth")) {
     return handleThreadsAuthPage(reqUrl, cfg);
+  }
+  if (req.method === "GET" && reqUrl.searchParams.has("youtube_auth")) {
+    return handleYoutubeAuthPage(reqUrl, cfg);
+  }
+  // 구글은 보낸 state 를 그대로 돌려준다. 스레드 승인에는 state 를 쓰지 않으므로 이것으로 구분한다.
+  if (req.method === "GET" && reqUrl.searchParams.get("state") === YOUTUBE_OAUTH_STATE) {
+    return await handleYoutubeCallback(reqUrl, cfg);
   }
   if (req.method === "GET" && (reqUrl.searchParams.has("code") || reqUrl.searchParams.has("error"))) {
     return await handleThreadsCallback(reqUrl, cfg);
