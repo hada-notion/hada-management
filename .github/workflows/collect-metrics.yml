@@ -16,7 +16,7 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     steps:
-      - name: Call meta-publish?metrics=1
+      - name: Call hada-publish?metrics=1
         env:
           SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
@@ -28,7 +28,7 @@ jobs:
             exit 1
           fi
           STATUS=$(curl -sS -o result.json -w '%{http_code}' --max-time 170 -X POST \
-            "https://${SUPABASE_PROJECT_ID}.supabase.co/functions/v1/meta-publish?metrics=1&wait=1&dryRun=${DRY_RUN}" \
+            "https://${SUPABASE_PROJECT_ID}.supabase.co/functions/v1/hada-publish?metrics=1&wait=1&dryRun=${DRY_RUN}" \
             -H "x-admin-key: ${ADMIN_SECRET}" \
             -H "Content-Type: application/json" \
             -d '{}')

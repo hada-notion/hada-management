@@ -12,7 +12,7 @@
 // '캡션'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '짧은글' 형식뿐이다).
 // 그래서 이미지·캐러셀 발행에서는 caption·text 파라미터를 아예 빼고 보낸다.
 //
-// 호출: POST /functions/v1/meta-publish   (헤더 x-admin-key 필요)
+// 호출: POST /functions/v1/hada-publish   (헤더 x-admin-key 필요)
 //   본문에 페이지 지정(pageUrl/pageId/url/id)이 있거나 본문 어딘가에 노션 페이지 주소가 실려 있으면
 //   그 페이지만 처리한다. ?channel=instagram|threads 로 채널을 지정할 수 있다.
 //   지정이 없으면 상태가 ⚪ 대기인 채널과 '배포 채널'에 고른 채널을 처리한다.
@@ -29,10 +29,10 @@
 // 오류 문구에는 비밀값이 섞여 들어올 수 있다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
 // 노션에 쓰기 전에 summarizeApiError 로 요약하고 maskSecrets 로 가린다.
 //
-// 스레드 인증 안내: GET /functions/v1/meta-publish?threads_auth=1
-// 스레드 인증 콜백: GET /functions/v1/meta-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
-// 유튜브 인증 안내: GET /functions/v1/meta-publish?youtube_auth=1
-// 유튜브 인증 콜백: GET /functions/v1/meta-publish?code=...&state=youtube  (구글이 돌려보내는 주소)
+// 스레드 인증 안내: GET /functions/v1/hada-publish?threads_auth=1
+// 스레드 인증 콜백: GET /functions/v1/hada-publish?code=...  (스레드가 브라우저를 돌려보내는 주소)
+// 유튜브 인증 안내: GET /functions/v1/hada-publish?youtube_auth=1
+// 유튜브 인증 콜백: GET /functions/v1/hada-publish?code=...&state=youtube  (구글이 돌려보내는 주소)
 //
 // 자세한 배포·설정 방법은 저장소 README 를 따른다.
 
@@ -1449,7 +1449,7 @@ async function publishRow(
   if (channels.length === 0 && !youtube) {
     // 버튼 설정이 어긋나면 여기로 온다. '배포 채널'이 비었거나, 예전 버튼이 상태를 ⚪ 대기로 바꾸지 않은 경우다.
     // 예전에는 아무 흔적 없이 끝나서 원인을 찾기 어려웠다. 이제는 로그와 안내를 남긴다.
-    console.log("meta-publish 건너뜀", pageId, "요청된 채널 없음");
+    console.log("hada-publish 건너뜀", pageId, "요청된 채널 없음");
     const reason = "요청된 채널이 없어 아무것도 하지 않았습니다. " +
       "'배포 채널'에서 올릴 채널을 골랐는지 확인하세요.";
     if (!dryRun && only === null) {
@@ -1534,7 +1534,7 @@ async function publishRow(
   await updatePage(cfg, pageId, {
     "처리 시작 시각": { date: { start: new Date().toISOString() } },
   });
-  console.log("meta-publish 시작", pageId, channels.join(","), `${format} · ${kind} · 캡션 ${caption.length}자`);
+  console.log("hada-publish 시작", pageId, channels.join(","), `${format} · ${kind} · 캡션 ${caption.length}자`);
 
   // 파일은 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
   let uploaded: MediaPlan | null = null;
@@ -1566,7 +1566,7 @@ async function publishRow(
           const link = youtubeWatchUrl(video.id, shorts);
           succeeded = true;
           results[YOUTUBE_CHANNEL] = link;
-          console.log("meta-publish 완료", pageId, YOUTUBE_CHANNEL, link, video.privacy);
+          console.log("hada-publish 완료", pageId, YOUTUBE_CHANNEL, link, video.privacy);
           if (video.privacy !== "" && video.privacy !== cfg.youtubePrivacy) {
             notices.push(
               `유튜브: '${cfg.youtubePrivacy}'로 요청했지만 '${video.privacy}'로 올라갔습니다. ` +
@@ -1640,7 +1640,7 @@ async function publishRow(
       await updatePage(cfg, pageId, {
         [RESULT_PROP[channel]]: { select: { name: STATUS_DONE } },
       });
-      console.log("meta-publish 완료", pageId, channel, link || "(링크 없음)");
+      console.log("hada-publish 완료", pageId, channel, link || "(링크 없음)");
       results[channel] = link || "성공";
 
       // 링크는 게시물 기록에 남긴다. 이미 올라간 글이므로 기록 실패는 발행 실패로 치지 않고 따로 알린다.
@@ -1785,7 +1785,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 //   스레드     → 게시물 인사이트(views·likes·replies·reposts·quotes·shares). threads_manage_insights 권한 필요
 //   유튜브     → YouTube Data API videos.statistics (YOUTUBE_API_KEY, 공개 통계라 OAuth 불필요)
 // 계정에는 있는데 게시물 DB 에 없는 게시물(직접 올린 것 등)은 게시물 기록을 새로 만든 뒤 함께 수집한다.
-// 호출: POST /functions/v1/meta-publish?metrics=1   (헤더 x-admin-key)
+// 호출: POST /functions/v1/hada-publish?metrics=1   (헤더 x-admin-key)
 //   GitHub Actions 는 매일 새벽 ?wait=1 로 결과를 기다리고, 노션 버튼은 접수(202)만 받는다.
 
 const METRICS_TIME_BUDGET_MS = 110000;
@@ -2248,7 +2248,7 @@ Deno.serve(async (req) => {
   if (req.method === "POST") {
     const raw = await req.text();
     if (raw.trim() !== "") {
-      console.log("meta-publish 본문", raw.slice(0, 1500));
+      console.log("hada-publish 본문", raw.slice(0, 1500));
       try {
         payload = JSON.parse(raw);
       } catch {
@@ -2299,7 +2299,7 @@ Deno.serve(async (req) => {
   } catch (e) {
     return json({ ok: false, error: message(e) }, 400);
   }
-  console.log("meta-publish 대상", pageId || "(없음: 큐 모드)", "채널", hint ?? "(없음)");
+  console.log("hada-publish 대상", pageId || "(없음: 큐 모드)", "채널", hint ?? "(없음)");
 
   const task: Promise<Json> = pageId !== ""
     ? publishRow(cfg, pageId, dryRun, hint, hint === null)
