@@ -72,8 +72,14 @@ import {
   threadsLength,
   threadsAuthorizeUrl,
   truncate,
+  METRIC_FIELDS,
+  kstDate,
+  metricChannelOf,
+  metricDelta,
+  postCodeOf,
+  readInsights,
 } from "./lib.ts";
-import type { MediaKind } from "./lib.ts";
+import type { MediaKind, MetricChannel, Metrics } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
@@ -134,7 +140,15 @@ function assertToken(name: string, value: string): string {
 
 /** 오류 문구에서 지워야 할 비밀값 목록. 값 자체는 로그에도 남기지 않는다. */
 function secretsOf(cfg: Config): string[] {
-  return [cfg.igToken, cfg.threadsToken, cfg.threadsAppSecret, cfg.notionToken, cfg.storageKey, cfg.adminSecret];
+  return [
+    cfg.igToken,
+    cfg.threadsToken,
+    cfg.threadsAppSecret,
+    cfg.notionToken,
+    cfg.storageKey,
+    cfg.adminSecret,
+    cfg.youtubeApiKey,
+  ];
 }
 
 /** API 오류를 요약하고 비밀값을 지운 뒤 예외로 만든다. 응답을 통째로 남기지 않는 게 요점이다. */
@@ -215,6 +229,10 @@ function buildConfig() {
     threadsOauthBase: optionalEnv("THREADS_OAUTH_BASE") || "https://graph.threads.com",
     threadsRedirectUri: optionalEnv("THREADS_REDIRECT_URI"),
     tokenTable: optionalEnv("TOKEN_TABLE") || "meta_tokens",
+    // 성과 수집(?metrics=1)이 증가분을 쌓는 성과 로그 DB.
+    metricLogDataSourceId: optionalEnv("METRIC_LOG_DATA_SOURCE_ID") ||
+      "b7759760-49e5-425a-89f2-022232c576c3",
+    youtubeApiKey: optionalEnv("YOUTUBE_API_KEY"),
   };
 }
 
@@ -1497,6 +1515,267 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
  * 실제 컨텐츠 페이지('컷(프롬프트)' 관계가 있는 페이지)를 골라 쓴다.
  * 아무것도 못 찾으면 빈 문자열을 돌려주고 호출부는 큐 모드로 넘어간다.
  */
+// ---------- 성과 수집 ----------
+// 게시물 DB 에서 게시 링크가 있는 기록을 모아 채널 API 로 누적 지표를 읽고,
+// 성과 로그 DB 에 '지난 기록 이후 늘어난 만큼'을 한 행으로 쌓는다. 게시물의 총 조회수 등은 롤업이 합친다.
+//   인스타그램 → 미디어 목록(like_count·comments_count) + 인사이트(views·saved·shares)
+//   스레드     → 게시물 인사이트(views·likes·replies·reposts·quotes·shares). threads_manage_insights 권한 필요
+//   유튜브     → YouTube Data API videos.statistics (YOUTUBE_API_KEY, 공개 통계라 OAuth 불필요)
+// 호출: POST /functions/v1/meta-publish?metrics=1   (헤더 x-admin-key, GitHub Actions 가 매일 부른다)
+
+const METRICS_TIME_BUDGET_MS = 110000;
+const MEDIA_LIST_PAGES = 5;
+
+type PostTarget = { id: string; title: string; link: string; channel: MetricChannel; code: string };
+type CollectResult = { post: string; channel: MetricChannel; status: string; delta?: Metrics; error?: string };
+
+async function queryAll(cfg: Config, dataSourceId: string, filter?: Json): Promise<Json[]> {
+  const rows: Json[] = [];
+  let cursor: string | undefined;
+  do {
+    const res = await notion(cfg, `/data_sources/${dataSourceId}/query`, {
+      method: "POST",
+      headers: { "Notion-Version": POST_API_VERSION },
+      body: JSON.stringify({ ...(filter ? { filter } : {}), page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) }),
+    });
+    rows.push(...((res.results ?? []) as Json[]));
+    cursor = res.has_more ? res.next_cursor : undefined;
+  } while (cursor);
+  return rows;
+}
+
+/** 게시 링크가 있고 내리지 않은 게시물만 대상으로 잡는다. */
+async function findMetricTargets(cfg: Config): Promise<PostTarget[]> {
+  const rows = await queryAll(cfg, cfg.postDataSourceId, {
+    property: "게시 링크",
+    url: { is_not_empty: true },
+  });
+  const targets: PostTarget[] = [];
+  for (const row of rows) {
+    const props = (row.properties ?? {}) as Json;
+    if (selectName(props["게시 상태"]) === "내림") continue;
+    const link = String(props["게시 링크"]?.url ?? "").trim();
+    const channel = metricChannelOf(link);
+    const code = postCodeOf(link);
+    if (channel === null || code === "") continue;
+    targets.push({ id: row.id, title: pageTitle(props), link, channel, code });
+  }
+  return targets;
+}
+
+/** 성과 로그에 이미 쌓인 값을 게시물별로 합친다. 직접 입력한 행도 합계에 들어간다. */
+async function loggedTotals(cfg: Config): Promise<Map<string, Metrics>> {
+  const totals = new Map<string, Metrics>();
+  for (const row of await queryAll(cfg, cfg.metricLogDataSourceId)) {
+    const props = (row.properties ?? {}) as Json;
+    for (const postId of relationIds(props["게시물"])) {
+      const sum = totals.get(postId) ?? {};
+      for (const field of METRIC_FIELDS) {
+        const value = props[field]?.number;
+        if (typeof value === "number") sum[field] = (sum[field] ?? 0) + value;
+      }
+      totals.set(postId, sum);
+    }
+  }
+  return totals;
+}
+
+/** 계정의 미디어 목록을 shortcode → 항목으로 모은다. 최근 것부터 MEDIA_LIST_PAGES 쪽까지만 본다. */
+async function listByShortcode(fetchPage: (after: string) => Promise<Json>): Promise<Map<string, Json>> {
+  const map = new Map<string, Json>();
+  let after = "";
+  for (let page = 0; page < MEDIA_LIST_PAGES; page++) {
+    const res = await fetchPage(after);
+    for (const item of (res.data ?? []) as Json[]) {
+      const code = item.shortcode || postCodeOf(String(item.permalink ?? ""));
+      if (code) map.set(code, item);
+    }
+    after = res.paging?.next ? String(res.paging?.cursors?.after ?? "") : "";
+    if (after === "") break;
+  }
+  return map;
+}
+
+async function instagramMetrics(cfg: Config, media: Json): Promise<Metrics> {
+  const metrics: Metrics = {};
+  if (typeof media.like_count === "number") metrics["좋아요"] = media.like_count;
+  if (typeof media.comments_count === "number") metrics["댓글"] = media.comments_count;
+  try {
+    const insights = readInsights(await igGet(cfg, `${media.id}/insights?metric=views,likes,comments,saved,shares`));
+    if (insights.views !== undefined) metrics["조회수"] = insights.views;
+    if (insights.likes !== undefined) metrics["좋아요"] = insights.likes;
+    if (insights.comments !== undefined) metrics["댓글"] = insights.comments;
+    if (insights.saved !== undefined) metrics["저장"] = insights.saved;
+    if (insights.shares !== undefined) metrics["공유"] = insights.shares;
+  } catch (e) {
+    // 인사이트 권한이 없으면 좋아요·댓글만 남긴다.
+    console.warn("인스타 인사이트 실패", media.id, message(e));
+  }
+  return metrics;
+}
+
+async function threadsMetrics(cfg: Config, auth: ThreadsAuth, mediaId: string): Promise<Metrics> {
+  const insights = readInsights(
+    await threadsGet(cfg, auth, `${mediaId}/insights?metric=views,likes,replies,reposts,quotes,shares`),
+  );
+  const metrics: Metrics = {};
+  if (insights.views !== undefined) metrics["조회수"] = insights.views;
+  if (insights.likes !== undefined) metrics["좋아요"] = insights.likes;
+  if (insights.replies !== undefined) metrics["댓글"] = insights.replies;
+  const shared = ["reposts", "quotes", "shares"].filter((name) => insights[name] !== undefined);
+  if (shared.length > 0) metrics["공유"] = shared.reduce((sum, name) => sum + insights[name], 0);
+  return metrics;
+}
+
+/** 유튜브 공개 통계. 50개씩 묶어 한 번에 묻는다. */
+async function youtubeStats(cfg: Config, ids: string[]): Promise<Map<string, Metrics>> {
+  const out = new Map<string, Metrics>();
+  for (let i = 0; i < ids.length; i += 50) {
+    const params = new URLSearchParams({ part: "statistics", id: ids.slice(i, i + 50).join(","), key: cfg.youtubeApiKey });
+    const res = await fetch(`https://www.googleapis.com/youtube/v3/videos?${params}`);
+    const text = await res.text();
+    if (!res.ok) throw apiError(cfg, "유튜브 API", res.status, text);
+    for (const item of (JSON.parse(text).items ?? []) as Json[]) {
+      const stats = (item.statistics ?? {}) as Json;
+      const metrics: Metrics = {};
+      if (stats.viewCount !== undefined) metrics["조회수"] = Number(stats.viewCount);
+      if (stats.likeCount !== undefined) metrics["좋아요"] = Number(stats.likeCount);
+      if (stats.commentCount !== undefined) metrics["댓글"] = Number(stats.commentCount);
+      out.set(item.id, metrics);
+    }
+  }
+  return out;
+}
+
+async function createMetricLog(cfg: Config, target: PostTarget, delta: Metrics, date: string): Promise<void> {
+  const numbers: Json = {};
+  for (const [field, value] of Object.entries(delta)) numbers[field] = { number: value };
+  await notion(cfg, "/pages", {
+    method: "POST",
+    headers: { "Notion-Version": POST_API_VERSION },
+    body: JSON.stringify({
+      parent: { type: "data_source_id", data_source_id: cfg.metricLogDataSourceId },
+      properties: {
+        "이름": { title: [{ type: "text", text: { content: truncate(`${target.title} · ${date}`, 1900) } }] },
+        "게시물": { relation: [{ id: target.id }] },
+        "기록일": { date: { start: date } },
+        "수집 방식": { select: { name: "자동 수집" } },
+        ...numbers,
+      },
+    }),
+  });
+}
+
+async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
+  const started = Date.now();
+  const date = kstDate(started);
+  const targets = await findMetricTargets(cfg);
+  const logged = await loggedTotals(cfg);
+  const results: CollectResult[] = [];
+  const has = (channel: MetricChannel) => targets.some((t) => t.channel === channel);
+
+  // 채널별로 현재 누적값을 먼저 모은다. 한 채널이 실패해도 나머지 채널은 그대로 기록한다.
+  const current = new Map<string, Metrics>();
+  const channelError = new Map<MetricChannel, string>();
+
+  if (has("instagram")) {
+    try {
+      const media = await listByShortcode((after) =>
+        igGet(cfg, `${cfg.igUserId}/media?fields=id,shortcode,permalink,like_count,comments_count&limit=100${after ? `&after=${after}` : ""}`)
+      );
+      for (const target of targets.filter((t) => t.channel === "instagram")) {
+        const item = media.get(target.code);
+        if (item) current.set(target.id, await instagramMetrics(cfg, item));
+      }
+    } catch (e) {
+      channelError.set("instagram", message(e));
+    }
+  }
+
+  if (has("threads")) {
+    try {
+      const auth = await resolveThreadsAuth(cfg);
+      const media = await listByShortcode((after) =>
+        threadsGet(cfg, auth, `${auth.userId || "me"}/threads?fields=id,shortcode,permalink&limit=100${after ? `&after=${after}` : ""}`)
+      );
+      for (const target of targets.filter((t) => t.channel === "threads")) {
+        const item = media.get(target.code);
+        if (!item) continue;
+        try {
+          current.set(target.id, await threadsMetrics(cfg, auth, item.id));
+        } catch (e) {
+          results.push({ post: target.title, channel: "threads", status: "실패", error: message(e) });
+        }
+      }
+    } catch (e) {
+      channelError.set("threads", message(e));
+    }
+  }
+
+  if (has("youtube")) {
+    if (cfg.youtubeApiKey === "") {
+      channelError.set("youtube", "환경값 YOUTUBE_API_KEY 가 없어 유튜브는 건너뜁니다.");
+    } else {
+      try {
+        const yt = targets.filter((t) => t.channel === "youtube");
+        const stats = await youtubeStats(cfg, [...new Set(yt.map((t) => t.code))]);
+        for (const target of yt) {
+          const metrics = stats.get(target.code);
+          if (metrics) current.set(target.id, metrics);
+        }
+      } catch (e) {
+        channelError.set("youtube", message(e));
+      }
+    }
+  }
+
+  let created = 0;
+  for (const target of targets) {
+    if (results.some((r) => r.post === target.title && r.channel === target.channel)) continue;
+    const failed = channelError.get(target.channel);
+    if (failed) {
+      results.push({ post: target.title, channel: target.channel, status: "실패", error: failed });
+      continue;
+    }
+    const metrics = current.get(target.id);
+    if (!metrics) {
+      results.push({ post: target.title, channel: target.channel, status: "못 찾음", error: `계정에서 ${target.code} 게시물을 찾지 못했습니다.` });
+      continue;
+    }
+    const delta = metricDelta(metrics, logged.get(target.id) ?? {});
+    if (delta === null) {
+      results.push({ post: target.title, channel: target.channel, status: "변화 없음" });
+      continue;
+    }
+    if (Date.now() - started > METRICS_TIME_BUDGET_MS) {
+      results.push({ post: target.title, channel: target.channel, status: "시간 초과로 다음에", delta });
+      continue;
+    }
+    if (!dryRun) {
+      try {
+        await createMetricLog(cfg, target, delta, date);
+      } catch (e) {
+        results.push({ post: target.title, channel: target.channel, status: "실패", delta, error: message(e) });
+        continue;
+      }
+    }
+    created++;
+    results.push({ post: target.title, channel: target.channel, status: dryRun ? "기록 예정" : "기록", delta });
+  }
+
+  const failures = results.filter((r) => r.status === "실패").length;
+  return {
+    ok: failures === 0,
+    dryRun,
+    date,
+    targets: targets.length,
+    created,
+    failures,
+    channelErrors: Object.fromEntries(channelError),
+    results,
+  };
+}
+
 async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string): Promise<string> {
   const explicit = readTarget(payload, requestUrl);
   if (explicit !== "") return parsePageId(explicit);
@@ -1566,6 +1845,17 @@ Deno.serve(async (req) => {
   }
 
   const dryRun = payload.dryRun === true || reqUrl.searchParams.get("dryRun") === "true";
+
+  // 성과 수집은 GitHub Actions 가 결과를 기다리며 부르므로 바로 실행하고 결과를 돌려준다.
+  if (reqUrl.searchParams.get("metrics") === "1") {
+    try {
+      const body = await runMetrics(cfg, dryRun);
+      return json(body, body.ok === false ? 500 : 200);
+    } catch (e) {
+      console.error("성과 수집 실패", message(e));
+      return json({ ok: false, error: message(e) }, 500);
+    }
+  }
   const wait = reqUrl.searchParams.get("wait") === "1";
   const hintText = channelHint(reqUrl.searchParams.get("channel"));
   const hint: Channel | null = hintText !== null && (CHANNELS as readonly string[]).includes(hintText)

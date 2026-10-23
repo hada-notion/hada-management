@@ -12,6 +12,7 @@
 | `supabase/meta_tokens.sql` | 스레드 토큰 보관 표 생성 SQL |
 | `supabase/meta_jobs.sql` | 발행 잠금 표 생성 SQL (중복 게시 방지) |
 | `.github/workflows/deploy-supabase-functions.yml` | 타입 검사·테스트 후 Supabase로 배포 |
+| `.github/workflows/collect-metrics.yml` | 매일 오전 9시(한국 시간) 성과 수집 호출 |
 
 ## 동작
 
@@ -103,6 +104,8 @@ Settings → Secrets and variables → Actions
 | `THREADS_USER_ID` | 아니오 | 스레드 인증 전 임시값. 인증하면 `meta_tokens` 표의 값이 우선한다 |
 | `THREADS_ACCESS_TOKEN` | 아니오 | 위와 같다 |
 | `TOKEN_TABLE` | 아니오 | 기본 `meta_tokens` |
+| `YOUTUBE_API_KEY` | 성과 수집 | 유튜브 공개 통계(조회수·좋아요·댓글)를 읽는 API 키. 없으면 유튜브만 건너뛴다 |
+| `METRIC_LOG_DATA_SOURCE_ID` | 아니오 | 성과 로그 DB 데이터 소스 ID. 기본값 내장 |
 | `PUBLISH_BUCKET` | 아니오 | 기본 `meta-publish` |
 
 값은 저장소에 넣지 않는다.
@@ -157,6 +160,30 @@ Threads API 는 페이스북 로그인으로 붙는 경로가 없어 스레드 �
 예전 `인스타그램 배포`·`스레드 배포` 버튼(상태를 `⚪ 대기`로 바꾸고 `?channel=instagram|threads` 로 보내는 방식)도 그대로 동작한다. `?channel=` 이 있으면 그 채널만 처리하고 `배포 채널`은 읽지 않는다.
 
 노션 자동화 웹훅은 실행된 페이지를 통째로 실어 보낸다(`data` 안의 페이지 ID 와 속성). 그래서 버튼 Content 에 페이지 URL 을 넣지 않아도 되고, 어느 페이지를 대상으로 잡았는지 함수 로그의 `meta-publish 대상` 줄에서 확인할 수 있다. 페이지가 실려 오지 않으면 `⚪ 대기`로 남은 행을 줍는 큐 모드로 넘어간다.
+
+## 성과 수집
+
+게시물 DB 에서 `게시 링크`가 있고 `게시 상태`가 `내림`이 아닌 기록을 모아, 채널 API 로 지금까지의 누적 지표를 읽는다. 그 값에서 성과 로그 DB 에 이미 쌓인 합(직접 입력한 행 포함)을 빼서 **늘어난 만큼만** 새 행으로 남긴다. 그래서 게시물의 `총 조회수`·`총 좋아요`·`총 댓글`·`총 저장` 롤업이 채널에 보이는 숫자와 같아진다. 늘어난 게 없으면 행을 만들지 않는다.
+
+| 채널 | 읽는 곳 | 채우는 칸 |
+| --- | --- | --- |
+| 인스타그램 | 미디어 목록 `like_count`·`comments_count` + 인사이트 `views`·`saved`·`shares` | 조회수·좋아요·댓글·저장·공유 |
+| 스레드 | 게시물 인사이트 `views`·`likes`·`replies`·`reposts`·`quotes`·`shares` | 조회수·좋아요·댓글(답글)·공유(리포스트+인용+공유) |
+| 유튜브 | YouTube Data API `videos.statistics` | 조회수·좋아요·댓글 |
+
+- 채널은 게시 링크 주소로 정하고, 게시물은 링크 속 코드(인스타 `/p/`·`/reel/` 뒤, 스레드 `/post/` 뒤, 유튜브 영상 ID)로 계정 목록과 맞춘다. 계정 최근 게시물 500개 안에서 찾는다.
+- 새 행: `이름` = `게시물 이름 · 날짜`, `기록일` = 한국 시간 오늘, `수집 방식` = `자동 수집`, `게시물` 연결.
+- 인스타그램 인사이트 권한이 없으면 좋아요·댓글만 남긴다. 스레드는 인사이트가 유일한 경로라 `threads_manage_insights` 권한이 필요하다. 이 권한은 2026-10-23 에 승인 범위에 추가했으므로 **그 전에 받은 스레드 토큰은 인증(위 5번)을 한 번 다시 해야 한다.**
+- 한 채널이 실패해도 다른 채널은 그대로 기록한다. 실패 내용은 응답의 `channelErrors`·`results` 와 Actions 로그에 남는다.
+
+호출은 `.github/workflows/collect-metrics.yml` 이 매일 한다. 저장소 시크릿에 `ADMIN_SECRET`(Supabase 함수의 값과 같게)을 넣어야 한다. 손으로 돌리려면 Actions → Collect Post Metrics → Run workflow(`dry_run` 을 켜면 노션에 쓰지 않는다), 또는:
+
+```bash
+curl -X POST "https://<프로젝트 ref>.supabase.co/functions/v1/meta-publish?metrics=1&dryRun=true" \
+  -H "x-admin-key: <ADMIN_SECRET 값>" -H "Content-Type: application/json" -d '{}'
+```
+
+노션 통합(`NOTION_TOKEN`)이 게시물 DB 와 성과 로그 DB 에 연결되어 있어야 한다.
 
 ## 수동 테스트
 

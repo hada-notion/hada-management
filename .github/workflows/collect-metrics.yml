@@ -1,0 +1,40 @@
+name: Collect Post Metrics
+
+# 매일 한국 시간 오전 9시에 인스타그램·스레드·유튜브 성과를 모아 노션 성과 로그에 쌓는다.
+# 매일 함수를 부르므로 Supabase 무료 플랜이 쉬다가 일시정지되는 것도 막는다.
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '노션에 쓰지 않고 결과만 보기'
+        type: boolean
+        default: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call meta-publish?metrics=1
+        env:
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -e
+          if [ -z "$ADMIN_SECRET" ]; then
+            echo "::error::저장소 시크릿 ADMIN_SECRET 이 없습니다. Supabase 함수의 ADMIN_SECRET 과 같은 값을 넣어주세요."
+            exit 1
+          fi
+          STATUS=$(curl -sS -o result.json -w '%{http_code}' --max-time 170 -X POST \
+            "https://${SUPABASE_PROJECT_ID}.supabase.co/functions/v1/meta-publish?metrics=1&dryRun=${DRY_RUN}" \
+            -H "x-admin-key: ${ADMIN_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          cat result.json
+          echo
+          if [ "$STATUS" -ge 400 ]; then
+            echo "::error::성과 수집이 일부 또는 전부 실패했습니다 (HTTP $STATUS). 위 결과의 channelErrors·results 를 확인하세요."
+            exit 1
+          fi
