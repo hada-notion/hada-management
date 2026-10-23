@@ -36,6 +36,8 @@ import {
   importedPostTitle,
   kstDate,
   metricChannelByLabel,
+  naverBlogIdOf,
+  naverBlogMetrics,
   metricsErrorSummary,
   metricsResultSummary,
   postHeadline,
@@ -453,7 +455,9 @@ Deno.test("metricChannelOf: 게시 링크 주소로 채널을 정한다", () => 
   assertEquals(metricChannelOf("https://www.threads.net/@ha.da_2025/post/DezfK__DRww"), "threads");
   assertEquals(metricChannelOf("https://youtube.com/shorts/62xB31O73Rg"), "youtube");
   assertEquals(metricChannelOf("https://youtu.be/62xB31O73Rg"), "youtube");
-  assertEquals(metricChannelOf("https://blog.naver.com/x/1"), null);
+  assertEquals(metricChannelOf("https://blog.naver.com/x/1"), "naver_blog");
+  assertEquals(metricChannelOf("https://m.blog.naver.com/PostView.naver?blogId=x&logNo=1"), "naver_blog");
+  assertEquals(metricChannelOf("https://cafe.naver.com/x/1"), null);
   assertEquals(metricChannelOf("링크 아님"), null);
 });
 
@@ -563,7 +567,8 @@ Deno.test("publishedOnOrAfter: 한국 시간 날짜로 비교한다", () => {
 Deno.test("metricChannelByLabel: 채널 페이지 이름으로 수집 채널을 찾는다", () => {
   assertEquals(metricChannelByLabel("스레드"), "threads");
   assertEquals(metricChannelByLabel(" 유튜브 "), "youtube");
-  assertEquals(metricChannelByLabel("블로그"), null);
+  assertEquals(metricChannelByLabel("블로그"), "naver_blog");
+  assertEquals(metricChannelByLabel("카페"), null);
   assertEquals(metricChannelByLabel(""), null);
 });
 
@@ -644,4 +649,34 @@ Deno.test("autoCollectDue: 정한 시각이 지났고 오늘 아직 안 했으�
   assertEquals(autoCollectDue(4, "2026-10-23T05:00:00+09:00", at("2026-10-23T03:00:00Z")), false);
   assertEquals(autoCollectDue(4, "2026-10-22T04:05:00+09:00", at("2026-10-23T03:00:00Z")), true);
   assertEquals(autoCollectDue(null, "", at("2026-10-23T03:00:00Z")), false);
+});
+
+Deno.test("네이버 블로그: 글 주소에서 아이디/글번호 코드를 꺼낸다", () => {
+  assertEquals(postCodeOf("https://blog.naver.com/hada_notion/224449821825"), "hada_notion/224449821825");
+  assertEquals(postCodeOf("https://m.blog.naver.com/hada_notion/224449821825?referrerCode=1"), "hada_notion/224449821825");
+  assertEquals(
+    postCodeOf("https://blog.naver.com/PostView.naver?blogId=hada_notion&logNo=224449821825"),
+    "hada_notion/224449821825",
+  );
+  // 블로그 첫 화면은 글이 아니다.
+  assertEquals(postCodeOf("https://blog.naver.com/hada_notion"), "");
+});
+
+Deno.test("네이버 블로그: 블로그 주소에서 아이디를 꺼낸다", () => {
+  assertEquals(naverBlogIdOf("https://blog.naver.com/hada_notion"), "hada_notion");
+  assertEquals(naverBlogIdOf("https://m.blog.naver.com/hada_notion/"), "hada_notion");
+  assertEquals(naverBlogIdOf("https://blog.naver.com/PostList.naver?blogId=hada_notion"), "hada_notion");
+  assertEquals(naverBlogIdOf("https://blog.naver.com/PostList.naver"), "");
+  assertEquals(naverBlogIdOf("https://www.instagram.com/hada"), "");
+  assertEquals(naverBlogIdOf(""), "");
+});
+
+Deno.test("네이버 블로그: 공감·댓글·공유를 좋아요·댓글·공유로 읽고 조회수는 없다", () => {
+  assertEquals(naverBlogMetrics({ sympathyCnt: 45, commentCnt: 3, shareCnt: 0, readCount: null }), {
+    좋아요: 45,
+    댓글: 3,
+    공유: 0,
+  });
+  assertEquals(naverBlogMetrics({}), {});
+  assertEquals(contentFormatFor("naver_blog", "", "https://blog.naver.com/x/1"), "긴글");
 });
