@@ -34,6 +34,7 @@ import {
   truncate,
   importedPostTitle,
   kstDate,
+  publishedOnOrAfter,
   metricChannelOf,
   metricDelta,
   postCodeOf,
@@ -480,4 +481,11 @@ Deno.test("importedPostTitle: 첫 줄을 40자로 자르고 채널을 붙인다"
   assertEquals(importedPostTitle("\n#학원관리 #노션\n수업 중 상담 전화\n둘째 줄", "스레드"), "수업 중 상담 전화 · 스레드");
   assertEquals(importedPostTitle("", "인스타그램"), "제목 없는 게시물 · 인스타그램");
   assertEquals(importedPostTitle("가".repeat(45), "유튜브"), `${"가".repeat(40)}… · 유튜브`);
+});
+
+Deno.test("publishedOnOrAfter: 한국 시간 날짜로 비교한다", () => {
+  assertEquals(publishedOnOrAfter("2026-09-30T15:30:00Z", "2026-10-01"), true);
+  assertEquals(publishedOnOrAfter("2026-09-30T14:00:00+0000", "2026-10-01"), false);
+  assertEquals(publishedOnOrAfter("", "2026-10-01"), false);
+  assertEquals(publishedOnOrAfter("", ""), true);
 });

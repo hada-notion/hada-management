@@ -560,3 +560,11 @@ export function importedPostTitle(text: string, channelLabel: string): string {
   const head = [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
   return `${head || "제목 없는 게시물"} · ${channelLabel}`;
 }
+
+/** 게시 시각이 since(한국 시간 날짜 YYYY-MM-DD) 이후인가. since 가 비면 항상 참, 게시 시각을 모르면 거짓. */
+export function publishedOnOrAfter(publishedAt: string, since: string): boolean {
+  if (since === "") return true;
+  const ms = Date.parse(publishedAt);
+  if (!Number.isFinite(ms)) return false;
+  return kstDate(ms) >= since;
+}
