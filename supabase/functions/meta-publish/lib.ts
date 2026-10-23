@@ -673,3 +673,12 @@ export function publishedOnOrAfter(publishedAt: string, since: string): boolean 
   if (!Number.isFinite(ms)) return false;
   return kstDate(ms) >= since;
 }
+
+/** 채널 페이지 이름으로 수집 채널을 찾는다. 수집하지 않는 채널(블로그 등)이면 null. */
+export function metricChannelByLabel(label: string): MetricChannel | null {
+  const name = label.trim();
+  for (const [channel, value] of Object.entries(METRIC_CHANNEL_LABELS)) {
+    if (value === name) return channel as MetricChannel;
+  }
+  return null;
+}

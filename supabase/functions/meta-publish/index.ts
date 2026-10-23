@@ -78,6 +78,7 @@ import {
   METRIC_CHANNEL_LABELS,
   METRIC_FIELDS,
   importedPostTitle,
+  metricChannelByLabel,
   publishedOnOrAfter,
   kstDate,
   metricChannelOf,
@@ -2013,10 +2014,14 @@ async function youtubeUploads(cfg: Config, knownIds: string[]): Promise<AccountP
   return posts;
 }
 
-async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
+/** only 가 있으면 그 채널만 수집한다(채널 DB 의 버튼). 없으면 전체. */
+async function runMetrics(cfg: Config, dryRun: boolean, only: MetricChannel | null = null): Promise<Json> {
   const started = Date.now();
   const date = kstDate(started);
-  const { targets, known } = await findMetricTargets(cfg);
+  const wants = (channel: MetricChannel) => only === null || only === channel;
+  const found = await findMetricTargets(cfg);
+  const targets = found.targets.filter((t) => wants(t.channel));
+  const known = found.known;
   const logged = await loggedTotals(cfg);
   const results: CollectResult[] = [];
   const channelIds = new Map<MetricChannel, string>();
@@ -2050,7 +2055,7 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
   const current = new Map<string, Metrics>();
   const channelError = new Map<MetricChannel, string>();
 
-  if (cfg.igUserId && cfg.igToken) {
+  if (wants("instagram") && cfg.igUserId && cfg.igToken) {
     try {
       const media = await listByShortcode((after) =>
         igGet(
@@ -2076,7 +2081,7 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
     }
   }
 
-  try {
+  if (wants("threads")) try {
     const auth = await resolveThreadsAuth(cfg);
     const media = await listByShortcode((after) =>
       threadsGet(
@@ -2109,7 +2114,9 @@ async function runMetrics(cfg: Config, dryRun: boolean): Promise<Json> {
     channelError.set("threads", message(e));
   }
 
-  if (cfg.youtubeApiKey === "") {
+  if (!wants("youtube")) {
+    // 이번 실행은 다른 채널만 수집한다.
+  } else if (cfg.youtubeApiKey === "") {
     if (targets.some((t) => t.channel === "youtube")) {
       channelError.set("youtube", "환경값 YOUTUBE_API_KEY 가 없어 유튜브는 건너뜁니다.");
     }
@@ -2256,7 +2263,11 @@ Deno.serve(async (req) => {
   // 성과 수집. GitHub Actions 는 ?wait=1 로 결과를 기다리고,
   // 노션 버튼은 10초 안에 답을 받아야 하므로 접수(202)만 돌려주고 뒤에서 수집한다.
   if (reqUrl.searchParams.get("metrics") === "1") {
-    const metricsTask = runMetrics(cfg, dryRun);
+    // 채널 DB 의 버튼으로 부르면 웹훅 본문에 그 채널 페이지가 실려 온다. 그 채널만 수집한다.
+    const data = (payload.data ?? {}) as Json;
+    const only = data.object === "page" ? metricChannelByLabel(pageTitle((data.properties ?? {}) as Json)) : null;
+    console.log("성과 수집 채널", only ?? "(전체)");
+    const metricsTask = runMetrics(cfg, dryRun, only);
     const runtime = (globalThis as {
       EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
     }).EdgeRuntime;
