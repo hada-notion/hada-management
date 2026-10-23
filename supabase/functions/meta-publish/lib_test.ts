@@ -37,6 +37,15 @@ import {
   metricDelta,
   postCodeOf,
   readInsights,
+  isShortsFormat,
+  splitYoutube,
+  truncateBytes,
+  youtubeAuthorizeUrl,
+  youtubeDescription,
+  youtubePrivacy,
+  youtubeTitle,
+  youtubeWatchUrl,
+  YOUTUBE_SCOPES,
 } from "./lib.ts";
 
 function assertEquals(actual: unknown, expected: unknown, label = "값이 다릅니다") {
@@ -473,4 +482,57 @@ Deno.test("readInsights: values 와 total_value 둘 다 읽는다", () => {
 Deno.test("kstDate: 한국 시간 날짜", () => {
   assertEquals(kstDate(Date.parse("2026-10-22T15:30:00Z")), "2026-10-23");
   assertEquals(kstDate(Date.parse("2026-10-22T14:59:00Z")), "2026-10-22");
+});
+
+Deno.test("youtubeAuthorizeUrl: 오프라인 접근과 state 를 붙인다", () => {
+  const url = new URL(youtubeAuthorizeUrl("id.apps", "https://x.supabase.co/functions/v1/meta-publish", YOUTUBE_SCOPES));
+  assertEquals(url.searchParams.get("access_type"), "offline");
+  assertEquals(url.searchParams.get("prompt"), "consent");
+  assertEquals(url.searchParams.get("state"), "youtube");
+  assertEquals(url.searchParams.get("scope"), YOUTUBE_SCOPES.join(" "));
+});
+
+Deno.test("isShortsFormat: 세로 영상만 Shorts", () => {
+  assertEquals(isShortsFormat("숏폼(9:16)"), true);
+  assertEquals(isShortsFormat("영상-세로(9:16)"), true);
+  assertEquals(isShortsFormat("롱폼(16:9)"), false);
+});
+
+Deno.test("youtubeTitle: 유튜브 제목 우선, < > 와 줄바꿈 정리, 100자", () => {
+  assertEquals(youtubeTitle("", "시험 <후> 퇴원\n릴스"), "시험 후 퇴원 릴스");
+  assertEquals(youtubeTitle("직접 쓴 제목", "페이지"), "직접 쓴 제목");
+  assertEquals(youtubeTitle("", ""), "제목 없음");
+  assertEquals(youtubeTitle("가".repeat(150), "").length, 100);
+});
+
+Deno.test("youtubeDescription: Shorts 태그를 한 번만 붙이고 바이트 한도를 지킨다", () => {
+  assertEquals(youtubeDescription("본문", true), "본문\n\n#Shorts");
+  assertEquals(youtubeDescription("본문 #shorts", true), "본문 #shorts");
+  assertEquals(youtubeDescription("", true), "#Shorts");
+  assertEquals(youtubeDescription("본문", false), "본문");
+  const long = youtubeDescription("가".repeat(3000), false);
+  assertEquals(new TextEncoder().encode(long).length <= 5000, true);
+});
+
+Deno.test("truncateBytes: 짧으면 그대로", () => {
+  assertEquals(truncateBytes("abc", 10), "abc");
+  assertEquals(new TextEncoder().encode(truncateBytes("가나다라", 9)).length <= 9, true);
+});
+
+Deno.test("youtubePrivacy: 모르는 값은 공개", () => {
+  assertEquals(youtubePrivacy(""), "public");
+  assertEquals(youtubePrivacy("비공개"), "private");
+  assertEquals(youtubePrivacy("unlisted"), "unlisted");
+});
+
+Deno.test("youtubeWatchUrl: Shorts 와 일반 영상 주소", () => {
+  assertEquals(youtubeWatchUrl("abc", true), "https://youtube.com/shorts/abc");
+  assertEquals(youtubeWatchUrl("abc", false), "https://www.youtube.com/watch?v=abc");
+});
+
+Deno.test("splitYoutube: 연결돼 있고 영상일 때만 업로드로 뺀다", () => {
+  assertEquals(splitYoutube(["인스타그램", "유튜브"], true, "video"), { youtube: true, rest: ["인스타그램"] });
+  assertEquals(splitYoutube(["유튜브"], false, "video"), { youtube: false, rest: ["유튜브"] });
+  assertEquals(splitYoutube(["유튜브", "블로그"], true, "carousel"), { youtube: false, rest: ["유튜브", "블로그"] });
+  assertEquals(splitYoutube(["스레드"], true, "video"), { youtube: false, rest: ["스레드"] });
 });

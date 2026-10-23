@@ -546,3 +546,108 @@ export function readInsights(response: Record<string, any>): Record<string, numb
 export function kstDate(nowMs: number): string {
   return new Date(nowMs + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
+
+// ---------- 유튜브 ----------
+
+/** 배포 채널 옵션 이름. 채널 DB 페이지 이름과 같다. */
+export const YOUTUBE_CHANNEL = "유튜브";
+
+/** 업로드는 youtube.upload, 채널 확인(인증 완료 화면)과 이후 성과 조회는 youtube.readonly 로 한다. */
+export const YOUTUBE_SCOPES = [
+  "https://www.googleapis.com/auth/youtube.upload",
+  "https://www.googleapis.com/auth/youtube.readonly",
+];
+
+/** 구글 콜백과 스레드 콜백은 같은 주소로 돌아온다. state 값으로 구분한다. */
+export const YOUTUBE_OAUTH_STATE = "youtube";
+
+export const YOUTUBE_TITLE_LIMIT = 100;
+/** 설명 한도는 글자가 아니라 UTF-8 바이트(5000)다. 한글은 한 글자에 3바이트라 약 1600자다. */
+export const YOUTUBE_DESCRIPTION_BYTES = 5000;
+
+/**
+ * 구글 승인 화면 주소.
+ * access_type=offline 과 prompt=consent 를 같이 보내야 매번 refresh token 을 돌려준다.
+ */
+export function youtubeAuthorizeUrl(clientId: string, redirectUri: string, scopes: string[]): string {
+  const params = new URLSearchParams({
+    client_id: (clientId ?? "").trim(),
+    redirect_uri: (redirectUri ?? "").trim(),
+    response_type: "code",
+    scope: scopes.join(" "),
+    access_type: "offline",
+    prompt: "consent",
+    include_granted_scopes: "true",
+    state: YOUTUBE_OAUTH_STATE,
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+/** 세로 영상 형식이면 Shorts 로 본다. 유튜브는 세로·3분 이하 영상을 Shorts 로 분류한다. */
+export function isShortsFormat(format: string): boolean {
+  return ["숏폼(9:16)", "영상-세로(9:16)"].includes((format ?? "").trim());
+}
+
+/** UTF-8 바이트 한도에 맞춰 자른다. 글자 중간에서 끊지 않는다. */
+export function truncateBytes(text: string, limit: number): string {
+  const encoder = new TextEncoder();
+  if (encoder.encode(text).length <= limit) return text;
+  let out = "";
+  let used = 0;
+  const ellipsis = encoder.encode("…").length;
+  for (const ch of text) {
+    const size = encoder.encode(ch).length;
+    if (used + size + ellipsis > limit) break;
+    out += ch;
+    used += size;
+  }
+  return `${out.trimEnd()}…`;
+}
+
+/** 유튜브는 제목·설명에 < > 가 있으면 업로드를 거절한다. */
+function stripAngles(text: string): string {
+  return (text ?? "").replace(/[<>]/g, "");
+}
+
+/**
+ * 영상 제목. '유튜브 제목'이 있으면 그것을, 없으면 페이지 이름을 쓴다.
+ * 줄바꿈은 한 칸으로 바꾸고 100자에서 자른다. 제목이 비면 업로드가 거절되므로 기본값을 둔다.
+ */
+export function youtubeTitle(custom: string, pageTitle: string): string {
+  const pick = (custom ?? "").trim() !== "" ? custom : pageTitle;
+  const clean = stripAngles(pick).replace(/\s+/g, " ").trim();
+  return truncate(clean === "" ? "제목 없음" : clean, YOUTUBE_TITLE_LIMIT);
+}
+
+/** 영상 설명. 발행 문구(캡션 + 고정 멘트)를 쓰고, Shorts 면 #Shorts 를 붙인다. */
+export function youtubeDescription(caption: string, shorts: boolean): string {
+  let text = stripAngles(caption).trim();
+  if (shorts && !/#shorts\b/i.test(text)) text = text === "" ? "#Shorts" : `${text}\n\n#Shorts`;
+  return truncateBytes(text, YOUTUBE_DESCRIPTION_BYTES);
+}
+
+/** 공개 범위. 모르는 값이면 공개로 둔다. */
+export function youtubePrivacy(value: string): "public" | "unlisted" | "private" {
+  const key = (value ?? "").trim().toLowerCase();
+  if (["private", "비공개"].includes(key)) return "private";
+  if (["unlisted", "일부공개", "일부 공개"].includes(key)) return "unlisted";
+  return "public";
+}
+
+export function youtubeWatchUrl(videoId: string, shorts: boolean): string {
+  return shorts ? `https://youtube.com/shorts/${videoId}` : `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+/**
+ * '배포 채널'에서 유튜브를 자동 업로드로 뺄지 정한다.
+ * 유튜브 연결 설정이 있고 영상 형식일 때만 업로드한다. 아니면 예전처럼 게시물 기록만 만든다.
+ */
+export function splitYoutube(
+  deployChannels: string[],
+  enabled: boolean,
+  kind: MediaKind | null,
+): { youtube: boolean; rest: string[] } {
+  const picked = deployChannels.some((channel) => channel.trim() === YOUTUBE_CHANNEL);
+  if (!picked || !enabled || kind !== "video") return { youtube: false, rest: deployChannels };
+  return { youtube: true, rest: deployChannels.filter((channel) => channel.trim() !== YOUTUBE_CHANNEL) };
+}
