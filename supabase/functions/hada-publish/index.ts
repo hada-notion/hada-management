@@ -1093,6 +1093,8 @@ const RESULT_PROP: Record<Channel, string> = {
 };
 // 유튜브는 배포 채널로만 요청하고 ⚪ 대기를 쓰지 않는다. 함수가 🔄 작업중 → ✅ 완료/⚠️ 오류만 기록한다.
 const YOUTUBE_RESULT_PROP = "유튜브 상태";
+// 산출물 DB `상태` 선택지: 기획 → 게시대기 → 게시완료 (보류). 함수는 게시완료만 쓴다.
+const CONTENT_STATUS_PUBLISHED = "게시완료";
 
 // 채널 상태 값. 학원관리 다른 DB 와 같은 5단계를 쓴다.
 const STATUS_WAITING = "⚪ 대기";
@@ -1717,8 +1719,10 @@ async function publishRow(
   }
 
   if (succeeded) {
+    // 한 채널이라도 올라갔으면 산출물 상태를 '게시완료'로 옮긴다(블로그처럼 사람이 올리는 채널은 Aside가 옮긴다).
     await updatePage(cfg, pageId, {
       "발행 시각": { date: { start: new Date().toISOString() } },
+      "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
     });
   }
 
@@ -2019,7 +2023,7 @@ async function createContentForPost(cfg: Config, post: AccountPost): Promise<str
       properties: {
         "이름": { title: [{ type: "text", text: { content: postHeadline(post.text) || `${label} 게시물` } }] },
         "유형": { select: { name: "컨텐츠" } },
-        "상태": { select: { name: "게시" } },
+        "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
         ...(format ? { "형식": { select: { name: format } } } : {}),
         "배포 채널": { multi_select: [{ name: label }] },
         ...(post.text.trim() ? { "캡션": { rich_text: [{ type: "text", text: { content: truncate(post.text, 2000) } }] } } : {}),
