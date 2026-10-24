@@ -1095,6 +1095,9 @@ const RESULT_PROP: Record<Channel, string> = {
 const YOUTUBE_RESULT_PROP = "유튜브 상태";
 // 산출물 DB `상태` 선택지: 기획 → 게시대기 → 게시완료 (보류). 함수는 게시완료만 쓴다.
 const CONTENT_STATUS_PUBLISHED = "게시완료";
+// 사람이 직접 올리는 채널의 기록을 만들면 '게시대기'로 둔다. Aside가 '블로그 대기' 보기에서 가져가 올린 뒤 '게시완료'로 바꾼다.
+const CONTENT_STATUS_WAITING = "게시대기";
+const MANUAL_PUBLISH_CHANNELS = new Set(["블로그"]);
 
 // 채널 상태 값. 학원관리 다른 DB 와 같은 5단계를 쓴다.
 const STATUS_WAITING = "⚪ 대기";
@@ -1243,7 +1246,7 @@ async function findChannelPageId(cfg: Config, name: string): Promise<string> {
   return rows[0].id as string;
 }
 
-type PostRecord = { channel: string; url: string; created: boolean };
+type PostRecord = { channel: string; url: string; created: boolean; linked: boolean };
 
 /** 이 산출물·채널의 게시물 기록들. */
 async function findPostRecords(cfg: Config, pageId: string, channelId: string): Promise<Json[]> {
@@ -1330,11 +1333,12 @@ async function createPostRecords(
       const channelId = await findChannelPageId(cfg, channel);
       const existing = await findPostRecords(cfg, pageId, channelId);
       if (existing.length > 0) {
-        records.push({ channel, url: (existing[0].url as string) ?? "", created: false });
+        const linked = Boolean(((existing[0].properties as Json)?.["게시 링크"] as Json)?.url);
+        records.push({ channel, url: (existing[0].url as string) ?? "", created: false, linked });
         continue;
       }
       const page = await createPostPage(cfg, pageId, title, channel, channelId);
-      records.push({ channel, url: (page.url as string) ?? "", created: true });
+      records.push({ channel, url: (page.url as string) ?? "", created: true, linked: false });
       console.log("게시물 기록 생성", pageId, channel, page.url ?? "");
     } catch (e) {
       failures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}`);
@@ -1470,6 +1474,16 @@ async function publishRow(
   let recordFailures: string[] = [];
   if (recordChannels.length > 0 && !dryRun) {
     ({ records, failures: recordFailures } = await createPostRecords(cfg, pageId, props, recordChannels));
+  }
+  // 블로그처럼 사람이 올리는 채널이 아직 안 올라갔으면(기록에 게시 링크 없음) 산출물 상태를 '게시대기'로 둔다.
+  // 그래야 Aside의 '블로그 대기' 보기(상태=게시대기)에 뜬다. 이 경우 아래 자동 발행이 성공해도 '게시완료'로 넘기지 않는다.
+  const manualPending = records.some((record) => MANUAL_PUBLISH_CHANNELS.has(record.channel) && !record.linked);
+  if (manualPending) {
+    try {
+      await updatePage(cfg, pageId, { "상태": { select: { name: CONTENT_STATUS_WAITING } } });
+    } catch (e) {
+      console.error("게시대기 상태 기록 실패", pageId, message(e));
+    }
   }
 
   // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
@@ -1719,10 +1733,11 @@ async function publishRow(
   }
 
   if (succeeded) {
-    // 한 채널이라도 올라갔으면 산출물 상태를 '게시완료'로 옮긴다(블로그처럼 사람이 올리는 채널은 Aside가 옮긴다).
+    // 한 채널이라도 올라갔으면 산출물 상태를 '게시완료'로 옮긴다.
+    // 블로그처럼 사람이 올릴 채널이 남아 있으면 '게시대기'를 유지하고, Aside가 올린 뒤 '게시완료'로 바꾼다.
     await updatePage(cfg, pageId, {
       "발행 시각": { date: { start: new Date().toISOString() } },
-      "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
+      ...(manualPending ? {} : { "상태": { select: { name: CONTENT_STATUS_PUBLISHED } } }),
     });
   }
 
