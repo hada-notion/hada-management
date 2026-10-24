@@ -24,7 +24,7 @@
 //
 // 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
 // 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
-// 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'와 '실시간 처리 상태' 수식으로 확인한다.
+// 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'·'유튜브 상태'와 '실시간 처리 상태' 수식으로 확인한다.
 // 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
 //
 // 오류 문구에는 비밀값이 섞여 들어올 수 있다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
@@ -1091,6 +1091,8 @@ const RESULT_PROP: Record<Channel, string> = {
   "인스타그램": "인스타그램 상태",
   "스레드": "스레드 상태",
 };
+// 유튜브는 배포 채널로만 요청하고 ⚪ 대기를 쓰지 않는다. 함수가 🔄 작업중 → ✅ 완료/⚠️ 오류만 기록한다.
+const YOUTUBE_RESULT_PROP = "유튜브 상태";
 
 // 채널 상태 값. 학원관리 다른 DB 와 같은 5단계를 쓴다.
 const STATUS_WAITING = "⚪ 대기";
@@ -1580,15 +1582,21 @@ async function publishRow(
   let succeeded = false;
 
   // 유튜브는 업로드만 하면 처리를 기다리지 않아 금방 끝난다. 영상 처리를 기다리는 메타 채널보다 먼저 해서
-  // 함수 실행 한도에 밀려 잘리지 않게 한다. 채널 상태 칸이 없으므로 '이미 올렸는지'는 게시물 기록의 게시 링크로 본다.
+  // 함수 실행 한도에 밀려 잘리지 않게 한다. '이미 올렸는지'는 게시물 기록의 게시 링크로 본다(상태 칸보다 믿을 만하다).
   if (youtube && plan.kind === "video") {
     if (!(await claimJob(cfg, pageId, YOUTUBE_CHANNEL))) {
       results[YOUTUBE_CHANNEL] = "다른 실행이 처리 중이라 건너뛰었습니다.";
     } else {
       try {
+        await updatePage(cfg, pageId, {
+          [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_WORKING } },
+        });
         if (await youtubeAlreadyPosted(cfg, pageId)) {
           doneChannels.push(YOUTUBE_CHANNEL);
           results[YOUTUBE_CHANNEL] = "이미 올린 기록(게시 링크)이 있어 건너뛰었습니다.";
+          await updatePage(cfg, pageId, {
+            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
+          });
         } else {
           const shorts = isShortsFormat(format);
           const file = await downloadMedia(plan.url, "video");
@@ -1600,6 +1608,9 @@ async function publishRow(
           );
           const link = youtubeWatchUrl(video.id, shorts);
           succeeded = true;
+          await updatePage(cfg, pageId, {
+            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
+          });
           results[YOUTUBE_CHANNEL] = link;
           console.log("hada-publish 완료", pageId, YOUTUBE_CHANNEL, link, video.privacy);
           if (video.privacy !== "" && video.privacy !== cfg.youtubePrivacy) {
@@ -1621,6 +1632,7 @@ async function publishRow(
         results[YOUTUBE_CHANNEL] = detail;
         try {
           await updatePage(cfg, pageId, {
+            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_ERROR } },
             "마지막 오류": {
               rich_text: [{ type: "text", text: { content: truncate(`${YOUTUBE_CHANNEL} — ${detail}`, 1800) } }],
             },
@@ -1984,39 +1996,21 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
   return { targets, known, contentByKey, unlinked };
 }
 
-/** 산출물 DB 의 인스타그램 링크·스레드 링크로 채널:코드 → 산출물 id 를 더한다(게시물 DB 에서 이미 찾은 것은 그대로). */
-async function loadContentLinks(cfg: Config, contentByKey: Map<string, string>): Promise<void> {
-  const rows = await queryAll(cfg, cfg.contentDataSourceId, {
-    or: [
-      { property: "인스타그램 링크", url: { is_not_empty: true } },
-      { property: "스레드 링크", url: { is_not_empty: true } },
-    ],
-  });
-  for (const row of rows) {
-    const props = (row.properties ?? {}) as Json;
-    for (const name of ["인스타그램 링크", "스레드 링크"]) {
-      const link = String(props[name]?.url ?? "").trim();
-      const channel = metricChannelOf(link);
-      const code = postCodeOf(link);
-      if (channel === null || code === "") continue;
-      const key = `${channel}:${code}`;
-      if (!contentByKey.has(key)) contentByKey.set(key, row.id);
-    }
-  }
-}
-
 /**
  * 산출물이 없는 게시물로 산출물을 만든다. 이미 올라간 글이므로 상태는 게시, 그 채널 상태는 ✅ 완료로 둬서
- * 누가 배포 버튼을 눌러도 다시 올리지 않게 한다. 캡션에는 게시물 글을 그대로 담는다.
+ * 누가 배포 버튼을 눌러도 다시 올리지 않게 한다. 링크는 게시물 기록에만 둔다. 캡션에는 게시물 글을 그대로 담는다.
  */
 async function createContentForPost(cfg: Config, post: AccountPost): Promise<string> {
   const label = METRIC_CHANNEL_LABELS[post.channel];
   const format = contentFormatFor(post.channel, post.mediaType, post.link);
-  const channelLink: Json = post.channel === "instagram"
-    ? { "인스타그램 링크": { url: post.link }, "인스타그램 상태": { select: { name: "✅ 완료" } } }
+  const statusProp = post.channel === "instagram"
+    ? RESULT_PROP["인스타그램"]
     : post.channel === "threads"
-    ? { "스레드 링크": { url: post.link }, "스레드 상태": { select: { name: "✅ 완료" } } }
-    : {};
+    ? RESULT_PROP["스레드"]
+    : post.channel === "youtube"
+    ? YOUTUBE_RESULT_PROP
+    : "";
+  const channelStatus: Json = statusProp ? { [statusProp]: { select: { name: STATUS_DONE } } } : {};
   const page = await notion(cfg, "/pages", {
     method: "POST",
     headers: { "Notion-Version": POST_API_VERSION },
@@ -2030,7 +2024,7 @@ async function createContentForPost(cfg: Config, post: AccountPost): Promise<str
         "배포 채널": { multi_select: [{ name: label }] },
         ...(post.text.trim() ? { "캡션": { rich_text: [{ type: "text", text: { content: truncate(post.text, 2000) } }] } } : {}),
         ...(post.publishedAt ? { "발행 시각": { date: { start: post.publishedAt } } } : {}),
-        ...channelLink,
+        ...channelStatus,
       },
     }),
   });
@@ -2231,15 +2225,10 @@ async function runMetrics(
   const channelIds = new Map<MetricChannel, string>();
   const imported: string[] = [];
   const contents = { linked: [] as MetricChannel[], created: [] as MetricChannel[], errors: [] as string[] };
-  let contentLinksLoaded = false;
 
-  // 게시물에 붙일 산출물: 같은 링크의 산출물이 있으면 그것, 없으면 새로 만든다(dryRun 이면 만들지 않는다).
+  // 게시물에 붙일 산출물: 같은 게시물이 연결된 산출물이 있으면 그것, 없으면 새로 만든다(dryRun 이면 만들지 않는다).
   const resolveContent = async (post: AccountPost): Promise<{ id: string; created: boolean }> => {
     const key = `${post.channel}:${post.code}`;
-    if (!contentLinksLoaded) {
-      await loadContentLinks(cfg, found.contentByKey);
-      contentLinksLoaded = true;
-    }
     const existing = found.contentByKey.get(key);
     if (existing) return { id: existing, created: false };
     const id = dryRun ? "" : await createContentForPost(cfg, post);
