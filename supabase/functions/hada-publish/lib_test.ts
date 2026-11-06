@@ -63,6 +63,7 @@ import {
   youtubeDescription,
   youtubePrivacy,
   youtubeTitle,
+  youtubeVideoIdOf,
   youtubeWatchUrl,
   YOUTUBE_SCOPES,
 } from "./lib.ts";
@@ -549,6 +550,14 @@ Deno.test("youtubePrivacy: 모르는 값은 공개", () => {
 Deno.test("youtubeWatchUrl: Shorts 와 일반 영상 주소", () => {
   assertEquals(youtubeWatchUrl("abc", true), "https://youtube.com/shorts/abc");
   assertEquals(youtubeWatchUrl("abc", false), "https://www.youtube.com/watch?v=abc");
+});
+
+Deno.test("youtubeVideoIdOf: 게시 링크에서 영상 ID", () => {
+  assertEquals(youtubeVideoIdOf("https://youtube.com/shorts/NPBHWu7R2WM"), "NPBHWu7R2WM");
+  assertEquals(youtubeVideoIdOf("https://www.youtube.com/watch?v=abc_DEF-12"), "abc_DEF-12");
+  assertEquals(youtubeVideoIdOf("https://www.youtube.com/watch?feature=x&v=abcdefg"), "abcdefg");
+  assertEquals(youtubeVideoIdOf("https://youtu.be/abcdefg"), "abcdefg");
+  assertEquals(youtubeVideoIdOf("https://www.threads.com/@x/post/abc"), "");
 });
 
 Deno.test("splitYoutube: 연결돼 있고 영상일 때만 업로드로 뺀다", () => {
