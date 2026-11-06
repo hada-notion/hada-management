@@ -1,15 +1,18 @@
 // META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 발행한다.
 //
-// 발행 소스는 콘텐츠 DB 의 '형식'으로 정한다.
-//   카드뉴스    → 컷(프롬프트)의 미리보기 이미지 캐러셀
-//   이미지      → 콘텐츠 '미리보기' 한 장
-//   숏폼(9:16)  → 콘텐츠 '미리보기' 영상 (릴스)
-//   롱폼(16:9)  → 콘텐츠 '미리보기' 영상 (릴스)
+// 콘텐츠 DB 에서 올리는 칸은 넷이다: 타이틀 · 섬네일 · 콘텐츠(파일) · 본문.
+// 발행 소스는 '형식'으로 정한다.
+//   카드뉴스    → '콘텐츠' 이미지 캐러셀(칸에 넣은 순서대로)
+//   이미지      → '콘텐츠' 한 장
+//   숏폼(9:16)  → '콘텐츠' 영상 (릴스)
+//   롱폼(16:9)  → '콘텐츠' 영상 (릴스)
 //   짧은글      → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
 //   긴글        → 자동 발행하지 않는다(블로그용).
 //   예전 이름(영상-세로(9:16)·영상-가로(16:9)·카피)도 그대로 받는다.
+// '타이틀'은 유튜브 제목, '섬네일'은 유튜브(일반 영상) 섬네일과 인스타그램 릴스 커버로 쓴다.
+// 스레드는 '하위 항목'을 만든 순서대로 바로 앞 글의 답글로 이어 단다. 하위 항목마다 게시물 기록이 따로 생긴다.
 //
-// '캡션'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '짧은글' 형식뿐이다).
+// '본문'은 선택이다. 비면 글 없이 미디어만 올린다(글을 요구하는 건 '짧은글' 형식뿐이다).
 // 그래서 이미지·캐러셀 발행에서는 caption·text 파라미터를 아예 빼고 보낸다.
 //
 // 호출: POST /functions/v1/hada-publish   (헤더 x-admin-key 필요)
@@ -72,6 +75,9 @@ import {
   readTarget,
   resolveRedirectUri,
   sortCuts,
+  sortByCreated,
+  contentFieldName,
+  replyMediaKind,
   optionalText,
   summarizeApiError,
   threadsLength,
@@ -110,7 +116,7 @@ import {
   YOUTUBE_OAUTH_STATE,
   YOUTUBE_SCOPES,
 } from "./lib.ts";
-import type { MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
+import type { ContentField, MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
@@ -320,6 +326,15 @@ function relationIds(prop: Json | undefined): string[] {
   return ((prop?.relation ?? []) as Json[]).map((item) => item.id);
 }
 
+/** 콘텐츠 페이지의 올리는 칸(타이틀·섬네일·콘텐츠·본문). 예전 칸 이름도 읽는다. */
+function contentField(props: Json, field: ContentField): Json | undefined {
+  return props[contentFieldName(Object.keys(props), field)];
+}
+
+function contentFiles(props: Json, field: ContentField = "file"): any[] {
+  return (contentField(props, field)?.files ?? []) as any[];
+}
+
 function cutOrder(prop: Json | undefined): number {
   return typeof prop?.number === "number" ? prop.number : Number.POSITIVE_INFINITY;
 }
@@ -364,7 +379,7 @@ async function downloadMedia(sourceUrl: string, role: MediaRole): Promise<MediaF
   if (role === "video") {
     const detected = detectVideoType(bytes);
     if (!detected && !headerType.startsWith("video/")) {
-      throw new Error(`영상 파일이 아닙니다(${detail}). '형식'과 '미리보기' 파일을 확인하세요.`);
+      throw new Error(`영상 파일이 아닙니다(${detail}). '형식'과 '콘텐츠' 파일을 확인하세요.`);
     }
     ext = detected ?? extensionFor(headerType, sourceUrl);
     if (!["mp4", "mov", "webm"].includes(ext)) {
@@ -385,7 +400,7 @@ async function downloadMedia(sourceUrl: string, role: MediaRole): Promise<MediaF
 async function uploadMedia(
   cfg: Config,
   pageId: string,
-  index: number,
+  index: number | string,
   sourceUrl: string,
   role: MediaRole,
 ): Promise<string> {
@@ -394,7 +409,9 @@ async function uploadMedia(
   }
 
   const { bytes, ext, contentType } = await downloadMedia(sourceUrl, role);
-  const path = `${pageId}/${String(index + 1).padStart(2, "0")}.${ext}`;
+  // 숫자는 콘텐츠 파일 순번(01, 02 …), 글자는 섬네일처럼 이름을 정해 둔 파일이다.
+  const name = typeof index === "number" ? String(index + 1).padStart(2, "0") : index;
+  const path = `${pageId}/${name}.${ext}`;
   const upload = await fetch(`${cfg.storageUrl}/storage/v1/object/${cfg.bucket}/${path}`, {
     method: "POST",
     headers: {
@@ -559,12 +576,18 @@ async function publishInstagram(cfg: Config, imageUrls: string[], caption: strin
  * 처리 시간이 길어 함수 한도에 걸리면 여기서 멈추는데, 그때는 media_publish 를 부르지 않았으므로
  * 다시 실행해도 같은 글이 두 번 올라가지 않는다.
  */
-async function publishInstagramReel(cfg: Config, videoUrl: string, caption: string): Promise<string> {
+async function publishInstagramReel(
+  cfg: Config,
+  videoUrl: string,
+  caption: string,
+  coverUrl = "",
+): Promise<string> {
   const text = truncate(caption, IG_CAPTION_LIMIT);
   const container = await igPost(cfg, `${cfg.igUserId}/media`, {
     media_type: "REELS",
     video_url: videoUrl,
     ...optionalText("caption", text),
+    ...optionalText("cover_url", coverUrl),
     share_to_feed: "true",
   });
   await waitForIgContainer(cfg, container.id, IG_VIDEO_POLL_ATTEMPTS, IG_VIDEO_POLL_INTERVAL_MS);
@@ -811,7 +834,7 @@ const threadsGet = (cfg: Config, auth: ThreadsAuth, path: string) =>
   threadsFetch(cfg, auth.token, path);
 
 /**
- * 발행 소스. 형식에 따라 컷 이미지 캐러셀 / 미리보기 한 장 / 미리보기 영상 / 글만 중 하나가 된다.
+ * 발행 소스. 형식에 따라 '콘텐츠' 이미지(한 장 또는 캐러셀) / '콘텐츠' 영상 / 글만 중 하나가 된다.
  * 인스타그램은 글만 올리는 걸 지원하지 않으므로 text 는 스레드 전용이다.
  */
 type MediaPlan =
@@ -857,6 +880,7 @@ async function createThreadsCarousel(
   auth: ThreadsAuth,
   children: string[],
   text: string,
+  replyToId = "",
 ): Promise<Json> {
   return await retryWhen(
     THREADS_CAROUSEL_CREATE_ATTEMPTS,
@@ -867,6 +891,7 @@ async function createThreadsCarousel(
         media_type: "CAROUSEL",
         children: children.join(","),
         ...optionalText("text", text),
+        ...optionalText("reply_to_id", replyToId),
       }),
     "스레드 캐러셀 컨테이너",
   );
@@ -887,27 +912,32 @@ async function publishThreadsContainer(
   );
 }
 
+type ThreadsPosted = { id: string; link: string };
+
+/** 스레드에 올린다. replyToId 가 있으면 그 글의 답글로 단다(하위 항목 이어 쓰기). */
 async function publishThreads(
   cfg: Config,
   auth: ThreadsAuth,
   media: MediaPlan,
   caption: string,
-): Promise<string> {
+  replyToId = "",
+): Promise<ThreadsPosted> {
   const text = truncate(caption, THREADS_TEXT_LIMIT);
   const uid = auth.userId;
+  const textParams = { ...optionalText("text", text), ...optionalText("reply_to_id", replyToId) };
 
   let containerId: string;
   if (media.kind === "text") {
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "TEXT",
-      ...optionalText("text", text),
+      ...textParams,
     });
     containerId = container.id;
   } else if (media.kind === "video") {
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "VIDEO",
       video_url: media.url,
-      ...optionalText("text", text),
+      ...textParams,
     });
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
@@ -915,7 +945,7 @@ async function publishThreads(
     const container = await threadsPost(cfg, auth, `${uid}/threads`, {
       media_type: "IMAGE",
       image_url: media.urls[0],
-      ...optionalText("text", text),
+      ...textParams,
     });
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
@@ -933,14 +963,14 @@ async function publishThreads(
     console.log("스레드 자식 컨테이너", children.length, "개 생성");
     // 부모를 만들기 전에 자식들이 처리를 마쳐야 한다. 건너뛰면 4279004 로 거절당한다.
     await Promise.all(children.map((id) => waitForThreadsContainer(cfg, auth, id)));
-    const container = await createThreadsCarousel(cfg, auth, children, text);
+    const container = await createThreadsCarousel(cfg, auth, children, text, replyToId);
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
   }
 
   const published = await publishThreadsContainer(cfg, auth, containerId);
   const info = await threadsGet(cfg, auth, `${published.id}?fields=permalink`);
-  return info.permalink ?? "";
+  return { id: String(published.id ?? ""), link: info.permalink ?? "" };
 }
 
 // ---------- 유튜브 ----------
@@ -1075,6 +1105,27 @@ async function uploadYoutube(
   if (!put.ok) throw apiError(cfg, "유튜브 업로드", put.status, text);
   const video = JSON.parse(text) as Json;
   return { id: String(video.id ?? ""), privacy: String(video.status?.privacyStatus ?? "") };
+}
+
+const YOUTUBE_THUMBNAIL_URL = "https://www.googleapis.com/upload/youtube/v3/thumbnails/set";
+const YOUTUBE_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 올린 영상에 '섬네일' 이미지를 붙인다. 쇼츠는 API 로 섬네일을 바꿀 수 없어 부르지 않는다.
+ * 채널이 전화번호 인증을 마치지 않았으면 유튜브가 거절한다. 영상은 이미 올라갔으므로 호출부는 안내로만 남긴다.
+ */
+async function setYoutubeThumbnail(cfg: Config, videoId: string, imageUrl: string): Promise<void> {
+  const image = await downloadMedia(imageUrl, "image");
+  if (image.bytes.byteLength > YOUTUBE_THUMBNAIL_MAX_BYTES) {
+    throw new Error(`섬네일이 2MB를 넘습니다(${Math.ceil(image.bytes.byteLength / 1024)}KB). 줄여서 유튜브 스튜디오에서 바꿔주세요.`);
+  }
+  const accessToken = await youtubeAccessToken(cfg);
+  const res = await fetch(`${YOUTUBE_THUMBNAIL_URL}?videoId=${encodeURIComponent(videoId)}&uploadType=media`, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": image.contentType },
+    body: image.bytes,
+  });
+  if (!res.ok) throw apiError(cfg, "유튜브 섬네일", res.status, await res.text());
 }
 
 /** 이 콘텐츠의 유튜브 게시물 기록 중 게시 링크가 있는 것이 있으면 이미 올린 것으로 본다. */
@@ -1381,11 +1432,14 @@ async function createPostRecords(
 
 // ---------- 발행 ----------
 
-/** 컷(프롬프트)에 연결된 컷들의 미리보기 이미지를 컷 순서대로 모은다. */
+/**
+ * 예전 방식: 컷(프롬프트)에 연결된 컷들의 미리보기 이미지를 컷 순서대로 모은다.
+ * 카드뉴스 이미지를 '콘텐츠' 칸으로 옮기는 동안만 쓴다. '콘텐츠' 칸에 이미지가 있으면 그쪽이 먼저다.
+ */
 async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> {
   const cutIds = relationIds(props["컷(프롬프트)"]);
   if (cutIds.length === 0) {
-    throw new Error("'컷(프롬프트)' 관계가 비어 있습니다. 발행할 컷을 먼저 연결하세요.");
+    throw new Error("'콘텐츠'에 이미지가 없습니다. 카드뉴스 이미지를 순서대로 올려주세요.");
   }
   const cuts: { pageId: string; order: number; files: any[] }[] = [];
   for (const cutId of cutIds) {
@@ -1405,37 +1459,116 @@ async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> 
   return sourceUrls;
 }
 
-/** 콘텐츠 페이지의 '미리보기' 파일. 영상·이미지·짧은글처럼 한 덩어리인 형식에서 쓴다. */
-function previewFiles(props: Json): any[] {
-  return (props["미리보기"]?.files ?? []) as any[];
-}
-
 /**
  * '형식'에 따라 발행 소스를 정한다.
- * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 짧은글은 글만 올린다.
+ * 카드뉴스는 '콘텐츠' 이미지 캐러셀(넣은 순서대로), 이미지는 한 장, 영상은 '콘텐츠' 영상, 짧은글은 글만 올린다.
  */
 async function collectSources(cfg: Config, props: Json, kind: MediaKind): Promise<MediaPlan> {
+  const files = contentFiles(props);
   if (kind === "carousel") {
-    return { kind: "images", urls: await collectCutImageUrls(cfg, props) };
+    const urls = extractImageUrls(files);
+    return { kind: "images", urls: urls.length > 0 ? urls : await collectCutImageUrls(cfg, props) };
   }
   if (kind === "image") {
-    const urls = extractImageUrls(previewFiles(props));
+    const urls = extractImageUrls(files);
     if (urls.length === 0) {
-      throw new Error("'미리보기'에 이미지 파일이 없습니다. 발행할 이미지를 올려주세요.");
+      throw new Error("'콘텐츠'에 이미지 파일이 없습니다. 발행할 이미지를 올려주세요.");
     }
     return { kind: "images", urls: urls.slice(0, 1) };
   }
   if (kind === "video") {
-    const urls = extractVideoUrls(previewFiles(props));
+    const urls = extractVideoUrls(files);
     if (urls.length === 0) {
-      throw new Error("'미리보기'에 영상 파일이 없습니다. mp4 파일을 올려주세요.");
+      throw new Error("'콘텐츠'에 영상 파일이 없습니다. mp4 파일을 올려주세요.");
     }
     if (urls.length > 1) {
-      console.warn("'미리보기'에 영상이 여러 개라 첫 번째만 발행합니다.");
+      console.warn("'콘텐츠'에 영상이 여러 개라 첫 번째만 발행합니다.");
     }
     return { kind: "video", url: urls[0] };
   }
   return { kind: "text" };
+}
+
+/** '섬네일' 칸의 첫 이미지. 없으면 빈 문자열. */
+function thumbnailUrl(props: Json): string {
+  return extractImageUrls(contentFiles(props, "thumbnail"))[0] ?? "";
+}
+
+/** 하위 항목의 발행 소스. 형식을 따로 두지 않고 '콘텐츠' 칸에 든 파일로 정한다. */
+function replySources(props: Json): MediaPlan {
+  const files = contentFiles(props);
+  const videos = extractVideoUrls(files);
+  const images = extractImageUrls(files);
+  switch (replyMediaKind(images.length, videos.length)) {
+    case "video":
+      return { kind: "video", url: videos[0] };
+    case "carousel":
+      return { kind: "images", urls: images };
+    case "image":
+      return { kind: "images", urls: images.slice(0, 1) };
+    default:
+      return { kind: "text" };
+  }
+}
+
+const SUB_ITEMS_PROP = "하위 항목";
+
+/**
+ * 스레드 본글에 하위 항목을 만든 순서대로 답글로 이어 단다. 바로 앞 글에 다는 사슬이라 하나가 실패하면 거기서 멈춘다.
+ * 하위 항목마다 스레드 상태·상태를 완료로 두고 게시물 기록을 따로 만든다(답글마다 조회수·좋아요가 따로 잡힌다).
+ * 고정 멘트는 본글에만 붙인다.
+ */
+async function publishThreadsReplies(
+  cfg: Config,
+  auth: ThreadsAuth,
+  props: Json,
+  rootId: string,
+): Promise<{ posted: string[]; failures: string[]; postFailures: string[] }> {
+  const posted: string[] = [];
+  const failures: string[] = [];
+  const postFailures: string[] = [];
+  const ids = relationIds(props[SUB_ITEMS_PROP]);
+  if (ids.length === 0 || rootId === "") return { posted, failures, postFailures };
+
+  const items: { pageId: string; createdTime: string; props: Json }[] = [];
+  for (const id of ids) {
+    const page = await notion(cfg, `/pages/${id}`);
+    items.push({ pageId: id, createdTime: String(page.created_time ?? ""), props: (page.properties ?? {}) as Json });
+  }
+
+  let replyTo = rootId;
+  for (const item of sortByCreated(items)) {
+    const name = pageTitle(item.props) || "제목 없음";
+    try {
+      const text = richText(contentField(item.props, "body")).trim();
+      const limitError = captionLimitError(text, ["스레드"]);
+      if (limitError) throw new Error(limitError);
+      const plan = replySources(item.props);
+      if (plan.kind === "text" && text === "") throw new Error("'본문'과 '콘텐츠'가 모두 비어 있습니다.");
+      const media = await uploadPlan(cfg, item.pageId, plan);
+      const reply = await publishThreads(cfg, auth, media, text, replyTo);
+      replyTo = reply.id;
+      posted.push(reply.link || name);
+      console.log("hada-publish 답글 완료", item.pageId, reply.link || "(링크 없음)");
+      await updatePage(cfg, item.pageId, {
+        [RESULT_PROP["스레드"]]: { select: { name: STATUS_DONE } },
+        "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
+        "발행 시각": { date: { start: new Date().toISOString() } },
+      });
+      try {
+        await recordPublishedPost(cfg, item.pageId, item.props, "스레드", reply.link);
+      } catch (e) {
+        postFailures.push(`스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}`);
+      }
+    } catch (e) {
+      failures.push(
+        `스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}. ` +
+          "본글은 올라갔습니다. 이 답글부터는 스레드에서 직접 달아주세요.",
+      );
+      break;
+    }
+  }
+  return { posted, failures, postFailures };
 }
 
 /** 요청한 채널들이 같은 파일을 쓰도록 한 번만 올린다. */
@@ -1537,20 +1670,14 @@ async function publishRow(
   }
 
   const plan = await collectSources(cfg, props, kind);
-  // 발행 문구는 '캡션'만 쓴다. '대본'은 제작 메모가 섞인 작업 문서라 대체재로 쓰지 않는다.
-  // 대본으로 대체하면 메모가 그대로 게시되고, 길이가 한도를 넘어 한 채널만 실패한다.
-  const captionText = richText(props["캡션"]);
-  const scriptText = richText(props["대본"]);
+  const captionText = richText(contentField(props, "body"));
   const caption = buildCaption(captionText, cfg.fixedComment);
-  // 캡션이 비어도 막지 않는다. 카드뉴스는 그림이 본체라 글 없이 올리는 편이 낫다.
-  // 글이 본체인 '짧은글' 형식만 캡션이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
+  const title = youtubeTitle(richText(contentField(props, "title")), pageTitle(props));
+  const thumbnail = thumbnailUrl(props);
+  // 본문이 비어도 막지 않는다. 카드뉴스는 그림이 본체라 글 없이 올리는 편이 낫다.
+  // 글이 본체인 '짧은글' 형식만 본문이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
   if (caption.trim() === "" && kind === "text") {
-    const scriptNote = scriptText.trim() === ""
-      ? "대본도 비어 있습니다."
-      : `대본은 ${scriptText.trim().length}자지만 발행 문구로 쓰지 않습니다(제작 메모가 섞여 있습니다).`;
-    throw new Error(
-      `'${format}' 형식은 글이 본체라 '캡션'이 필요합니다. ${scriptNote} '캡션'을 채운 뒤 다시 실행하세요.`,
-    );
+    throw new Error(`'${format}' 형식은 글이 본체라 '본문'이 필요합니다. '본문'을 채운 뒤 다시 실행하세요.`);
   }
 
   // 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
@@ -1584,8 +1711,9 @@ async function publishRow(
           auth: youtubeNote,
           shorts,
           privacy: cfg.youtubePrivacy,
-          title: youtubeTitle(richText(props["유튜브 제목"]), pageTitle(props)),
+          title,
           description: youtubeDescription(caption, shorts),
+          thumbnail: thumbnail === "" ? "없음" : shorts ? "쇼츠라 붙이지 않음" : "붙임",
         }
         : youtubeNote,
       format,
@@ -1594,6 +1722,7 @@ async function publishRow(
       caption,
       captionLength: caption.length,
       threadsCaptionLength: threadsLength(caption),
+      threadsReplies: relationIds(props[SUB_ITEMS_PROP]).length,
       threadsAuth: threadsAuthNote,
       note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
     };
@@ -1631,14 +1760,18 @@ async function publishRow(
         } else {
           const shorts = isShortsFormat(format);
           const file = await downloadMedia(plan.url, "video");
-          const video = await uploadYoutube(
-            cfg,
-            file,
-            youtubeTitle(richText(props["유튜브 제목"]), pageTitle(props)),
-            youtubeDescription(caption, shorts),
-          );
+          const video = await uploadYoutube(cfg, file, title, youtubeDescription(caption, shorts));
           const link = youtubeWatchUrl(video.id, shorts);
           succeeded = true;
+          if (thumbnail !== "" && !shorts) {
+            try {
+              await setYoutubeThumbnail(cfg, video.id, thumbnail);
+            } catch (e) {
+              notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))} 영상은 올라갔습니다.`);
+            }
+          } else if (thumbnail !== "") {
+            notices.push("유튜브: 쇼츠는 API 로 섬네일을 바꿀 수 없어 '섬네일'을 붙이지 않았습니다.");
+          }
           await updatePage(cfg, pageId, {
             [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
           });
@@ -1693,7 +1826,7 @@ async function publishRow(
         // 어느 값이 길이를 만들었는지 같이 알려준다. 그래야 바로 고칠 수 있다.
         const fixedLength = cfg.fixedComment.trim().length;
         throw new Error(
-          `${limitError} (캡션 ${captionText.trim().length}자 + 고정 멘트 ${fixedLength}자 = 발행 문구 ${caption.length}자)`,
+          `${limitError} (본문 ${captionText.trim().length}자 + 고정 멘트 ${fixedLength}자 = 발행 문구 ${caption.length}자)`,
         );
       }
 
@@ -1706,12 +1839,21 @@ async function publishRow(
       const media: MediaPlan = uploaded;
 
       let link = "";
+      let threadsRootId = "";
+      let threadsAuth: ThreadsAuth | null = null;
       if (channel === "인스타그램") {
-        link = media.kind === "video"
-          ? await publishInstagramReel(cfg, media.url, caption)
-          : await publishInstagram(cfg, media.kind === "images" ? media.urls : [], caption);
+        if (media.kind === "video") {
+          // 섬네일은 릴스 커버로 쓴다. 공개 주소가 필요해 콘텐츠 파일과 같은 곳에 올린다.
+          const cover = thumbnail === "" ? "" : await uploadMedia(cfg, pageId, "cover", thumbnail, "image");
+          link = await publishInstagramReel(cfg, media.url, caption, cover);
+        } else {
+          link = await publishInstagram(cfg, media.kind === "images" ? media.urls : [], caption);
+        }
       } else {
-        link = await publishThreads(cfg, await resolveThreadsAuth(cfg), media, caption);
+        threadsAuth = await resolveThreadsAuth(cfg);
+        const posted = await publishThreads(cfg, threadsAuth, media, caption);
+        link = posted.link;
+        threadsRootId = posted.id;
       }
 
       succeeded = true;
@@ -1726,6 +1868,18 @@ async function publishRow(
         await recordPublishedPost(cfg, pageId, props, channel, link);
       } catch (e) {
         postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
+      }
+
+      // 본글이 올라간 뒤 하위 항목을 답글로 잇는다. 답글 실패는 본글 성공을 되돌리지 않는다.
+      if (threadsAuth && threadsRootId !== "") {
+        try {
+          const replies = await publishThreadsReplies(cfg, threadsAuth, props, threadsRootId);
+          if (replies.posted.length > 0) results["스레드 답글"] = replies.posted;
+          failures.push(...replies.failures);
+          postFailures.push(...replies.postFailures);
+        } catch (e) {
+          failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}. 본글은 올라갔습니다.`);
+        }
       }
     } catch (e) {
       // 메타는 거절한 토큰을 오류 문구에 되돌려준다. 노션에 쓰기 전에 한 번 더 가린다.
@@ -1856,7 +2010,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 /**
  * 발행할 페이지를 정한다.
  * 본문에 페이지 지정이 있으면 그것을 쓰고, 없으면 본문 어딘가에 실린 노션 주소 중
- * 실제 콘텐츠 페이지('컷(프롬프트)' 관계가 있는 페이지)를 골라 쓴다.
+ * 실제 콘텐츠 페이지('배포 채널' 칸이 있는 페이지)를 골라 쓴다.
  * 아무것도 못 찾으면 빈 문자열을 돌려주고 호출부는 큐 모드로 넘어간다.
  */
 // ---------- 성과 수집 ----------
@@ -2032,17 +2186,30 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
 }
 
 let contentTypeOptionName = "";
+let contentBodyPropName = "";
 
-/** 콘텐츠 DB `유형`에서 올리는 콘텐츠를 뜻하는 선택지('콘텐츠', 예전 철자 '컨텐츠'). 한 번 읽어 둔다. */
+/** 콘텐츠 DB 의 칸 구성을 한 번 읽어 둔다. 칸·선택지 이름을 바꾸는 동안 예전 이름도 받는다. */
+async function loadContentSchema(cfg: Config): Promise<void> {
+  if (contentTypeOptionName !== "") return;
+  const source = await notion(cfg, `/data_sources/${cfg.contentDataSourceId}`, {
+    headers: { "Notion-Version": POST_API_VERSION },
+  });
+  const properties = (source.properties ?? {}) as Json;
+  const options = ((properties["유형"]?.select?.options ?? []) as Json[]).map((option) => String(option.name));
+  contentTypeOptionName = pickContentTypeOption(options);
+  contentBodyPropName = contentFieldName(Object.keys(properties), "body");
+}
+
+/** 콘텐츠 DB `유형`에서 올리는 콘텐츠를 뜻하는 선택지('콘텐츠', 예전 철자 '컨텐츠'). */
 async function contentTypeOption(cfg: Config): Promise<string> {
-  if (contentTypeOptionName === "") {
-    const source = await notion(cfg, `/data_sources/${cfg.contentDataSourceId}`, {
-      headers: { "Notion-Version": POST_API_VERSION },
-    });
-    const options = ((source.properties?.["유형"]?.select?.options ?? []) as Json[]).map((option) => String(option.name));
-    contentTypeOptionName = pickContentTypeOption(options);
-  }
+  await loadContentSchema(cfg);
   return contentTypeOptionName;
+}
+
+/** 콘텐츠 DB 의 본문 칸 이름('본문', 예전 이름 '캡션'). */
+async function contentBodyProp(cfg: Config): Promise<string> {
+  await loadContentSchema(cfg);
+  return contentBodyPropName;
 }
 
 /**
@@ -2071,7 +2238,9 @@ async function createContentForPost(cfg: Config, post: AccountPost): Promise<str
         "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
         ...(format ? { "형식": { select: { name: format } } } : {}),
         "배포 채널": { multi_select: [{ name: label }] },
-        ...(post.text.trim() ? { "캡션": { rich_text: [{ type: "text", text: { content: truncate(post.text, 2000) } }] } } : {}),
+        ...(post.text.trim()
+          ? { [await contentBodyProp(cfg)]: { rich_text: [{ type: "text", text: { content: truncate(post.text, 2000) } }] } }
+          : {}),
         ...(post.publishedAt ? { "발행 시각": { date: { start: post.publishedAt } } } : {}),
         ...channelStatus,
       },
@@ -2650,8 +2819,8 @@ async function resolveTargetPage(cfg: Config, payload: Json, requestUrl: string)
     seen.add(id);
     try {
       const page = await notion(cfg, `/pages/${id}`);
-      // 컷 관계가 없는 페이지(예: 관계 속성에 실려 온 컷 페이지)는 후보에서 뺀다.
-      if (((page.properties ?? {}) as Json)["컷(프롬프트)"] !== undefined) return id;
+      // 콘텐츠 DB 페이지('배포 채널' 칸이 있는 페이지)만 고른다. 관계 속성에 실려 온 다른 DB 페이지는 뺀다.
+      if (((page.properties ?? {}) as Json)["배포 채널"] !== undefined) return id;
     } catch {
       // 접근할 수 없으면 다음 후보로 넘어간다.
     }

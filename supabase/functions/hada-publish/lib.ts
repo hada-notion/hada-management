@@ -43,10 +43,8 @@ export function sortCuts<T extends { order: number; pageId: string }>(cuts: T[])
 }
 
 /**
- * 발행 문구를 만든다. '캡션' 뒤에 고정 멘트를 한 줄 띄우고 붙인다.
- * '대본'으로 대체하지 않는 이유: 대본은 제작 메모(컨셉·타겟·사진 지시)가 섞인 작업 문서라
- * 발행 문구로 쓰면 메모가 그대로 게시되고 길이도 한도를 넘는다.
- * 캡션이 비면 고정 멘트만 남고, 둘 다 비면 빈 문구가 된다. 그래도 발행은 막지 않는다.
+ * 발행 문구를 만든다. '본문' 뒤에 고정 멘트를 한 줄 띄우고 붙인다.
+ * 본문이 비면 고정 멘트만 남고, 둘 다 비면 빈 문구가 된다. 그래도 발행은 막지 않는다.
  * 카드뉴스는 그림이 본체라 글 없이 올릴 수 있고, 글이 꼭 필요한 '짧은글' 형식만 호출부가 막는다.
  */
 export function buildCaption(caption: string, fixedComment: string): string {
@@ -331,7 +329,7 @@ export function extractVideoUrls(files: NotionFile[] | undefined): string[] {
 
 /**
  * 형식별 발행 소스.
- * 카드뉴스는 컷 이미지 캐러셀, 이미지는 미리보기 한 장, 영상은 미리보기 영상, 짧은글은 글만 올린다.
+ * 카드뉴스는 '콘텐츠' 칸 이미지 캐러셀, 이미지는 '콘텐츠' 한 장, 영상은 '콘텐츠' 영상, 짧은글은 글만 올린다.
  * 긴글(블로그용)은 자동 발행 대상이 아니다.
  * 예전 이름(영상-세로(9:16)·영상-가로(16:9)·카피)도 그대로 받는다.
  */
@@ -355,6 +353,40 @@ export function mediaKindFor(format: string): MediaKind | null {
     default:
       return null;
   }
+}
+
+/**
+ * 콘텐츠 DB에서 올리는 칸. 2026-11-06에 이름을 바꿨고, 노션 칸 이름을 바꾸는 동안 예전 이름도 읽는다.
+ *   타이틀 ← 유튜브 제목, 콘텐츠 ← 미리보기, 본문 ← 캡션, 섬네일은 새 칸
+ */
+export const CONTENT_FIELD_NAMES = {
+  title: ["타이틀", "유튜브 제목"],
+  file: ["콘텐츠", "미리보기"],
+  body: ["본문", "캡션"],
+  thumbnail: ["섬네일"],
+} as const;
+export type ContentField = keyof typeof CONTENT_FIELD_NAMES;
+
+/** 페이지에 있는 칸 이름 중 그 칸에 해당하는 이름. 새 이름이 있으면 새 이름, 없으면 예전 이름. */
+export function contentFieldName(propertyNames: string[], field: ContentField): string {
+  const names: readonly string[] = CONTENT_FIELD_NAMES[field];
+  return names.find((name) => propertyNames.includes(name)) ?? names[0];
+}
+
+/** 하위 항목(스레드 이어 쓰기)의 발행 소스. 영상이 있으면 영상, 이미지가 여러 장이면 캐러셀, 없으면 글만. */
+export function replyMediaKind(imageCount: number, videoCount: number): MediaKind {
+  if (videoCount > 0) return "video";
+  if (imageCount > 1) return "carousel";
+  if (imageCount === 1) return "image";
+  return "text";
+}
+
+/** 하위 항목은 만든 순서대로 이어 단다. 같은 시각이면 페이지 ID로 안정 정렬한다. */
+export function sortByCreated<T extends { createdTime: string; pageId: string }>(items: T[]): T[] {
+  return [...items].sort((a, b) => {
+    if (a.createdTime !== b.createdTime) return a.createdTime < b.createdTime ? -1 : 1;
+    return a.pageId < b.pageId ? -1 : 1;
+  });
 }
 
 /** 자동 발행하는 채널. 나머지 배포 채널은 게시물 기록만 만든다. */
@@ -617,7 +649,7 @@ function stripAngles(text: string): string {
 }
 
 /**
- * 영상 제목. '유튜브 제목'이 있으면 그것을, 없으면 페이지 이름을 쓴다.
+ * 영상 제목. '타이틀'이 있으면 그것을, 없으면 페이지 이름을 쓴다.
  * 줄바꿈은 한 칸으로 바꾸고 100자에서 자른다. 제목이 비면 업로드가 거절되므로 기본값을 둔다.
  */
 export function youtubeTitle(custom: string, pageTitle: string): string {

@@ -43,6 +43,9 @@ import {
   postHeadline,
   pickPostContentProp,
   pickContentTypeOption,
+  contentFieldName,
+  replyMediaKind,
+  sortByCreated,
   kstDateTime,
   applyMetricScope,
   autoCollectDue,
@@ -694,4 +697,30 @@ Deno.test("네이버 블로그: 공감·댓글·공유를 좋아요·댓글·공
   });
   assertEquals(naverBlogMetrics({}), {});
   assertEquals(contentFormatFor("naver_blog", "", "https://blog.naver.com/x/1"), "긴글");
+});
+
+Deno.test("contentFieldName: 새 칸 이름을 먼저, 없으면 예전 이름", () => {
+  assertEquals(contentFieldName(["콘텐츠", "본문", "타이틀", "섬네일"], "file"), "콘텐츠");
+  assertEquals(contentFieldName(["미리보기", "캡션"], "file"), "미리보기");
+  assertEquals(contentFieldName(["미리보기", "캡션"], "body"), "캡션");
+  assertEquals(contentFieldName(["본문", "캡션"], "body"), "본문");
+  assertEquals(contentFieldName(["유튜브 제목"], "title"), "유튜브 제목");
+  assertEquals(contentFieldName([], "title"), "타이틀");
+  assertEquals(contentFieldName([], "thumbnail"), "섬네일");
+});
+
+Deno.test("replyMediaKind: 영상 > 여러 장 캐러셀 > 한 장 > 글만", () => {
+  assertEquals(replyMediaKind(3, 1), "video");
+  assertEquals(replyMediaKind(2, 0), "carousel");
+  assertEquals(replyMediaKind(1, 0), "image");
+  assertEquals(replyMediaKind(0, 0), "text");
+});
+
+Deno.test("sortByCreated: 하위 항목은 만든 순서대로", () => {
+  const sorted = sortByCreated([
+    { pageId: "c", createdTime: "2026-11-06T03:00:00.000Z" },
+    { pageId: "b", createdTime: "2026-11-06T01:00:00.000Z" },
+    { pageId: "a", createdTime: "2026-11-06T03:00:00.000Z" },
+  ]);
+  assertEquals(sorted.map((item) => item.pageId), ["b", "a", "c"]);
 });
