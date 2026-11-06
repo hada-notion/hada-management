@@ -1498,7 +1498,10 @@ const SUB_ITEMS_PROP = "하위 항목";
 async function threadsIdOfPage(cfg: Config, pageId: string): Promise<string> {
   const channelId = await findChannelPageId(cfg, "스레드");
   for (const row of await findPostRecords(cfg, pageId, channelId)) {
-    const id = threadsIdFromMemo(richText(((row.properties ?? {}) as Json)["메모"]));
+    const props = (row.properties ?? {}) as Json;
+    // 내린(지운) 글에는 답글을 이을 수 없다.
+    if (selectName(props["게시 상태"]) === "내림") continue;
+    const id = threadsIdFromMemo(richText(props["메모"]));
     if (id !== "") return id;
   }
   return "";
