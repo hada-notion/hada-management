@@ -719,6 +719,17 @@ export function pickPostContentProp(propertyNames: string[]): string {
   return POST_CONTENT_PROPS.find((name) => propertyNames.includes(name)) ?? POST_CONTENT_PROPS[0];
 }
 
+/**
+ * 콘텐츠 DB `유형`에서 올리는 콘텐츠를 뜻하는 선택지. 2026-11-06 철자를 '컨텐츠'에서 '콘텐츠'로 맞춘다.
+ * 노션에서 선택지 이름을 바꾸기 전에 배포돼도 새 선택지가 생기지 않도록 지금 있는 쪽을 고른다.
+ */
+export const CONTENT_TYPE_OPTIONS = ["콘텐츠", "컨텐츠"] as const;
+
+/** `유형` 선택지 이름 목록에서 콘텐츠 선택지를 고른다. 둘 다 없으면 새 철자. */
+export function pickContentTypeOption(optionNames: string[]): string {
+  return CONTENT_TYPE_OPTIONS.find((name) => optionNames.includes(name)) ?? CONTENT_TYPE_OPTIONS[0];
+}
+
 /** 게시물 글의 첫 줄(해시태그 줄 제외)을 40자까지. 콘텐츠 이름으로도 쓴다. */
 export function postHeadline(text: string): string {
   const line = text.split("\n").map((part) => part.trim()).find((part) => part !== "" && !part.startsWith("#")) ?? "";

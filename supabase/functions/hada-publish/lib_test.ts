@@ -42,6 +42,7 @@ import {
   metricsResultSummary,
   postHeadline,
   pickPostContentProp,
+  pickContentTypeOption,
   kstDateTime,
   applyMetricScope,
   autoCollectDue,
@@ -304,7 +305,7 @@ Deno.test("collectPageCandidates: 본문 어디에 있든 노션 주소를 찾�
   assertEquals(collectPageCandidates({ data: { properties: { link: "https://www.notion.so/x-3f1ba040586b80fd91f0efa3c32b37c2" } } }), [
     "https://www.notion.so/x-3f1ba040586b80fd91f0efa3c32b37c2",
   ]);
-  // 관계 속성처럼 주소가 여러 개면 전부 모은다. 어느 것이 컨텐츠 페이지인지는 호출부가 확인한다.
+  // 관계 속성처럼 주소가 여러 개면 전부 모은다. 어느 것이 콘텐츠 페이지인지는 호출부가 확인한다.
   assertEquals(collectPageCandidates({ relation: ["3f1ba040586b80fd91f0efa3c32b37c2", "9d42bac3eece4995acda607590ae1728"] }), [
     "3f1ba040586b80fd91f0efa3c32b37c2",
     "9d42bac3eece4995acda607590ae1728",
@@ -615,6 +616,12 @@ Deno.test("pickPostContentProp: 새 이름 '콘텐츠'를 먼저, 없으면 예�
   assertEquals(pickPostContentProp(["이름", "채널", "산출물", "게시 링크"]), "산출물");
   assertEquals(pickPostContentProp(["이름", "산출물", "콘텐츠"]), "콘텐츠");
   assertEquals(pickPostContentProp(["이름", "채널"]), "콘텐츠");
+});
+
+Deno.test("pickContentTypeOption: 유형 선택지는 '콘텐츠'를 먼저, 없으면 예전 철자 '컨텐츠'", () => {
+  assertEquals(pickContentTypeOption(["콘텐츠", "기준문서"]), "콘텐츠");
+  assertEquals(pickContentTypeOption(["콘텐츠", "기준문서"]), "콘텐츠");
+  assertEquals(pickContentTypeOption(["기준문서"]), "콘텐츠");
 });
 
 Deno.test("postHeadline: 해시태그 줄을 건너뛴 첫 줄 40자", () => {
