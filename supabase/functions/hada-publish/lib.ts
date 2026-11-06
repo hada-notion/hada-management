@@ -373,6 +373,20 @@ export function contentFieldName(propertyNames: string[], field: ContentField): 
   return names.find((name) => propertyNames.includes(name)) ?? names[0];
 }
 
+/**
+ * 스레드 답글은 계정의 글 목록(/threads)에 나오지 않아 성과 수집이 짝을 찾지 못한다.
+ * 목록을 읽으려면 답글 읽기 권한이 따로 필요해서, 발행할 때 받은 글 ID를 게시물 메모에 남겨 두고 그 ID로 바로 읽는다.
+ */
+const THREADS_ID_NOTE = "스레드 글 ID";
+
+export function threadsIdNote(id: string): string {
+  return `${THREADS_ID_NOTE} ${id}`;
+}
+
+export function threadsIdFromMemo(memo: string): string {
+  return (memo ?? "").match(new RegExp(`${THREADS_ID_NOTE} (\\d+)`))?.[1] ?? "";
+}
+
 /** 하위 항목(스레드 이어 쓰기)의 발행 소스. 영상이 있으면 영상, 이미지가 여러 장이면 캐러셀, 없으면 글만. */
 export function replyMediaKind(imageCount: number, videoCount: number): MediaKind {
   if (videoCount > 0) return "video";
