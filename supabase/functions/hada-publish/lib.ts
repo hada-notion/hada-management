@@ -109,8 +109,15 @@ export function captionLimitError(caption: string, channels: string[]): string |
 /** 스레드 토큰은 60일짜리라, 마지막 갱신 후 이 일수가 지나면 미리 갱신한다. */
 export const THREADS_REFRESH_AFTER_DAYS = 30;
 
-// threads_manage_insights 는 성과 수집(조회수·좋아요·답글)에 필요하다. 이 권한이 없던 토큰은 인증을 다시 해야 한다.
-export const THREADS_AUTHORIZE_SCOPES = ["threads_basic", "threads_content_publish", "threads_manage_insights"];
+// threads_manage_insights 는 성과 수집(조회수·좋아요·답글)에 필요하다.
+// threads_manage_replies 는 하위 항목을 답글로 다는 데 필요하다(2026-11-06 추가).
+// 새 권한이 없던 토큰은 인증을 다시 해야 한다.
+export const THREADS_AUTHORIZE_SCOPES = [
+  "threads_basic",
+  "threads_content_publish",
+  "threads_manage_insights",
+  "threads_manage_replies",
+];
 
 /** 스레드 승인 화면 주소를 만든다. 브라우저에서 열면 code 를 받아 되돌아온다. */
 export function threadsAuthorizeUrl(appId: string, redirectUri: string, scopes: string[]): string {

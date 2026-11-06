@@ -1494,6 +1494,46 @@ const SUB_ITEMS_PROP = "하위 항목";
  * 하위 항목마다 스레드 상태·상태를 완료로 두고 게시물 기록을 따로 만든다(답글마다 조회수·좋아요가 따로 잡힌다).
  * 고정 멘트는 본글에만 붙인다.
  */
+/** 이 콘텐츠의 스레드 게시물 기록 메모에 남긴 글 ID. 없으면 빈 문자열. */
+async function threadsIdOfPage(cfg: Config, pageId: string): Promise<string> {
+  const channelId = await findChannelPageId(cfg, "스레드");
+  for (const row of await findPostRecords(cfg, pageId, channelId)) {
+    const id = threadsIdFromMemo(richText(((row.properties ?? {}) as Json)["메모"]));
+    if (id !== "") return id;
+  }
+  return "";
+}
+
+/** 본글이 이미 올라간 콘텐츠를 다시 배포하면, 아직 못 단 하위 항목만 답글로 단다. */
+async function resumeThreadsReplies(
+  cfg: Config,
+  pageId: string,
+  props: Json,
+): Promise<{ posted: string[]; failures: string[]; postFailures: string[] }> {
+  const empty = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
+  if (relationIds(props[SUB_ITEMS_PROP]).length === 0) return empty;
+  const rootId = await threadsIdOfPage(cfg, pageId);
+  if (rootId === "") {
+    return { ...empty, failures: ["스레드 답글 — 본글의 게시물 기록에 글 ID가 없어 답글을 이을 수 없습니다."] };
+  }
+  return await publishThreadsReplies(cfg, await resolveThreadsAuth(cfg), props, rootId);
+}
+
+/** 답글 결과를 코멘트로 남긴다. 본글 발행 흐름 밖(다시 배포)에서 쓴다. */
+async function reportReplies(
+  cfg: Config,
+  pageId: string,
+  replies: { posted: string[]; failures: string[]; postFailures: string[] },
+): Promise<void> {
+  const lines = [...replies.failures, ...replies.postFailures.map((line) => `게시물 기록 실패: ${line}`)];
+  if (lines.length === 0) return;
+  try {
+    await addComment(cfg, pageId, `스레드 답글 실패\n\n${maskSecrets(lines.join("\n"), secretsOf(cfg))}`);
+  } catch (e) {
+    console.error("답글 실패 코멘트 실패", message(e));
+  }
+}
+
 async function publishThreadsReplies(
   cfg: Config,
   auth: ThreadsAuth,
@@ -1515,6 +1555,16 @@ async function publishThreadsReplies(
   let replyTo = rootId;
   for (const item of sortByCreated(items)) {
     const name = pageTitle(item.props) || "제목 없음";
+    // 이미 단 답글은 건너뛰고, 다음 답글은 그 답글에 잇는다(다시 배포할 때 남은 답글만 단다).
+    if (selectName(item.props[RESULT_PROP["스레드"]]) === STATUS_DONE) {
+      const doneId = await threadsIdOfPage(cfg, item.pageId);
+      if (doneId === "") {
+        failures.push(`스레드 답글 '${name}' — 이미 올렸지만 게시물 기록에 글 ID가 없어 다음 답글을 이을 수 없습니다.`);
+        break;
+      }
+      replyTo = doneId;
+      continue;
+    }
     try {
       const text = richText(contentField(item.props, "body")).trim();
       const limitError = captionLimitError(text, ["스레드"]);
@@ -1539,7 +1589,7 @@ async function publishThreadsReplies(
     } catch (e) {
       failures.push(
         `스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}. ` +
-          "본글은 올라갔습니다. 이 답글부터는 스레드에서 직접 달아주세요.",
+          "본글은 올라갔습니다. 원인을 고친 뒤 배포 버튼을 다시 누르면 본글은 건너뛰고 남은 답글만 이어 답니다.",
       );
       break;
     }
@@ -1614,13 +1664,25 @@ async function publishRow(
   let channels: Channel[] = CHANNELS.filter((channel) => wanted.has(channel));
   if (channels.length === 0 && dryRun && recordChannels.length === 0 && !youtube) channels = [...CHANNELS];
   if (channels.length === 0 && !youtube && (recordChannels.length > 0 || doneChannels.length > 0)) {
+    // 스레드 본글은 이미 올라갔고 하위 항목 답글이 남았으면 그것만 이어 단다.
+    let replies = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
+    if (!dryRun && doneChannels.includes("스레드")) {
+      try {
+        replies = await resumeThreadsReplies(cfg, pageId, props);
+      } catch (e) {
+        replies.failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}`);
+      }
+      await reportReplies(cfg, pageId, replies);
+    }
     return {
-      ok: recordFailures.length === 0,
+      ok: recordFailures.length === 0 && replies.failures.length === 0,
       pageId,
       dryRun,
       records: dryRun ? recordChannels : records,
       recordFailures,
       alreadyDone: doneChannels,
+      ...(replies.posted.length > 0 ? { threadsReplies: replies.posted } : {}),
+      ...(replies.failures.length > 0 ? { replyFailures: replies.failures } : {}),
     };
   }
   if (channels.length === 0 && !youtube) {
