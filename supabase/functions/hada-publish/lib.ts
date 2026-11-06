@@ -698,6 +698,12 @@ export function youtubeWatchUrl(videoId: string, shorts: boolean): string {
   return shorts ? `https://youtube.com/shorts/${videoId}` : `https://www.youtube.com/watch?v=${videoId}`;
 }
 
+/** 게시 링크(쇼츠·watch·youtu.be)에서 영상 ID를 꺼낸다. 알아볼 수 없으면 빈 문자열. */
+export function youtubeVideoIdOf(link: string): string {
+  const m = /(?:youtube\.com\/shorts\/|youtube\.com\/watch\?(?:.*&)?v=|youtu\.be\/)([A-Za-z0-9_-]{6,})/.exec(link);
+  return m ? m[1] : "";
+}
+
 /**
  * '배포 채널'에서 유튜브를 자동 업로드로 뺄지 정한다.
  * 유튜브 연결 설정이 있고 영상 형식일 때만 업로드한다. 아니면 예전처럼 게시물 기록만 만든다.

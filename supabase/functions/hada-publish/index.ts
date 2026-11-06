@@ -112,6 +112,7 @@ import {
   youtubeDescription,
   youtubePrivacy,
   youtubeTitle,
+  youtubeVideoIdOf,
   youtubeWatchUrl,
   YOUTUBE_CHANNEL,
   YOUTUBE_OAUTH_STATE,
@@ -1108,7 +1109,7 @@ const YOUTUBE_THUMBNAIL_URL = "https://www.googleapis.com/upload/youtube/v3/thum
 const YOUTUBE_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
- * 올린 영상에 '섬네일' 이미지를 붙인다. 쇼츠는 API 로 섬네일을 바꿀 수 없어 부르지 않는다.
+ * 올린 영상에 '섬네일' 이미지를 붙인다. 쇼츠도 부른다(스튜디오는 쇼츠 섬네일을 받는다). 거절되면 그 오류를 안내로 남긴다.
  * 채널이 전화번호 인증을 마치지 않았으면 유튜브가 거절한다. 영상은 이미 올라갔으므로 호출부는 안내로만 남긴다.
  */
 async function setYoutubeThumbnail(cfg: Config, videoId: string, imageUrl: string): Promise<void> {
@@ -1125,11 +1126,15 @@ async function setYoutubeThumbnail(cfg: Config, videoId: string, imageUrl: strin
   if (!res.ok) throw apiError(cfg, "유튜브 섬네일", res.status, await res.text());
 }
 
-/** 이 콘텐츠의 유튜브 게시물 기록 중 게시 링크가 있는 것이 있으면 이미 올린 것으로 본다. */
-async function youtubeAlreadyPosted(cfg: Config, pageId: string): Promise<boolean> {
+/** 이 콘텐츠의 유튜브 게시물 기록 중 게시 링크가 있으면 그 링크를 준다(이미 올린 것). 없으면 빈 문자열. */
+async function youtubePostedLink(cfg: Config, pageId: string): Promise<string> {
   const channelId = await findChannelPageId(cfg, YOUTUBE_CHANNEL);
   const rows = await findPostRecords(cfg, pageId, channelId);
-  return rows.some((row) => Boolean(((row.properties ?? {}) as Json)["게시 링크"]?.url));
+  for (const row of rows) {
+    const url = ((row.properties ?? {}) as Json)["게시 링크"]?.url;
+    if (url) return String(url);
+  }
+  return "";
 }
 
 // ---------- 채널 ----------
@@ -1754,7 +1759,7 @@ async function publishRow(
           privacy: cfg.youtubePrivacy,
           title,
           description: youtubeDescription(caption, shorts),
-          thumbnail: thumbnail === "" ? "없음" : shorts ? "쇼츠라 붙이지 않음" : "붙임",
+          thumbnail: thumbnail === "" ? "없음" : "붙임",
         }
         : youtubeNote,
       format,
@@ -1792,9 +1797,20 @@ async function publishRow(
         await updatePage(cfg, pageId, {
           [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_WORKING } },
         });
-        if (await youtubeAlreadyPosted(cfg, pageId)) {
+        const postedLink = await youtubePostedLink(cfg, pageId);
+        if (postedLink !== "") {
           doneChannels.push(YOUTUBE_CHANNEL);
           results[YOUTUBE_CHANNEL] = "이미 올린 기록(게시 링크)이 있어 건너뛰었습니다.";
+          // 다시 배포하면 '섬네일'만 다시 붙인다. 섬네일을 바꾼 뒤 영상은 그대로 두고 섬네일만 갈 때 쓴다.
+          const postedId = youtubeVideoIdOf(postedLink);
+          if (thumbnail !== "" && postedId !== "") {
+            try {
+              await setYoutubeThumbnail(cfg, postedId, thumbnail);
+              notices.push("유튜브: 이미 올린 영상에 '섬네일'을 다시 붙였습니다.");
+            } catch (e) {
+              notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))}`);
+            }
+          }
           await updatePage(cfg, pageId, {
             [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
           });
@@ -1804,14 +1820,12 @@ async function publishRow(
           const video = await uploadYoutube(cfg, file, title, youtubeDescription(caption, shorts));
           const link = youtubeWatchUrl(video.id, shorts);
           succeeded = true;
-          if (thumbnail !== "" && !shorts) {
+          if (thumbnail !== "") {
             try {
               await setYoutubeThumbnail(cfg, video.id, thumbnail);
             } catch (e) {
               notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))} 영상은 올라갔습니다.`);
             }
-          } else if (thumbnail !== "") {
-            notices.push("유튜브: 쇼츠는 API 로 섬네일을 바꿀 수 없어 '섬네일'을 붙이지 않았습니다.");
           }
           await updatePage(cfg, pageId, {
             [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
