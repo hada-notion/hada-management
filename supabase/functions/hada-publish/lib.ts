@@ -708,14 +708,25 @@ export function importedPostTitle(text: string, channelLabel: string): string {
   return `${postHeadline(text) || "제목 없는 게시물"} · ${channelLabel}`;
 }
 
-/** 게시물 글의 첫 줄(해시태그 줄 제외)을 40자까지. 산출물 이름으로도 쓴다. */
+/**
+ * 게시물 DB 에서 콘텐츠(하다) DB 를 가리키는 관계 칸 이름. 2026-11-06 산출물 DB 를 콘텐츠 DB 로 합치며
+ * '산출물'을 '콘텐츠'로 바꾼다. 노션에서 이름을 바꾸기 전에 배포돼도 동작하도록 예전 이름도 찾는다.
+ */
+export const POST_CONTENT_PROPS = ["콘텐츠", "산출물"] as const;
+
+/** 게시물 DB 칸 이름 목록에서 콘텐츠 관계 칸 이름을 고른다. 둘 다 없으면 새 이름. */
+export function pickPostContentProp(propertyNames: string[]): string {
+  return POST_CONTENT_PROPS.find((name) => propertyNames.includes(name)) ?? POST_CONTENT_PROPS[0];
+}
+
+/** 게시물 글의 첫 줄(해시태그 줄 제외)을 40자까지. 콘텐츠 이름으로도 쓴다. */
 export function postHeadline(text: string): string {
   const line = text.split("\n").map((part) => part.trim()).find((part) => part !== "" && !part.startsWith("#")) ?? "";
   return [...line].length > 40 ? `${[...line].slice(0, 40).join("")}…` : line;
 }
 
 /**
- * 계정에서 가져온 게시물로 산출물을 만들 때 쓸 형식. API 의 미디어 종류로 고르고, 모르면 빈 문자열.
+ * 계정에서 가져온 게시물로 콘텐츠를 만들 때 쓸 형식. API 의 미디어 종류로 고르고, 모르면 빈 문자열.
  * 인스타그램은 media_product_type(REELS 등)·media_type, 스레드는 media_type(TEXT_POST 등)을 준다.
  * 유튜브 업로드 목록은 Shorts 여부를 알려주지 않아 링크가 /shorts/ 일 때만 숏폼으로 본다.
  */
@@ -829,7 +840,7 @@ export function metricsResultSummary(body: {
   if (imported > 0) lines.push(`계정에서 새로 가져온 게시물 ${imported}건`);
   const linked = num(body.contents?.linked);
   const madeContents = num(body.contents?.created);
-  if (linked + madeContents > 0) lines.push(`산출물 연결 ${linked}건 · 새로 만든 산출물 ${madeContents}건`);
+  if (linked + madeContents > 0) lines.push(`콘텐츠 연결 ${linked}건 · 새로 만든 콘텐츠 ${madeContents}건`);
   const errors = metricsErrorSummary(body);
   if (errors !== "") lines.push(errors);
   return lines.join("\n");

@@ -82,6 +82,7 @@ import {
   importedPostTitle,
   contentFormatFor,
   postHeadline,
+  pickPostContentProp,
   metricChannelByLabel,
   metricsErrorSummary,
   metricsResultSummary,
@@ -1075,7 +1076,7 @@ async function uploadYoutube(
   return { id: String(video.id ?? ""), privacy: String(video.status?.privacyStatus ?? "") };
 }
 
-/** 이 산출물의 유튜브 게시물 기록 중 게시 링크가 있는 것이 있으면 이미 올린 것으로 본다. */
+/** 이 콘텐츠의 유튜브 게시물 기록 중 게시 링크가 있는 것이 있으면 이미 올린 것으로 본다. */
 async function youtubeAlreadyPosted(cfg: Config, pageId: string): Promise<boolean> {
   const channelId = await findChannelPageId(cfg, YOUTUBE_CHANNEL);
   const rows = await findPostRecords(cfg, pageId, channelId);
@@ -1093,7 +1094,7 @@ const RESULT_PROP: Record<Channel, string> = {
 };
 // 유튜브는 배포 채널로만 요청하고 ⚪ 대기를 쓰지 않는다. 함수가 🔄 작업중 → ✅ 완료/⚠️ 오류만 기록한다.
 const YOUTUBE_RESULT_PROP = "유튜브 상태";
-// 산출물 DB `상태` 선택지: 기획 → 게시대기 → 게시완료 (보류). 함수는 게시완료만 쓴다.
+// 콘텐츠 DB `상태` 선택지: 기획 → 게시대기 → 게시완료 (보류). 함수는 게시완료만 쓴다.
 const CONTENT_STATUS_PUBLISHED = "게시완료";
 // 사람이 직접 올리는 채널의 기록을 만들면 '게시대기'로 둔다. Aside가 '블로그 대기' 보기에서 가져가 올린 뒤 '게시완료'로 바꾼다.
 const CONTENT_STATUS_WAITING = "게시대기";
@@ -1248,11 +1249,24 @@ async function findChannelPageId(cfg: Config, name: string): Promise<string> {
 
 type PostRecord = { channel: string; url: string; created: boolean; linked: boolean };
 
-/** 이 산출물·채널의 게시물 기록들. */
+let postContentPropName = "";
+
+/** 게시물 DB 에서 콘텐츠를 가리키는 관계 칸 이름('콘텐츠', 예전 이름 '산출물'). 한 번 읽어 둔다. */
+async function postContentProp(cfg: Config): Promise<string> {
+  if (postContentPropName === "") {
+    const source = await notion(cfg, `/data_sources/${cfg.postDataSourceId}`, {
+      headers: { "Notion-Version": POST_API_VERSION },
+    });
+    postContentPropName = pickPostContentProp(Object.keys((source.properties ?? {}) as Json));
+  }
+  return postContentPropName;
+}
+
+/** 이 콘텐츠·채널의 게시물 기록들. */
 async function findPostRecords(cfg: Config, pageId: string, channelId: string): Promise<Json[]> {
   return await queryDataSource(cfg, cfg.postDataSourceId, {
     and: [
-      { property: "산출물", relation: { contains: pageId } },
+      { property: await postContentProp(cfg), relation: { contains: pageId } },
       { property: "채널", relation: { contains: channelId } },
     ],
   });
@@ -1274,7 +1288,7 @@ async function createPostPage(
       properties: {
         "이름": { title: [{ type: "text", text: { content: truncate(`${title} · ${channel}`, 1900) } }] },
         "채널": { relation: [{ id: channelId }] },
-        "산출물": { relation: [{ id: pageId }] },
+        [await postContentProp(cfg)]: { relation: [{ id: pageId }] },
         ...extra,
       },
     }),
@@ -1283,7 +1297,7 @@ async function createPostPage(
 
 /**
  * 자동 발행에 성공한 채널을 게시물 DB 에 기록한다. 성과 트래킹은 이 게시물 기록에 붙는다.
- * 같은 산출물·채널 기록 중 게시 링크가 빈 것이 있으면 그 기록을 채우고, 없으면 새로 만든다.
+ * 같은 콘텐츠·채널 기록 중 게시 링크가 빈 것이 있으면 그 기록을 채우고, 없으면 새로 만든다.
  * 다시 발행한 경우(상태를 비우고 재발행)에는 이전 기록을 덮어쓰지 않고 새 기록이 생긴다.
  */
 async function recordPublishedPost(
@@ -1316,7 +1330,7 @@ async function recordPublishedPost(
 
 /**
  * 채널마다 게시물 DB 에 기록을 하나 만든다.
- * 같은 산출물·채널 기록이 이미 있으면 새로 만들지 않는다. 버튼을 여러 번 눌러도 기록은 하나다.
+ * 같은 콘텐츠·채널 기록이 이미 있으면 새로 만들지 않는다. 버튼을 여러 번 눌러도 기록은 하나다.
  * 실패해도 발행은 계속 가도록 실패 목록만 돌려준다.
  */
 async function createPostRecords(
@@ -1475,7 +1489,7 @@ async function publishRow(
   if (recordChannels.length > 0 && !dryRun) {
     ({ records, failures: recordFailures } = await createPostRecords(cfg, pageId, props, recordChannels));
   }
-  // 블로그처럼 사람이 올리는 채널이 아직 안 올라갔으면(기록에 게시 링크 없음) 산출물 상태를 '게시대기'로 둔다.
+  // 블로그처럼 사람이 올리는 채널이 아직 안 올라갔으면(기록에 게시 링크 없음) 콘텐츠 상태를 '게시대기'로 둔다.
   // 그래야 Aside의 '블로그 대기' 보기(상태=게시대기)에 뜬다. 이 경우 아래 자동 발행이 성공해도 '게시완료'로 넘기지 않는다.
   const manualPending = records.some((record) => MANUAL_PUBLISH_CHANNELS.has(record.channel) && !record.linked);
   if (manualPending) {
@@ -1733,7 +1747,7 @@ async function publishRow(
   }
 
   if (succeeded) {
-    // 한 채널이라도 올라갔으면 산출물 상태를 '게시완료'로 옮긴다.
+    // 한 채널이라도 올라갔으면 콘텐츠 상태를 '게시완료'로 옮긴다.
     // 블로그처럼 사람이 올릴 채널이 남아 있으면 '게시대기'를 유지하고, Aside가 올린 뒤 '게시완료'로 바꾼다.
     await updatePage(cfg, pageId, {
       "발행 시각": { date: { start: new Date().toISOString() } },
@@ -1982,9 +1996,9 @@ async function createMetricLog(cfg: Config, target: PostTarget, delta: Metrics, 
 type MetricTargets = {
   targets: PostTarget[];
   known: Set<string>;
-  // 산출물이 연결된 게시물: 채널:코드 → 산출물 id. 같은 게시물의 다른 기록을 이 산출물에 붙인다.
+  // 콘텐츠가 연결된 게시물: 채널:코드 → 콘텐츠 id. 같은 게시물의 다른 기록을 이 콘텐츠에 붙인다.
   contentByKey: Map<string, string>;
-  // 산출물이 비어 있는 게시물 기록(내림 제외). 같은 게시물 기록이 둘 이상일 수 있다.
+  // 콘텐츠가 비어 있는 게시물 기록(내림 제외). 같은 게시물 기록이 둘 이상일 수 있다.
   unlinked: Map<string, { id: string; title: string }[]>;
 };
 
@@ -1997,6 +2011,7 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
   const known = new Set<string>();
   const contentByKey = new Map<string, string>();
   const unlinked = new Map<string, { id: string; title: string }[]>();
+  const contentProp = await postContentProp(cfg);
   for (const row of rows) {
     const props = (row.properties ?? {}) as Json;
     const link = String(props["게시 링크"]?.url ?? "").trim();
@@ -2005,7 +2020,7 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
     if (channel === null || code === "") continue;
     const key = `${channel}:${code}`;
     known.add(key);
-    const contentId = relationIds(props["산출물"])[0];
+    const contentId = relationIds(props[contentProp])[0];
     if (contentId) contentByKey.set(key, contentId);
     if (selectName(props["게시 상태"]) === "내림") continue;
     if (!contentId) unlinked.set(key, [...(unlinked.get(key) ?? []), { id: row.id, title: pageTitle(props) }]);
@@ -2016,7 +2031,7 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
 }
 
 /**
- * 산출물이 없는 게시물로 산출물을 만든다. 이미 올라간 글이므로 상태는 게시, 그 채널 상태는 ✅ 완료로 둬서
+ * 콘텐츠가 없는 게시물로 콘텐츠를 만든다. 이미 올라간 글이므로 상태는 게시, 그 채널 상태는 ✅ 완료로 둬서
  * 누가 배포 버튼을 눌러도 다시 올리지 않게 한다. 링크는 게시물 기록에만 둔다. 캡션에는 게시물 글을 그대로 담는다.
  */
 async function createContentForPost(cfg: Config, post: AccountPost): Promise<string> {
@@ -2050,15 +2065,15 @@ async function createContentForPost(cfg: Config, post: AccountPost): Promise<str
   return page.id;
 }
 
-const MEMO_CONTENT_LINKED = "성과 수집이 같은 링크의 산출물을 찾아 자동으로 연결함.";
-const MEMO_CONTENT_CREATED = "성과 수집이 산출물이 없어 게시물 글로 산출물을 자동으로 만들어 연결함.";
+const MEMO_CONTENT_LINKED = "성과 수집이 같은 링크의 콘텐츠를 찾아 자동으로 연결함.";
+const MEMO_CONTENT_CREATED = "성과 수집이 콘텐츠가 없어 게시물 글로 콘텐츠를 자동으로 만들어 연결함.";
 
 async function linkPostToContent(cfg: Config, postId: string, contentId: string, created: boolean): Promise<void> {
   await notion(cfg, `/pages/${postId}`, {
     method: "PATCH",
     body: JSON.stringify({
       properties: {
-        "산출물": { relation: [{ id: contentId }] },
+        [await postContentProp(cfg)]: { relation: [{ id: contentId }] },
         "메모": { rich_text: [{ type: "text", text: { content: created ? MEMO_CONTENT_CREATED : MEMO_CONTENT_LINKED } }] },
       },
     }),
@@ -2072,13 +2087,13 @@ type AccountPost = {
   link: string;
   text: string;
   publishedAt: string;
-  // API 의 미디어 종류(REELS·CAROUSEL_ALBUM·TEXT_POST 등). 산출물 형식을 고를 때 쓴다.
+  // API 의 미디어 종류(REELS·CAROUSEL_ALBUM·TEXT_POST 등). 콘텐츠 형식을 고를 때 쓴다.
   mediaType: string;
 };
 
 /**
  * 계정에는 있는데 게시물 DB 에 없는 게시물(직접 올린 것 등)의 게시물 기록을 만든다.
- * content 가 있으면 그 산출물을 연결한다. 메모로 자동 생성임을 남긴다.
+ * content 가 있으면 그 콘텐츠를 연결한다. 메모로 자동 생성임을 남긴다.
  */
 async function importPost(
   cfg: Config,
@@ -2104,14 +2119,14 @@ async function importPost(
         "게시 링크": { url: post.link },
         "게시 상태": { select: { name: "게시" } },
         ...(post.publishedAt ? { "게시일": { date: { start: post.publishedAt } } } : {}),
-        ...(content ? { "산출물": { relation: [{ id: content.id }] } } : {}),
+        ...(content ? { [await postContentProp(cfg)]: { relation: [{ id: content.id }] } } : {}),
         "메모": {
           rich_text: [{
             type: "text",
             text: {
               content: content
                 ? `성과 수집이 계정에서 찾아 자동으로 만든 기록. ${content.created ? MEMO_CONTENT_CREATED : MEMO_CONTENT_LINKED}`
-                : "성과 수집이 계정에서 찾아 자동으로 만든 기록. 산출물은 직접 연결하세요.",
+                : "성과 수집이 계정에서 찾아 자동으로 만든 기록. 콘텐츠는 직접 연결하세요.",
             },
           }],
         },
@@ -2245,7 +2260,7 @@ async function runMetrics(
   const imported: string[] = [];
   const contents = { linked: [] as MetricChannel[], created: [] as MetricChannel[], errors: [] as string[] };
 
-  // 게시물에 붙일 산출물: 같은 게시물이 연결된 산출물이 있으면 그것, 없으면 새로 만든다(dryRun 이면 만들지 않는다).
+  // 게시물에 붙일 콘텐츠: 같은 게시물이 연결된 콘텐츠가 있으면 그것, 없으면 새로 만든다(dryRun 이면 만들지 않는다).
   const resolveContent = async (post: AccountPost): Promise<{ id: string; created: boolean }> => {
     const key = `${post.channel}:${post.code}`;
     const existing = found.contentByKey.get(key);
@@ -2263,7 +2278,7 @@ async function runMetrics(
       // 한 번에 많이 만들면 함수 시간 한도에 걸린다. 남은 것은 다음 실행이 이어서 만든다.
       if (!dryRun && Date.now() - started > METRICS_TIME_BUDGET_MS / 2) break;
       if (known.has(key)) {
-        // 이미 있는 게시물 기록 중 산출물이 빈 것은 산출물을 찾아 붙이거나 새로 만든다.
+        // 이미 있는 게시물 기록 중 콘텐츠가 빈 것은 콘텐츠를 찾아 붙이거나 새로 만든다.
         const rows = found.unlinked.get(key);
         if (!rows) continue;
         found.unlinked.delete(key);
@@ -2272,7 +2287,7 @@ async function runMetrics(
           if (!dryRun) for (const row of rows) await linkPostToContent(cfg, row.id, content.id, content.created);
           (content.created ? contents.created : contents.linked).push(post.channel);
         } catch (e) {
-          console.warn("산출물 연결 실패", rows[0].title, message(e));
+          console.warn("콘텐츠 연결 실패", rows[0].title, message(e));
           contents.errors.push(`${rows[0].title}: ${message(e)}`);
         }
         continue;
@@ -2295,7 +2310,7 @@ async function runMetrics(
         content = await resolveContent(post);
         (content.created ? contents.created : contents.linked).push(post.channel);
       } catch (e) {
-        console.warn("산출물 연결 실패", title, message(e));
+        console.warn("콘텐츠 연결 실패", title, message(e));
         contents.errors.push(`${title}: ${message(e)}`);
       }
       try {
