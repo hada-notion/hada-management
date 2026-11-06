@@ -46,6 +46,8 @@ import {
   contentFieldName,
   replyMediaKind,
   sortByCreated,
+  threadsIdFromMemo,
+  threadsIdNote,
   kstDateTime,
   applyMetricScope,
   autoCollectDue,
@@ -723,4 +725,10 @@ Deno.test("sortByCreated: 하위 항목은 만든 순서대로", () => {
     { pageId: "a", createdTime: "2026-11-06T03:00:00.000Z" },
   ]);
   assertEquals(sorted.map((item) => item.pageId), ["b", "a", "c"]);
+});
+
+Deno.test("threadsIdNote·threadsIdFromMemo: 게시물 메모에 남긴 스레드 글 ID를 다시 읽는다", () => {
+  assertEquals(threadsIdFromMemo(threadsIdNote("18012345678901234")), "18012345678901234");
+  assertEquals(threadsIdFromMemo("성과 수집이 계정에서 찾아 자동으로 만든 기록."), "");
+  assertEquals(threadsIdFromMemo(""), "");
 });

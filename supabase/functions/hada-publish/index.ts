@@ -74,10 +74,11 @@ import {
   parsePageId,
   readTarget,
   resolveRedirectUri,
-  sortCuts,
   sortByCreated,
   contentFieldName,
   replyMediaKind,
+  threadsIdFromMemo,
+  threadsIdNote,
   optionalText,
   summarizeApiError,
   threadsLength,
@@ -333,10 +334,6 @@ function contentField(props: Json, field: ContentField): Json | undefined {
 
 function contentFiles(props: Json, field: ContentField = "file"): any[] {
   return (contentField(props, field)?.files ?? []) as any[];
-}
-
-function cutOrder(prop: Json | undefined): number {
-  return typeof prop?.number === "number" ? prop.number : Number.POSITIVE_INFINITY;
 }
 
 async function updatePage(cfg: Config, pageId: string, properties: Json): Promise<void> {
@@ -1358,6 +1355,7 @@ async function recordPublishedPost(
   props: Json,
   channel: string,
   link: string,
+  threadsId = "",
 ): Promise<string> {
   const channelId = await findChannelPageId(cfg, channel);
   const fields: Json = {
@@ -1365,6 +1363,8 @@ async function recordPublishedPost(
     "게시일": { date: { start: new Date().toISOString() } },
   };
   if (link) fields["게시 링크"] = { url: link };
+  // 스레드 답글의 성과를 읽을 때 쓴다(threadsIdNote 설명 참고).
+  if (threadsId) fields["메모"] = { rich_text: [{ type: "text", text: { content: threadsIdNote(threadsId) } }] };
 
   const existing = await findPostRecords(cfg, pageId, channelId);
   const empty = existing.find((row) => !((row.properties ?? {}) as Json)["게시 링크"]?.url);
@@ -1433,41 +1433,17 @@ async function createPostRecords(
 // ---------- 발행 ----------
 
 /**
- * 예전 방식: 컷(프롬프트)에 연결된 컷들의 미리보기 이미지를 컷 순서대로 모은다.
- * 카드뉴스 이미지를 '콘텐츠' 칸으로 옮기는 동안만 쓴다. '콘텐츠' 칸에 이미지가 있으면 그쪽이 먼저다.
- */
-async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> {
-  const cutIds = relationIds(props["컷(프롬프트)"]);
-  if (cutIds.length === 0) {
-    throw new Error("'콘텐츠'에 이미지가 없습니다. 카드뉴스 이미지를 순서대로 올려주세요.");
-  }
-  const cuts: { pageId: string; order: number; files: any[] }[] = [];
-  for (const cutId of cutIds) {
-    const cutPage = await notion(cfg, `/pages/${cutId}`);
-    const cutProps = (cutPage.properties ?? {}) as Json;
-    cuts.push({
-      pageId: cutId,
-      order: cutOrder(cutProps["컷 순서"]),
-      files: cutProps["미리보기"]?.files ?? [],
-    });
-  }
-  const sourceUrls: string[] = [];
-  for (const cut of sortCuts(cuts)) sourceUrls.push(...extractImageUrls(cut.files));
-  if (sourceUrls.length === 0) {
-    throw new Error("발행할 이미지를 찾지 못했습니다. 컷의 '미리보기' 파일을 확인하세요.");
-  }
-  return sourceUrls;
-}
-
-/**
  * '형식'에 따라 발행 소스를 정한다.
  * 카드뉴스는 '콘텐츠' 이미지 캐러셀(넣은 순서대로), 이미지는 한 장, 영상은 '콘텐츠' 영상, 짧은글은 글만 올린다.
  */
-async function collectSources(cfg: Config, props: Json, kind: MediaKind): Promise<MediaPlan> {
+function collectSources(props: Json, kind: MediaKind): MediaPlan {
   const files = contentFiles(props);
   if (kind === "carousel") {
     const urls = extractImageUrls(files);
-    return { kind: "images", urls: urls.length > 0 ? urls : await collectCutImageUrls(cfg, props) };
+    if (urls.length === 0) {
+      throw new Error("'콘텐츠'에 이미지가 없습니다. 카드뉴스 이미지를 올릴 순서대로 넣어주세요.");
+    }
+    return { kind: "images", urls };
   }
   if (kind === "image") {
     const urls = extractImageUrls(files);
@@ -1556,7 +1532,7 @@ async function publishThreadsReplies(
         "발행 시각": { date: { start: new Date().toISOString() } },
       });
       try {
-        await recordPublishedPost(cfg, item.pageId, item.props, "스레드", reply.link);
+        await recordPublishedPost(cfg, item.pageId, item.props, "스레드", reply.link, reply.id);
       } catch (e) {
         postFailures.push(`스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}`);
       }
@@ -1669,7 +1645,7 @@ async function publishRow(
     );
   }
 
-  const plan = await collectSources(cfg, props, kind);
+  const plan = collectSources(props, kind);
   const captionText = richText(contentField(props, "body"));
   const caption = buildCaption(captionText, cfg.fixedComment);
   const title = youtubeTitle(richText(contentField(props, "title")), pageTitle(props));
@@ -1865,7 +1841,7 @@ async function publishRow(
 
       // 링크는 게시물 기록에 남긴다. 이미 올라간 글이므로 기록 실패는 발행 실패로 치지 않고 따로 알린다.
       try {
-        await recordPublishedPost(cfg, pageId, props, channel, link);
+        await recordPublishedPost(cfg, pageId, props, channel, link, threadsRootId);
       } catch (e) {
         postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
       }
@@ -2026,7 +2002,16 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 const METRICS_TIME_BUDGET_MS = 110000;
 const MEDIA_LIST_PAGES = 5;
 
-type PostTarget = { id: string; title: string; link: string; channel: MetricChannel; code: string; publishedAt: string };
+// threadsId: 발행할 때 게시물 메모에 남긴 스레드 글 ID. 계정 글 목록에 없는 답글의 성과를 읽을 때 쓴다.
+type PostTarget = {
+  id: string;
+  title: string;
+  link: string;
+  channel: MetricChannel;
+  code: string;
+  publishedAt: string;
+  threadsId: string;
+};
 type CollectResult = { post: string; channel: MetricChannel; status: string; delta?: Metrics; error?: string };
 
 async function queryAll(cfg: Config, dataSourceId: string, filter?: Json): Promise<Json[]> {
@@ -2180,7 +2165,8 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
     if (selectName(props["게시 상태"]) === "내림") continue;
     if (!contentId) unlinked.set(key, [...(unlinked.get(key) ?? []), { id: row.id, title: pageTitle(props) }]);
     const publishedAt = String(props["게시일"]?.date?.start ?? "");
-    targets.push({ id: row.id, title: pageTitle(props), link, channel, code, publishedAt });
+    const threadsId = threadsIdFromMemo(richText(props["메모"]));
+    targets.push({ id: row.id, title: pageTitle(props), link, channel, code, publishedAt, threadsId });
   }
   return { targets, known, contentByKey, unlinked };
 }
@@ -2317,7 +2303,15 @@ async function importPost(
       },
     }),
   });
-  return { id: page.id, title, link: post.link, channel: post.channel, code: post.code, publishedAt: post.publishedAt };
+  return {
+    id: page.id,
+    title,
+    link: post.link,
+    channel: post.channel,
+    code: post.code,
+    publishedAt: post.publishedAt,
+    threadsId: "",
+  };
 }
 
 /** 유튜브 채널 업로드 목록. 채널은 게시물 DB 에 이미 있는 영상에서 알아낸다(YOUTUBE_CHANNEL_ID 가 있으면 그것도). */
@@ -2559,10 +2553,11 @@ async function runMetrics(
       mediaType: String(item.media_type ?? ""),
     })));
     for (const target of targets.filter((t) => t.channel === "threads")) {
-      const item = media.get(target.code);
-      if (!item) continue;
+      // 답글은 계정 글 목록에 없다. 발행 때 남긴 글 ID가 있으면 그것으로 읽는다.
+      const mediaId = String(media.get(target.code)?.id ?? "") || target.threadsId;
+      if (mediaId === "") continue;
       try {
-        current.set(target.id, await threadsMetrics(cfg, auth, item.id));
+        current.set(target.id, await threadsMetrics(cfg, auth, mediaId));
       } catch (e) {
         results.push({ post: target.title, channel: "threads", status: "실패", error: message(e) });
       }
