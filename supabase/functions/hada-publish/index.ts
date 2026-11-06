@@ -1,10 +1,10 @@
 // META 업로드 자동화 — 노션 웹훅을 받아 인스타그램·스레드에 발행한다.
 //
-// 발행 소스는 컨텐츠 DB 의 '형식'으로 정한다.
+// 발행 소스는 콘텐츠 DB 의 '형식'으로 정한다.
 //   카드뉴스    → 컷(프롬프트)의 미리보기 이미지 캐러셀
-//   이미지      → 컨텐츠 '미리보기' 한 장
-//   숏폼(9:16)  → 컨텐츠 '미리보기' 영상 (릴스)
-//   롱폼(16:9)  → 컨텐츠 '미리보기' 영상 (릴스)
+//   이미지      → 콘텐츠 '미리보기' 한 장
+//   숏폼(9:16)  → 콘텐츠 '미리보기' 영상 (릴스)
+//   롱폼(16:9)  → 콘텐츠 '미리보기' 영상 (릴스)
 //   짧은글      → 글만. 스레드 전용이다. 인스타그램은 미디어 없는 발행을 지원하지 않는다.
 //   긴글        → 자동 발행하지 않는다(블로그용).
 //   예전 이름(영상-세로(9:16)·영상-가로(16:9)·카피)도 그대로 받는다.
@@ -83,6 +83,7 @@ import {
   contentFormatFor,
   postHeadline,
   pickPostContentProp,
+  pickContentTypeOption,
   metricChannelByLabel,
   metricsErrorSummary,
   metricsResultSummary,
@@ -236,7 +237,7 @@ function buildConfig() {
     bucket: optionalEnv("PUBLISH_BUCKET") || "meta-publish",
     jobTable: optionalEnv("JOB_TABLE") || "meta_jobs",
     fixedComment: optionalEnv("PUBLISH_FIXED_COMMENT"),
-    // 큐 모드에서 조회할 컨텐츠(학원관리) DB.
+    // 큐 모드에서 조회할 콘텐츠(하다) DB.
     contentDataSourceId: optionalEnv("CONTENT_DATA_SOURCE_ID") ||
       "dda5e4d7-d1b1-4c24-a75a-9442ce9664ca",
     contentDatabaseId: optionalEnv("CONTENT_DATABASE_ID") ||
@@ -1203,7 +1204,7 @@ async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
       body,
     }));
   } catch (e) {
-    throw new Error(`컨텐츠 DB 조회에 실패했습니다. (${firstError} / ${message(e)})`);
+    throw new Error(`콘텐츠 DB 조회에 실패했습니다. (${firstError} / ${message(e)})`);
   }
 }
 
@@ -1404,7 +1405,7 @@ async function collectCutImageUrls(cfg: Config, props: Json): Promise<string[]> 
   return sourceUrls;
 }
 
-/** 컨텐츠 페이지의 '미리보기' 파일. 영상·이미지·짧은글처럼 한 덩어리인 형식에서 쓴다. */
+/** 콘텐츠 페이지의 '미리보기' 파일. 영상·이미지·짧은글처럼 한 덩어리인 형식에서 쓴다. */
 function previewFiles(props: Json): any[] {
   return (props["미리보기"]?.files ?? []) as any[];
 }
@@ -1816,7 +1817,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
       processed: 0,
       results: [],
       remaining: [],
-      message: "요청(⚪ 대기)으로 남아 있는 컨텐츠가 없습니다.",
+      message: "요청(⚪ 대기)으로 남아 있는 콘텐츠가 없습니다.",
     };
   }
 
@@ -1855,7 +1856,7 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
 /**
  * 발행할 페이지를 정한다.
  * 본문에 페이지 지정이 있으면 그것을 쓰고, 없으면 본문 어딘가에 실린 노션 주소 중
- * 실제 컨텐츠 페이지('컷(프롬프트)' 관계가 있는 페이지)를 골라 쓴다.
+ * 실제 콘텐츠 페이지('컷(프롬프트)' 관계가 있는 페이지)를 골라 쓴다.
  * 아무것도 못 찾으면 빈 문자열을 돌려주고 호출부는 큐 모드로 넘어간다.
  */
 // ---------- 성과 수집 ----------
@@ -2030,6 +2031,20 @@ async function findMetricTargets(cfg: Config): Promise<MetricTargets> {
   return { targets, known, contentByKey, unlinked };
 }
 
+let contentTypeOptionName = "";
+
+/** 콘텐츠 DB `유형`에서 올리는 콘텐츠를 뜻하는 선택지('콘텐츠', 예전 철자 '컨텐츠'). 한 번 읽어 둔다. */
+async function contentTypeOption(cfg: Config): Promise<string> {
+  if (contentTypeOptionName === "") {
+    const source = await notion(cfg, `/data_sources/${cfg.contentDataSourceId}`, {
+      headers: { "Notion-Version": POST_API_VERSION },
+    });
+    const options = ((source.properties?.["유형"]?.select?.options ?? []) as Json[]).map((option) => String(option.name));
+    contentTypeOptionName = pickContentTypeOption(options);
+  }
+  return contentTypeOptionName;
+}
+
 /**
  * 콘텐츠가 없는 게시물로 콘텐츠를 만든다. 이미 올라간 글이므로 상태는 게시, 그 채널 상태는 ✅ 완료로 둬서
  * 누가 배포 버튼을 눌러도 다시 올리지 않게 한다. 링크는 게시물 기록에만 둔다. 캡션에는 게시물 글을 그대로 담는다.
@@ -2052,7 +2067,7 @@ async function createContentForPost(cfg: Config, post: AccountPost): Promise<str
       parent: { type: "data_source_id", data_source_id: cfg.contentDataSourceId },
       properties: {
         "이름": { title: [{ type: "text", text: { content: postHeadline(post.text) || `${label} 게시물` } }] },
-        "유형": { select: { name: "컨텐츠" } },
+        "유형": { select: { name: await contentTypeOption(cfg) } },
         "상태": { select: { name: CONTENT_STATUS_PUBLISHED } },
         ...(format ? { "형식": { select: { name: format } } } : {}),
         "배포 채널": { multi_select: [{ name: label }] },
