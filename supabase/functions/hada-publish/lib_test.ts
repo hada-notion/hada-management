@@ -45,6 +45,7 @@ import {
   pickContentTypeOption,
   contentFieldName,
   replyMediaKind,
+  scheduleDecision,
   sortByCreated,
   threadsIdFromMemo,
   threadsIdNote,
@@ -740,4 +741,16 @@ Deno.test("threadsIdNote·threadsIdFromMemo: 게시물 메모에 남긴 스레�
   assertEquals(threadsIdFromMemo(threadsIdNote("18012345678901234")), "18012345678901234");
   assertEquals(threadsIdFromMemo("성과 수집이 계정에서 찾아 자동으로 만든 기록."), "");
   assertEquals(threadsIdFromMemo(""), "");
+});
+
+Deno.test("scheduleDecision: 예약 시각이 된 게시대기 글만 올린다", () => {
+  const now = Date.parse("2026-11-10T09:00:00+09:00");
+  assertEquals(scheduleDecision("2026-11-10T08:55:00.000+09:00", now, [""]), "publish");
+  assertEquals(scheduleDecision("2026-11-10T09:00:00.000+09:00", now, []), "publish");
+  assertEquals(scheduleDecision("2026-11-10T09:05:00.000+09:00", now, [""]), "not-yet");
+  assertEquals(scheduleDecision("2026-11-10", now, [""]), "no-time");
+  assertEquals(scheduleDecision("", now, [""]), "empty");
+  assertEquals(scheduleDecision(null, now, [""]), "empty");
+  assertEquals(scheduleDecision("2026-11-10T08:00:00.000+09:00", now, ["⚪ 대기"]), "started");
+  assertEquals(scheduleDecision("2026-11-10T08:00:00.000+09:00", now, ["", "⚠️ 오류"]), "started");
 });
