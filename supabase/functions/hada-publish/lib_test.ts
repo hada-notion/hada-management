@@ -13,6 +13,7 @@ import {
   hexPreview,
   extensionFor,
   extractImageUrls,
+  extractMediaItems,
   extractVideoUrls,
   isImageUrl,
   isThreadsNotFound,
@@ -753,4 +754,18 @@ Deno.test("scheduleDecision: 예약 시각이 된 게시대기 글만 올린다"
   assertEquals(scheduleDecision(null, now, [""]), "empty");
   assertEquals(scheduleDecision("2026-11-10T08:00:00.000+09:00", now, ["⚪ 대기"]), "started");
   assertEquals(scheduleDecision("2026-11-10T08:00:00.000+09:00", now, ["", "⚠️ 오류"]), "started");
+});
+
+Deno.test("extractMediaItems keeps order and splits image/video", () => {
+  const files = [
+    { name: "a.png", file: { url: "https://x/a.png?s=1" } },
+    { name: "b.mp4", file: { url: "https://x/b?s=2" } },
+    { name: "c.jpg", external: { url: "https://x/c.jpg" } },
+    { name: "empty" },
+  ];
+  assertEquals(extractMediaItems(files as any), [
+    { type: "image", url: "https://x/a.png?s=1" },
+    { type: "video", url: "https://x/b?s=2" },
+    { type: "image", url: "https://x/c.jpg" },
+  ]);
 });
