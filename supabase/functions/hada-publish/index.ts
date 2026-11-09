@@ -67,6 +67,7 @@ import {
   extensionFor,
   hexPreview,
   extractImageUrls,
+  extractMediaItems,
   extractVideoUrls,
   isThreadsNotFound,
   isThreadsNotReady,
@@ -122,7 +123,7 @@ import {
   YOUTUBE_OAUTH_STATE,
   YOUTUBE_SCOPES,
 } from "./lib.ts";
-import type { ContentField, MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
+import type { ContentField, MediaItem, MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
 const IG_CONTAINER_POLL_ATTEMPTS = 10;
@@ -841,6 +842,8 @@ const threadsGet = (cfg: Config, auth: ThreadsAuth, path: string) =>
  */
 type MediaPlan =
   | { kind: "images"; urls: string[] }
+  // 카드뉴스에 영상이 섞이면 넣은 순서대로 이미지·영상을 함께 캐러셀로 올린다(스레드).
+  | { kind: "mixed"; items: MediaItem[] }
   | { kind: "video"; url: string }
   | { kind: "text" };
 
@@ -941,6 +944,20 @@ async function publishThreads(
       video_url: media.url,
       ...textParams,
     });
+    containerId = container.id;
+    await waitForThreadsContainer(cfg, auth, containerId);
+  } else if (media.kind === "mixed") {
+    assertCarouselSize(media.items.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
+    const children: string[] = [];
+    for (const item of media.items) {
+      const child = await threadsPost(cfg, auth, `${uid}/threads`, item.type === "video"
+        ? { media_type: "VIDEO", video_url: item.url, is_carousel_item: "true" }
+        : { media_type: "IMAGE", image_url: item.url, is_carousel_item: "true" });
+      children.push(child.id);
+    }
+    console.log("스레드 자식 컨테이너(영상 포함)", children.length, "개 생성");
+    await Promise.all(children.map((id) => waitForThreadsContainer(cfg, auth, id)));
+    const container = await createThreadsCarousel(cfg, auth, children, text, replyToId);
     containerId = container.id;
     await waitForThreadsContainer(cfg, auth, containerId);
   } else if (media.urls.length === 1) {
@@ -1448,6 +1465,8 @@ async function createPostRecords(
 function collectSources(props: Json, kind: MediaKind): MediaPlan {
   const files = contentFiles(props);
   if (kind === "carousel") {
+    const items = extractMediaItems(files);
+    if (items.some((item) => item.type === "video")) return { kind: "mixed", items };
     const urls = extractImageUrls(files);
     if (urls.length === 0) {
       throw new Error("'콘텐츠'에 이미지가 없습니다. 카드뉴스 이미지를 올릴 순서대로 넣어주세요.");
@@ -1614,6 +1633,14 @@ async function uploadPlan(cfg: Config, pageId: string, plan: MediaPlan): Promise
   if (plan.kind === "text") return plan;
   if (plan.kind === "video") {
     return { kind: "video", url: await uploadMedia(cfg, pageId, 0, plan.url, "video") };
+  }
+  if (plan.kind === "mixed") {
+    const items: MediaItem[] = [];
+    for (let index = 0; index < plan.items.length; index++) {
+      const item = plan.items[index];
+      items.push({ type: item.type, url: await uploadMedia(cfg, pageId, index, item.url, item.type) });
+    }
+    return { kind: "mixed", items };
   }
   const urls: string[] = [];
   for (let index = 0; index < plan.urls.length; index++) {
@@ -1901,6 +1928,9 @@ async function publishRow(
       let threadsRootId = "";
       let threadsAuth: ThreadsAuth | null = null;
       if (channel === "인스타그램") {
+        if (media.kind === "mixed") {
+          throw new Error("인스타그램은 영상이 섞인 카드뉴스를 아직 올리지 못합니다. '배포 채널'에서 인스타그램을 빼거나 이미지만 넣어주세요.");
+        }
         if (media.kind === "video") {
           // 섬네일은 릴스 커버로 쓴다. 공개 주소가 필요해 콘텐츠 파일과 같은 곳에 올린다.
           const cover = thumbnail === "" ? "" : await uploadMedia(cfg, pageId, "cover", thumbnail, "image");

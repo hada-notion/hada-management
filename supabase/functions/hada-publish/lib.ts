@@ -324,6 +324,19 @@ export function isVideoUrl(url: string, name?: string): boolean {
   return /\.(mp4|mov|webm|m4v)$/.test(target);
 }
 
+export type MediaItem = { type: "image" | "video"; url: string };
+
+/** '콘텐츠' 칸 파일을 넣은 순서 그대로 이미지·영상으로 나눈다(카드뉴스에 영상이 섞인 경우). */
+export function extractMediaItems(files: NotionFile[] | undefined): MediaItem[] {
+  const items: MediaItem[] = [];
+  for (const f of files ?? []) {
+    const url = f?.file?.url ?? f?.external?.url ?? "";
+    if (url === "") continue;
+    items.push({ type: isVideoUrl(url, f?.name) ? "video" : "image", url });
+  }
+  return items;
+}
+
 export function extractVideoUrls(files: NotionFile[] | undefined): string[] {
   const urls: string[] = [];
   for (const f of files ?? []) {
