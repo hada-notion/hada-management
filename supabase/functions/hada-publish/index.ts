@@ -30,6 +30,9 @@
 // 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'·'유튜브 상태'와 '실시간 처리 상태' 수식으로 확인한다.
 // 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
 //
+// 예약 발행: POST /functions/v1/hada-publish?due=1  (pg_cron 5분마다, x-cron-key)
+//   상태=게시대기이고 '예약 시각'(날짜+시간)이 지난 행을 배포 버튼과 같은 경로로 올린다.
+//
 // 오류 문구에는 비밀값이 섞여 들어올 수 있다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
 // 노션에 쓰기 전에 summarizeApiError 로 요약하고 maskSecrets 로 가린다.
 //
@@ -77,6 +80,7 @@ import {
   sortByCreated,
   contentFieldName,
   replyMediaKind,
+  scheduleDecision,
   threadsIdFromMemo,
   threadsIdNote,
   optionalText,
@@ -2060,6 +2064,80 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
   return body;
 }
 
+// ---------- 예약 발행 ----------
+// 대표가 콘텐츠를 '게시대기'로 두고 '예약 시각'(날짜+시간)을 넣으면, pg_cron 이 5분마다 ?due=1 을 불러
+// 시각이 된 행을 배포 버튼과 같은 경로(publishRow)로 올린다(supabase/publish_cron.sql).
+// 발행할 채널 상태가 이미 있으면(대기·작업중·완료·오류) 건너뛴다. 실패한 글을 5분마다 다시 올리는 일을 막는다.
+
+const SCHEDULE_PROP = "예약 시각";
+const SCHEDULE_NO_TIME_NOTE = "예약 시각에 시간이 없어 예약 발행을 건너뛰었습니다. 날짜와 시간을 함께 넣어 주세요.";
+
+async function findDuePages(cfg: Config, nowIso: string): Promise<Json[]> {
+  const filter = {
+    and: [
+      { property: "상태", select: { equals: CONTENT_STATUS_WAITING } },
+      { property: SCHEDULE_PROP, date: { on_or_before: nowIso } },
+      {
+        or: CHANNELS.map((channel) => ({ property: "배포 채널", multi_select: { contains: channel } })),
+      },
+    ],
+  };
+  const res = await notion(cfg, `/data_sources/${cfg.contentDataSourceId}/query`, {
+    method: "POST",
+    headers: { "Notion-Version": "2025-09-03" },
+    body: JSON.stringify({ filter, page_size: 20 }),
+  });
+  return (res.results ?? []) as Json[];
+}
+
+async function runDue(cfg: Config, dryRun: boolean): Promise<Json> {
+  const startedAt = Date.now();
+  const nowIso = new Date(startedAt).toISOString();
+  const pages = await findDuePages(cfg, nowIso);
+  const results: Json[] = [];
+  const skipped: Json[] = [];
+  const remaining: string[] = [];
+  for (const page of pages) {
+    const pageId = page.id as string;
+    const props = (page.properties ?? {}) as Json;
+    const deploy = multiSelectNames(props["배포 채널"]);
+    const statuses = CHANNELS.filter((channel) => deploy.includes(channel))
+      .map((channel) => selectName(props[RESULT_PROP[channel]]));
+    const start = ((props[SCHEDULE_PROP] as Json)?.date as Json | null)?.start as string | undefined;
+    const decision = scheduleDecision(start, startedAt, statuses);
+    if (decision !== "publish") {
+      skipped.push({ pageId, decision });
+      // 시간 없는 예약은 페이지에 한 번만 알린다(같은 문구면 다시 쓰지 않는다).
+      if (decision === "no-time" && !dryRun && richText(props["마지막 오류"] as Json) !== SCHEDULE_NO_TIME_NOTE) {
+        await updatePage(cfg, pageId, {
+          "마지막 오류": { rich_text: [{ type: "text", text: { content: SCHEDULE_NO_TIME_NOTE } }] },
+        }).catch((e) => console.error("예약 안내 기록 실패", pageId, message(e)));
+      }
+      continue;
+    }
+    if (results.length > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
+      remaining.push(pageId);
+      continue;
+    }
+    try {
+      results.push({ pageId, scheduledAt: start, ...(await publishRow(cfg, pageId, dryRun, null, true)) });
+    } catch (e) {
+      results.push({ pageId, scheduledAt: start, ok: false, error: message(e) });
+    }
+  }
+  return {
+    ok: results.every((item) => item.ok !== false),
+    due: true,
+    dryRun,
+    now: nowIso,
+    found: pages.length,
+    processed: results.length,
+    results,
+    skipped,
+    remaining,
+  };
+}
+
 // ---------- 진입점 ----------
 
 /**
@@ -2936,11 +3014,12 @@ Deno.serve(async (req) => {
   }
 
   // Supabase pg_cron 의 매시 호출은 x-cron-key 로 들어온다. 값은 meta_tokens 표(channel = cron)에만 있고,
-  // 예약 성과 수집(?metrics=1&scheduled=1)에만 통한다.
+  // 예약 성과 수집(?metrics=1&scheduled=1)과 예약 발행(?due=1)에만 통한다.
   const cronKey = req.headers.get("x-cron-key") ?? "";
-  const cronOk = cronKey !== "" &&
-    reqUrl.searchParams.get("metrics") === "1" &&
-    reqUrl.searchParams.get("scheduled") === "1" &&
+  // 예약 발행(?due=1)도 같은 키로 5분마다 들어온다.
+  const cronRoute = (reqUrl.searchParams.get("metrics") === "1" && reqUrl.searchParams.get("scheduled") === "1") ||
+    reqUrl.searchParams.get("due") === "1";
+  const cronOk = cronKey !== "" && cronRoute &&
     (await readToken(cfg, "cron").catch(() => null))?.access_token === cronKey;
   if (!cronOk && req.headers.get("x-admin-key") !== cfg.adminSecret) {
     return json({ ok: false, error: "인증에 실패했습니다. x-admin-key 헤더를 확인하세요." }, 401);
@@ -2997,6 +3076,30 @@ Deno.serve(async (req) => {
     }
   }
   const wait = reqUrl.searchParams.get("wait") === "1";
+
+  // 예약 발행. pg_cron 호출은 10초 안에 끝나야 하므로 접수(202)만 돌려주고 뒤에서 올린다.
+  if (reqUrl.searchParams.get("due") === "1") {
+    const dueTask = runDue(cfg, dryRun);
+    const runtime = (globalThis as {
+      EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
+    }).EdgeRuntime;
+    if (!wait && runtime?.waitUntil) {
+      runtime.waitUntil(
+        dueTask
+          .then((body) => console.log("예약 발행 결과", JSON.stringify(body)))
+          .catch((e) => console.error("예약 발행 실패", message(e))),
+      );
+      return json({ ok: true, accepted: true, message: "예약 발행 확인을 시작했습니다." }, 202);
+    }
+    try {
+      const body = await dueTask;
+      return json(body, body.ok === false ? 500 : 200);
+    } catch (e) {
+      console.error("예약 발행 실패", message(e));
+      return json({ ok: false, error: message(e) }, 500);
+    }
+  }
+
   const hintText = channelHint(reqUrl.searchParams.get("channel"));
   const hint: Channel | null = hintText !== null && (CHANNELS as readonly string[]).includes(hintText)
     ? hintText as Channel

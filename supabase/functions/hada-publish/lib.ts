@@ -446,6 +446,31 @@ export function planDeploy(
   return plan;
 }
 
+export type ScheduleDecision = "publish" | "empty" | "no-time" | "not-yet" | "started";
+
+/**
+ * 예약 발행: 게시대기 콘텐츠의 '예약 시각'이 됐는지 판단한다.
+ * - empty: 예약 시각이 비었다(배포 버튼으로만 올린다)
+ * - no-time: 날짜만 있고 시간이 없다. 자정에 올라가는 사고를 막으려고 발행하지 않는다
+ * - not-yet: 아직 시각 전이다
+ * - started: 발행할 채널 중 하나라도 상태가 이미 있다(대기·작업중·완료·오류). 두 번 올리지 않는다
+ * - publish: 지금 올린다
+ */
+export function scheduleDecision(
+  start: string | null | undefined,
+  nowMs: number,
+  channelStatuses: string[],
+): ScheduleDecision {
+  const value = (start ?? "").trim();
+  if (value === "") return "empty";
+  if (!value.includes("T")) return "no-time";
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return "empty";
+  if (at > nowMs) return "not-yet";
+  if (channelStatuses.some((status) => (status ?? "").trim() !== "")) return "started";
+  return "publish";
+}
+
 /**
  * 환경값에 붙여넣기 사고로 따옴표나 JSON 조각이 섞이는 일이 있었다
  * (실제로 토큰 뒤에 `","instagram_business_account":{...}` 가 붙어 있어 메타가 401 로 거절했다).
