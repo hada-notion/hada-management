@@ -323,6 +323,49 @@ Deno.test("retry: 발행 API 가 성공한 뒤 실패하면 published_id 가 남
   assertEquals(publishCalls, 1);
 });
 
+// ---------- 답글(하위 항목) ----------
+
+Deno.test("reply: 본글을 올리면 컨테이너 칸이 비고, 답글 컨테이너가 처리 중이면 같은 줄에 남아 이어서 확인한다", async () => {
+  const { store, options, now, advance } = setup();
+  await store.enqueue("p1", "스레드", {});
+  // 본글 대기 한 번 → 본글 발행 → 답글 컨테이너 대기
+  const root = { id: "ROOT", children: [], createdAt: new Date(START).toISOString() };
+  const h: JobHandlers = {
+    async process(job, hooks) {
+      if (!job.published_id && !job.container_id) {
+        await hooks.saveContainer(root);
+        return { kind: "wait", container: root };
+      }
+      if (!job.published_id) {
+        await hooks.markPublished("POST1");
+        assertEquals(job.container_id, null, "본글 컨테이너는 다 썼다");
+        const reply = { id: "REPLY1", children: [], createdAt: new Date(now()).toISOString() };
+        await hooks.saveContainer(reply);
+        return { kind: "wait", container: reply };
+      }
+      // 다음 실행: 남은 컨테이너는 답글 것이다.
+      assertEquals(resumableContainer(job, now())?.id, "REPLY1");
+      await hooks.clearContainer();
+      return { kind: "done" };
+    },
+    onFailed: () => Promise.resolve(),
+  };
+  await runWorkerOnce(store, h, options, now);
+  assertEquals(store.jobs[0].wait_started_at, new Date(START).toISOString());
+  advance(MIN);
+  await runWorkerOnce(store, h, options, now);
+  const mid = store.jobs[0];
+  assertEquals(mid.status, "pending");
+  assertEquals(mid.published_id, "POST1");
+  assertEquals(mid.container_id, "REPLY1");
+  assertEquals(mid.wait_started_at, new Date(START + MIN).toISOString(), "답글 대기는 30분 한도를 새로 센다");
+  assertEquals(mid.attempts, 0);
+  advance(MIN);
+  await runWorkerOnce(store, h, options, now);
+  assertEquals(store.jobs[0].status, "done");
+  assertEquals(store.jobs[0].container_id, null);
+});
+
 // ---------- 멈춘 줄 복구 ----------
 
 Deno.test("recover: processing 으로 15분 넘게 멈춘 줄은 pending 으로 되돌리고 한 번의 시도로 센다", async () => {

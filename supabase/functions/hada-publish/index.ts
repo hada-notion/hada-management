@@ -140,10 +140,7 @@ import {
 import type { ContainerState, JobHandlers, JobPatch, ProcessHooks, ProcessResult, PublishJob, QueueStore } from "./queue.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
-// 스레드 답글(하위 항목)은 본글 실행 안에서 바로 올리므로 처리 대기를 짧게 묶어둔다.
-// 본글은 대기열 워커가 실행 사이에 이어서 기다린다(JOB_POLL_BUDGET_MS 참고).
-const THREADS_CONTAINER_POLL_ATTEMPTS = 10;
-const THREADS_CONTAINER_POLL_INTERVAL_MS = 4000;
+// 본글·답글 컨테이너 처리 대기는 대기열 워커가 실행 사이에 이어서 기다린다(JOB_POLL_BUDGET_MS 참고).
 // 자식 컨테이너가 준비되기 전에 부모를 만들면 메타가 400(subcode 4279004)으로 거절한다. 그때 다시 시도한다.
 const THREADS_CAROUSEL_CREATE_ATTEMPTS = 6;
 const THREADS_CAROUSEL_CREATE_DELAY_MS = 3000;
@@ -782,34 +779,6 @@ type MediaPlan =
   | { kind: "video"; url: string }
   | { kind: "text" };
 
-async function waitForThreadsContainer(
-  cfg: Config,
-  auth: ThreadsAuth,
-  containerId: string,
-): Promise<void> {
-  for (let attempt = 0; attempt < THREADS_CONTAINER_POLL_ATTEMPTS; attempt++) {
-    let info: Json;
-    try {
-      info = await threadsGet(cfg, auth, `${containerId}?fields=status,error_message`);
-    } catch (e) {
-      // 컨테이너를 막 만든 직후에는 아직 안 보일 수 있다. 그 오류만 넘긴다.
-      if (!isThreadsNotFound(e) || attempt === THREADS_CONTAINER_POLL_ATTEMPTS - 1) throw e;
-      await sleep(THREADS_CONTAINER_POLL_INTERVAL_MS);
-      continue;
-    }
-    const status = String(info.status ?? "").toUpperCase();
-    if (status === "FINISHED" || status === "PUBLISHED") return;
-    if (status === "ERROR" || status === "EXPIRED") {
-      const detail = maskSecrets(String(info.error_message ?? JSON.stringify(info)), secretsOf(cfg));
-      throw new Error(`스레드 컨테이너 처리 실패: ${truncate(detail, 300)}`);
-    }
-    await sleep(THREADS_CONTAINER_POLL_INTERVAL_MS);
-  }
-  throw new Error(
-    "스레드가 아직 파일을 처리하는 중입니다. 올라간 글은 없으니 잠시 뒤 같은 버튼을 다시 누르면 새로 처리합니다.",
-  );
-}
-
 /**
  * 캐러셀 부모 컨테이너를 만든다.
  * 자식들이 준비되기 전에 부모를 만들면 메타가 400(code 100, subcode 4279004)으로 거절하므로
@@ -850,81 +819,6 @@ async function publishThreadsContainer(
     () => threadsPost(cfg, auth, `${auth.userId}/threads_publish`, { creation_id: containerId }),
     "스레드 발행",
   );
-}
-
-type ThreadsPosted = { id: string; link: string };
-
-/** 스레드에 올린다. replyToId 가 있으면 그 글의 답글로 단다(하위 항목 이어 쓰기). */
-async function publishThreads(
-  cfg: Config,
-  auth: ThreadsAuth,
-  media: MediaPlan,
-  caption: string,
-  replyToId = "",
-): Promise<ThreadsPosted> {
-  const text = truncate(caption, THREADS_TEXT_LIMIT);
-  const uid = auth.userId;
-  const textParams = { ...optionalText("text", text), ...optionalText("reply_to_id", replyToId) };
-
-  let containerId: string;
-  if (media.kind === "text") {
-    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
-      media_type: "TEXT",
-      ...textParams,
-    });
-    containerId = container.id;
-  } else if (media.kind === "video") {
-    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
-      media_type: "VIDEO",
-      video_url: media.url,
-      ...textParams,
-    });
-    containerId = container.id;
-    await waitForThreadsContainer(cfg, auth, containerId);
-  } else if (media.kind === "mixed") {
-    assertCarouselSize(media.items.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
-    const children: string[] = [];
-    for (const item of media.items) {
-      const child = await threadsPost(cfg, auth, `${uid}/threads`, item.type === "video"
-        ? { media_type: "VIDEO", video_url: item.url, is_carousel_item: "true" }
-        : { media_type: "IMAGE", image_url: item.url, is_carousel_item: "true" });
-      children.push(child.id);
-    }
-    console.log("스레드 자식 컨테이너(영상 포함)", children.length, "개 생성");
-    await Promise.all(children.map((id) => waitForThreadsContainer(cfg, auth, id)));
-    const container = await createThreadsCarousel(cfg, auth, children, text, replyToId);
-    containerId = container.id;
-    await waitForThreadsContainer(cfg, auth, containerId);
-  } else if (media.urls.length === 1) {
-    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
-      media_type: "IMAGE",
-      image_url: media.urls[0],
-      ...textParams,
-    });
-    containerId = container.id;
-    await waitForThreadsContainer(cfg, auth, containerId);
-  } else {
-    assertCarouselSize(media.urls.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
-    const children: string[] = [];
-    for (const url of media.urls) {
-      const child = await threadsPost(cfg, auth, `${uid}/threads`, {
-        media_type: "IMAGE",
-        image_url: url,
-        is_carousel_item: "true",
-      });
-      children.push(child.id);
-    }
-    console.log("스레드 자식 컨테이너", children.length, "개 생성");
-    // 부모를 만들기 전에 자식들이 처리를 마쳐야 한다. 건너뛰면 4279004 로 거절당한다.
-    await Promise.all(children.map((id) => waitForThreadsContainer(cfg, auth, id)));
-    const container = await createThreadsCarousel(cfg, auth, children, text, replyToId);
-    containerId = container.id;
-    await waitForThreadsContainer(cfg, auth, containerId);
-  }
-
-  const published = await publishThreadsContainer(cfg, auth, containerId);
-  const info = await threadsGet(cfg, auth, `${published.id}?fields=permalink`);
-  return { id: String(published.id ?? ""), link: info.permalink ?? "" };
 }
 
 // ---------- 유튜브 ----------
@@ -1468,19 +1362,26 @@ async function threadsIdOfPage(cfg: Config, pageId: string): Promise<string> {
   return "";
 }
 
+/** 답글 결과. wait 가 있으면 그 답글의 컨테이너가 아직 처리 중이라 1분 뒤 이어서 확인한다. */
+type RepliesResult = { posted: string[]; failures: string[]; postFailures: string[]; wait?: ContainerState };
+
+/** 답글을 대기열 줄(본글의 스레드 줄)에서 이어 올릴 때 쓰는 값. */
+type ReplyQueue = { job: PublishJob; hooks: ProcessHooks; deadline: number };
+
 /** 본글이 이미 올라간 콘텐츠를 다시 배포하면, 아직 못 단 하위 항목만 답글로 단다. */
 async function resumeThreadsReplies(
   cfg: Config,
   pageId: string,
   props: Json,
-): Promise<{ posted: string[]; failures: string[]; postFailures: string[] }> {
+  queue: ReplyQueue,
+): Promise<RepliesResult> {
   const empty = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
   if (relationIds(props[SUB_ITEMS_PROP]).length === 0) return empty;
   const rootId = await threadsIdOfPage(cfg, pageId);
   if (rootId === "") {
     return { ...empty, failures: ["스레드 답글 — 본글의 게시물 기록에 글 ID가 없어 답글을 이을 수 없습니다."] };
   }
-  return await publishThreadsReplies(cfg, await resolveThreadsAuth(cfg), props, rootId);
+  return await publishThreadsReplies(cfg, await resolveThreadsAuth(cfg), props, rootId, queue);
 }
 
 /** 답글 결과를 코멘트로 남긴다. 본글 발행 흐름 밖(다시 배포)에서 쓴다. */
@@ -1498,12 +1399,17 @@ async function reportReplies(
   }
 }
 
+/**
+ * 답글 컨테이너는 본글과 같은 대기열 줄의 컨테이너 칸에 남긴다. 답글은 하나씩 차례로 달고, 단 직후 칸을 비우므로
+ * 남아 있는 컨테이너는 항상 '아직 못 단 첫 답글'의 것이다. 처리 중이면 wait 를 돌려주고 1분 뒤 이어서 확인한다.
+ */
 async function publishThreadsReplies(
   cfg: Config,
   auth: ThreadsAuth,
   props: Json,
   rootId: string,
-): Promise<{ posted: string[]; failures: string[]; postFailures: string[] }> {
+  queue: ReplyQueue,
+): Promise<RepliesResult> {
   const posted: string[] = [];
   const failures: string[] = [];
   const postFailures: string[] = [];
@@ -1535,8 +1441,20 @@ async function publishThreadsReplies(
       if (limitError) throw new Error(limitError);
       const plan = replySources(item.props);
       if (plan.kind === "text" && text === "") throw new Error("'본문'과 '콘텐츠'가 모두 비어 있습니다.");
-      const media = await uploadPlan(cfg, item.pageId, plan);
-      const reply = await publishThreads(cfg, auth, media, text, replyTo);
+      const reply = await publishThreadsQueued(
+        cfg,
+        auth,
+        queue.job,
+        queue.hooks,
+        () => uploadPlan(cfg, item.pageId, plan),
+        text,
+        queue.deadline,
+        replyTo,
+      );
+      if (reply.kind === "wait") {
+        console.log("hada-publish 답글 처리 대기", item.pageId, reply.container.id || "(자식 대기)");
+        return { posted, failures, postFailures, wait: reply.container };
+      }
       replyTo = reply.id;
       posted.push(reply.link || name);
       console.log("hada-publish 답글 완료", item.pageId, reply.link || "(링크 없음)");
@@ -1551,6 +1469,8 @@ async function publishThreadsReplies(
         postFailures.push(`스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}`);
       }
     } catch (e) {
+      // 실패한 답글의 컨테이너는 버린다. 다시 배포하면 새로 만든다.
+      await queue.hooks.clearContainer().catch(() => {});
       failures.push(
         `스레드 답글 '${name}' — ${maskSecrets(message(e), secretsOf(cfg))}. ` +
           "본글은 올라갔습니다. 원인을 고친 뒤 배포 버튼을 다시 누르면 본글은 건너뛰고 남은 답글만 이어 답니다.",
@@ -2053,6 +1973,7 @@ async function createThreadsContainers(
   auth: ThreadsAuth,
   media: MediaPlan,
   text: string,
+  replyTo = "",
 ): Promise<ContainerState> {
   const uid = auth.userId;
   const createdAt = new Date().toISOString();
@@ -2061,6 +1982,7 @@ async function createThreadsContainers(
       media_type: "VIDEO",
       video_url: media.url,
       ...optionalText("text", text),
+      ...optionalText("reply_to_id", replyTo),
     });
     return { id: String(container.id), children: [], createdAt };
   }
@@ -2069,6 +1991,7 @@ async function createThreadsContainers(
       media_type: "IMAGE",
       image_url: media.urls[0],
       ...optionalText("text", text),
+      ...optionalText("reply_to_id", replyTo),
     });
     return { id: String(container.id), children: [], createdAt };
   }
@@ -2089,8 +2012,10 @@ async function createThreadsContainers(
 }
 
 /**
- * 스레드 본글 발행(대기열용). 저장해 둔 컨테이너가 있으면 새로 올리지 않고 이어서 확인한다.
+ * 스레드 발행(대기열용). 저장해 둔 컨테이너가 있으면 새로 올리지 않고 이어서 확인한다.
  * 짧은글(글만)은 처리를 기다리지 않으므로 컨테이너를 남기지 않고 바로 발행한다.
+ * replyTo 가 있으면 그 글의 답글(하위 항목)이다. 본글은 published_id 로 두 번 올리지 않고,
+ * 답글은 올린 직후 컨테이너 칸을 비우고 노션 상태(✅)로 두 번 올리지 않는다.
  */
 async function publishThreadsQueued(
   cfg: Config,
@@ -2100,9 +2025,14 @@ async function publishThreadsQueued(
   loadMedia: () => Promise<MediaPlan>,
   caption: string,
   deadline: number,
+  replyTo = "",
 ): Promise<QueuedPublish> {
   const text = truncate(caption, THREADS_TEXT_LIMIT);
-  let publishedId = job.published_id ?? "";
+  const done = async (id: string) => {
+    if (replyTo === "") await hooks.markPublished(id);
+    else await hooks.clearContainer();
+  };
+  let publishedId = replyTo === "" ? job.published_id ?? "" : "";
   if (publishedId === "") {
     for (let round = 0; round < 2; round++) {
       let state = round === 0 ? resumableContainer(job, Date.now()) : null;
@@ -2113,13 +2043,14 @@ async function publishThreadsQueued(
             const container = await threadsPost(cfg, auth, `${auth.userId}/threads`, {
               media_type: "TEXT",
               ...optionalText("text", text),
+              ...optionalText("reply_to_id", replyTo),
             });
             const published = await publishThreadsContainer(cfg, auth, String(container.id));
             publishedId = String(published.id ?? "");
-            await hooks.markPublished(publishedId);
+            await done(publishedId);
             break;
           }
-          state = await createThreadsContainers(cfg, auth, media, text);
+          state = await createThreadsContainers(cfg, auth, media, text, replyTo);
           await hooks.saveContainer(state);
           console.log("스레드 컨테이너 생성", job.page_id, state.id || `자식 ${state.children.length}개`);
         } else {
@@ -2135,7 +2066,7 @@ async function publishThreadsQueued(
             ),
           );
           if (ready.some((done) => !done)) return { kind: "wait", container: pending };
-          const parent = await createThreadsCarousel(cfg, auth, pending.children, text);
+          const parent = await createThreadsCarousel(cfg, auth, pending.children, text, replyTo);
           state = { ...pending, id: String(parent.id) };
           await hooks.saveContainer(state);
         }
@@ -2149,7 +2080,7 @@ async function publishThreadsQueued(
         if (!ready) return { kind: "wait", container };
         const published = await publishThreadsContainer(cfg, auth, container.id);
         publishedId = String(published.id ?? "");
-        await hooks.markPublished(publishedId);
+        await done(publishedId);
         break;
       } catch (e) {
         if (round === 0 && isContainerExpired(e)) {
@@ -2229,13 +2160,14 @@ async function processMetaJob(
   // 이미 완료면 다시 올리지 않는다. 스레드는 아직 못 단 하위 항목 답글만 잇는다.
   if (status === STATUS_DONE) {
     if (channel === "스레드") {
-      let replies = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
+      let replies: RepliesResult = { posted: [], failures: [], postFailures: [] };
       try {
-        replies = await resumeThreadsReplies(cfg, pageId, props);
+        replies = await resumeThreadsReplies(cfg, pageId, props, { job, hooks, deadline });
       } catch (e) {
         replies.failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}`);
       }
       await reportReplies(cfg, pageId, replies);
+      if (replies.wait) return { kind: "wait", container: replies.wait, reason: "답글 파일을 메타가 처리하는 중" };
       return { kind: "done", detail: `이미 완료, 답글 ${replies.posted.length}개` };
     }
     return { kind: "done", detail: "이미 완료" };
@@ -2311,18 +2243,21 @@ async function processMetaJob(
   } catch (e) {
     postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
   }
+  await markContentPublished(cfg, pageId, manualPending);
+
   // 본글이 올라간 뒤 하위 항목을 답글로 잇는다. 답글 실패는 본글 성공을 되돌리지 않는다.
+  // 답글 파일이 아직 처리 중이면 1분 뒤 이 줄이 다시 돌아와(본글은 ✅ 라) 남은 답글만 잇는다.
+  let replyWait: ContainerState | undefined;
   if (threadsAuth && posted.id !== "") {
     try {
-      const replies = await publishThreadsReplies(cfg, threadsAuth, props, posted.id);
+      const replies = await publishThreadsReplies(cfg, threadsAuth, props, posted.id, { job, hooks, deadline });
       failures.push(...replies.failures);
       postFailures.push(...replies.postFailures);
+      replyWait = replies.wait;
     } catch (e) {
       failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}. 본글은 올라갔습니다.`);
     }
   }
-
-  await markContentPublished(cfg, pageId, manualPending);
   if (failures.length === 0) await clearOwnError(cfg, pageId, props, channel);
   await commentLines(
     cfg,
@@ -2338,6 +2273,7 @@ async function processMetaJob(
     postFailures,
     "발행은 됐습니다. 게시물 DB 에 직접 기록하고 링크를 붙여주세요.",
   );
+  if (replyWait) return { kind: "wait", container: replyWait, reason: "답글 파일을 메타가 처리하는 중" };
   return { kind: "done", detail: link || "성공" };
 }
 
