@@ -81,10 +81,15 @@ export type JobHandlers = {
 };
 
 export type ProcessHooks = {
-  /** 발행 API 가 성공하면 바로 부른다. 뒤 단계가 실패해 다시 시도해도 두 번 올리지 않게 한다. */
+  /**
+   * 발행 API 가 성공하면 바로 부른다. 뒤 단계가 실패해 다시 시도해도 두 번 올리지 않게 한다.
+   * 쓴 컨테이너와 처리 대기 시각도 비운다(같은 줄이 이어서 답글을 달 때 새 컨테이너 칸으로 쓴다).
+   */
   markPublished(publishedId: string): Promise<void>;
   /** 새 컨테이너를 만들면 바로 부른다. 실행이 중간에 잘려도 다음 실행이 이어서 확인한다. */
   saveContainer(container: ContainerState): Promise<void>;
+  /** 컨테이너 칸과 처리 대기 시각을 비운다. 답글을 올린 직후나 답글이 실패했을 때 쓴다. */
+  clearContainer(): Promise<void>;
 };
 
 /** 다시 시도해도 소용없는 실패(설정·형식 오류 등). 바로 failed 로 확정한다. */
@@ -179,10 +184,27 @@ export async function runWorkerOnce(
     if (!job) return { ran: true, recovered, job: null, hasMore: false };
 
     const ref = { id: job.id, pageId: job.page_id, channel: job.channel };
+    const emptyContainer = {
+      container_id: null,
+      container_children: null,
+      container_created_at: null,
+      wait_started_at: null,
+    };
+    const forgetContainer = () => {
+      job.container_id = null;
+      job.container_children = null;
+      job.container_created_at = null;
+      job.wait_started_at = null;
+    };
     const hooks: ProcessHooks = {
       markPublished: async (publishedId) => {
         job.published_id = publishedId;
-        await store.update(job.id, { published_id: publishedId, updated_at: iso(now()) });
+        forgetContainer();
+        await store.update(job.id, { published_id: publishedId, ...emptyContainer, updated_at: iso(now()) });
+      },
+      clearContainer: async () => {
+        forgetContainer();
+        await store.update(job.id, { ...emptyContainer, updated_at: iso(now()) });
       },
       saveContainer: async (container) => {
         job.container_id = container.id;
