@@ -25,13 +25,17 @@
 //   (네이버 블로그는 Aside 브라우저가 그 기록을 보고 올린 뒤 게시 링크를 채운다. 성과는 ?metrics=1 이 공감·댓글·공유를 모은다.)
 //   페이지를 찾지 못하면 큐 조회로 넘어간다.
 //
-// 버튼 웹훅에는 항상 202(접수)로 응답하고 실제 발행은 백그라운드에서 이어간다.
-// 노션 버튼 웹훅은 10초 안에 응답이 와야 하는데 발행은 그보다 오래 걸리기 때문이다.
+// 배포는 대기열(publish_queue, supabase/publish_queue.sql)로 한다. (261111)
+//   버튼 웹훅은 채널마다 대기열에 한 줄씩 넣고 202(접수)로 답한다. 노션 버튼 웹훅은 10초 안에 응답이 와야 한다.
+//   워커(?worker=1)가 한 실행에 한 채널씩, 쌓인 순서대로 올린다. 접수 직후 바로 깨우고 pg_cron 이 1분마다 깨운다.
+//   메타가 영상을 아직 처리 중이면 실패로 치지 않고 컨테이너 번호를 남겨 1분 뒤 이어서 확인한다(최대 30분).
+//   진짜 실패는 3번까지 다시 시도한다. 자세한 규칙은 queue.ts.
 // 실제 결과는 페이지의 '인스타그램 상태'·'스레드 상태'·'유튜브 상태'와 '실시간 처리 상태' 수식으로 확인한다.
-// 테스트처럼 결과를 바로 보고 싶으면 ?wait=1 을 붙인다.
+// ?wait=1 을 붙이면 접수 결과(넣은 채널)를 바로 돌려준다. ?worker=1&wait=1 은 워커 한 번의 결과를 돌려준다.
 //
 // 예약 발행: POST /functions/v1/hada-publish?due=1  (pg_cron 5분마다, x-cron-key)
-//   상태=게시대기이고 '예약 시각'(날짜+시간)이 지난 행을 배포 버튼과 같은 경로로 올린다.
+//   상태=게시대기이고 '예약 시각'(날짜+시간)이 지난 행을 배포 버튼과 같은 경로로 대기열에 넣는다.
+// 워커: POST /functions/v1/hada-publish?worker=1  (pg_cron 1분마다 x-cron-key, 함수 자신이 깨울 때 x-admin-key)
 //
 // 오류 문구에는 비밀값이 섞여 들어올 수 있다(메타는 거절한 토큰을 오류 문구에 되돌려준다).
 // 노션에 쓰기 전에 summarizeApiError 로 요약하고 maskSecrets 로 가린다.
@@ -124,14 +128,20 @@ import {
   YOUTUBE_SCOPES,
 } from "./lib.ts";
 import type { ContentField, MediaItem, MediaKind, MetricChannel, Metrics, MetricScope } from "./lib.ts";
+import {
+  ContainerExpired,
+  PermanentError,
+  containerStep,
+  isContainerExpired,
+  isPermanent,
+  resumableContainer,
+  runWorkerOnce,
+} from "./queue.ts";
+import type { ContainerState, JobHandlers, JobPatch, ProcessHooks, ProcessResult, PublishJob, QueueStore } from "./queue.ts";
 
 const NOTION_BASE = "https://api.notion.com/v1";
-const IG_CONTAINER_POLL_ATTEMPTS = 10;
-const IG_CONTAINER_POLL_INTERVAL_MS = 3000;
-// 영상은 메타가 처리하는 데 시간이 걸린다. 다만 함수 실행 한도(150초)를 넘기면
-// 백그라운드 작업이 중간에 잘리므로, 기다리는 시간을 한도 안쪽으로 묶어둔다.
-const IG_VIDEO_POLL_ATTEMPTS = 12;
-const IG_VIDEO_POLL_INTERVAL_MS = 6000;
+// 스레드 답글(하위 항목)은 본글 실행 안에서 바로 올리므로 처리 대기를 짧게 묶어둔다.
+// 본글은 대기열 워커가 실행 사이에 이어서 기다린다(JOB_POLL_BUDGET_MS 참고).
 const THREADS_CONTAINER_POLL_ATTEMPTS = 10;
 const THREADS_CONTAINER_POLL_INTERVAL_MS = 4000;
 // 자식 컨테이너가 준비되기 전에 부모를 만들면 메타가 400(subcode 4279004)으로 거절한다. 그때 다시 시도한다.
@@ -522,82 +532,7 @@ const igPost = (cfg: Config, path: string, params: Json) =>
 
 const igGet = (cfg: Config, path: string) => igRequest(cfg, path);
 
-async function waitForIgContainer(
-  cfg: Config,
-  containerId: string,
-  attempts = IG_CONTAINER_POLL_ATTEMPTS,
-  intervalMs = IG_CONTAINER_POLL_INTERVAL_MS,
-): Promise<void> {
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const info = await igGet(cfg, `${containerId}?fields=status_code,status`);
-    const status = info.status_code ?? info.status;
-    if (status === "FINISHED" || status === "PUBLISHED") return;
-    if (status === "ERROR" || status === "EXPIRED") {
-      const detail = maskSecrets(JSON.stringify(info), secretsOf(cfg));
-      throw new Error(`인스타 컨테이너 처리 실패: ${truncate(detail, 300)}`);
-    }
-    await sleep(intervalMs);
-  }
-  throw new Error(
-    "메타가 아직 파일을 처리하는 중입니다. 올라간 글은 없으니 잠시 뒤 같은 버튼을 다시 누르면 새로 처리합니다.",
-  );
-}
-
-async function publishInstagram(cfg: Config, imageUrls: string[], caption: string): Promise<string> {
-  const text = truncate(caption, IG_CAPTION_LIMIT);
-
-  let containerId: string;
-  if (imageUrls.length === 1) {
-    const container = await igPost(cfg, `${cfg.igUserId}/media`, {
-      image_url: imageUrls[0],
-      ...optionalText("caption", text),
-    });
-    containerId = container.id;
-  } else {
-    assertCarouselSize(imageUrls.length, IG_CAROUSEL_MIN, IG_CAROUSEL_MAX, "인스타그램");
-    const children: string[] = [];
-    for (const url of imageUrls) {
-      const child = await igPost(cfg, `${cfg.igUserId}/media`, { image_url: url, is_carousel_item: "true" });
-      children.push(child.id);
-    }
-    const container = await igPost(cfg, `${cfg.igUserId}/media`, {
-      media_type: "CAROUSEL",
-      children: children.join(","),
-      ...optionalText("caption", text),
-    });
-    containerId = container.id;
-  }
-
-  await waitForIgContainer(cfg, containerId);
-  const published = await igPost(cfg, `${cfg.igUserId}/media_publish`, { creation_id: containerId });
-  const info = await igGet(cfg, `${published.id}?fields=permalink`);
-  return info.permalink ?? "";
-}
-
-/**
- * 릴스 발행. 영상은 컨테이너를 만든 뒤 메타가 처리할 때까지 기다려야 발행할 수 있다.
- * 처리 시간이 길어 함수 한도에 걸리면 여기서 멈추는데, 그때는 media_publish 를 부르지 않았으므로
- * 다시 실행해도 같은 글이 두 번 올라가지 않는다.
- */
-async function publishInstagramReel(
-  cfg: Config,
-  videoUrl: string,
-  caption: string,
-  coverUrl = "",
-): Promise<string> {
-  const text = truncate(caption, IG_CAPTION_LIMIT);
-  const container = await igPost(cfg, `${cfg.igUserId}/media`, {
-    media_type: "REELS",
-    video_url: videoUrl,
-    ...optionalText("caption", text),
-    ...optionalText("cover_url", coverUrl),
-    share_to_feed: "true",
-  });
-  await waitForIgContainer(cfg, container.id, IG_VIDEO_POLL_ATTEMPTS, IG_VIDEO_POLL_INTERVAL_MS);
-  const published = await igPost(cfg, `${cfg.igUserId}/media_publish`, { creation_id: container.id });
-  const info = await igGet(cfg, `${published.id}?fields=permalink`);
-  return info.permalink ?? "";
-}
+// 인스타그램 발행은 대기열 워커가 한다(publishInstagramQueued). 컨테이너 처리 대기를 실행 사이에 이어서 확인한다.
 
 // ---------- 스레드 인증 ----------
 // Threads API 는 페이스북 로그인으로 붙는 경로가 없다. 스레드 자체 OAuth 를 한 번 거쳐
@@ -1247,8 +1182,6 @@ async function releaseJob(cfg: Config, pageId: string, channel: string): Promise
 // 노션 버튼 웹훅은 페이지 URL 을 실어 보낼 수 없다(보낼 수 있는 건 DB 속성뿐).
 // 그래서 작업중 체크가 켜진 행을 서버가 직접 조회한다.
 
-const QUEUE_TIME_BUDGET_MS = 110000;
-
 async function queryQueuedPageIds(cfg: Config): Promise<string[]> {
   // 버튼이 상태를 ⚪ 대기로 바꾼 뒤 웹훅을 보내므로, 웹훅이 오지 않은 행은 대기로 남는다.
   const filter = {
@@ -1649,7 +1582,96 @@ async function uploadPlan(cfg: Config, pageId: string, plan: MediaPlan): Promise
   return { kind: "images", urls };
 }
 
-async function publishRow(
+// ---------- 대기열: 접수 ----------
+// 배포 버튼(웹훅)·큐 조회·예약 발행은 여기서 채널마다 대기열(publish_queue)에 한 줄씩 넣기만 한다.
+// 실제 발행은 워커(?worker=1)가 한 실행에 한 채널씩 한다(supabase/publish_queue.sql, queue.ts).
+
+/** 대기열 저장소. supabase/publish_queue.sql 의 표·함수를 PostgREST 로 부른다. */
+class RestQueueStore implements QueueStore {
+  constructor(private cfg: Config) {}
+
+  private async rpc(name: string, args: Json = {}): Promise<unknown> {
+    const res = await sbRest(this.cfg, `rpc/${name}`, { method: "POST", body: JSON.stringify(args) });
+    const text = await res.text();
+    if (!res.ok) throw apiError(this.cfg, `대기열 ${name} 실패`, res.status, text, 200);
+    return text ? JSON.parse(text) : null;
+  }
+
+  async enqueue(pageId: string, channel: string, payload: Record<string, unknown>): Promise<boolean> {
+    return (await this.rpc("enqueue_publish_job", {
+      p_page_id: pageId,
+      p_channel: channel,
+      p_payload: payload,
+    })) === true;
+  }
+
+  async claimNext(): Promise<PublishJob | null> {
+    const rows = (await this.rpc("claim_next_publish_job")) as PublishJob[] | null;
+    return rows && rows.length > 0 ? rows[0] : null;
+  }
+
+  async update(id: number, patch: JobPatch): Promise<void> {
+    const res = await sbRest(this.cfg, `${QUEUE_TABLE}?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "Prefer": "return=minimal" },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) throw apiError(this.cfg, "대기열 갱신 실패", res.status, await res.text(), 200);
+  }
+
+  async recoverStale(staleSeconds: number, maxAttempts: number): Promise<number> {
+    const rows = (await this.rpc("recover_stale_publish_jobs", {
+      stale_after_seconds: staleSeconds,
+      max_attempts: maxAttempts,
+    })) as Json[] | null;
+    return rows?.length ?? 0;
+  }
+
+  async tryLock(leaseSeconds: number): Promise<boolean> {
+    return (await this.rpc("try_acquire_publish_lock", { lease_seconds: leaseSeconds })) === true;
+  }
+
+  async renewLock(leaseSeconds: number): Promise<void> {
+    await this.rpc("renew_publish_lock", { lease_seconds: leaseSeconds });
+  }
+
+  async releaseLock(): Promise<void> {
+    await this.rpc("release_publish_lock");
+  }
+
+  async hasReady(): Promise<boolean> {
+    const now = encodeURIComponent(new Date().toISOString());
+    const res = await sbRest(
+      this.cfg,
+      `${QUEUE_TABLE}?status=eq.pending&next_attempt_at=lte.${now}&select=id&limit=1`,
+    );
+    if (!res.ok) return false;
+    return ((await res.json()) as Json[]).length > 0;
+  }
+}
+
+const QUEUE_TABLE = "publish_queue";
+
+/** 워커를 바로 깨운다. 실패해도 1분 크론이 줍는다. */
+function wakeWorker(cfg: Config): void {
+  if (cfg.storageUrl === "") return;
+  const call = fetch(`${cfg.storageUrl}/functions/v1/hada-publish?worker=1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-admin-key": cfg.adminSecret },
+    body: JSON.stringify({ source: "wake" }),
+  })
+    .then((res) => res.body?.cancel())
+    .catch((e) => console.error("워커 깨우기 실패(1분 크론이 대신 줍는다)", message(e)));
+  const runtime = (globalThis as { EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void } }).EdgeRuntime;
+  runtime?.waitUntil?.(call);
+}
+
+/**
+ * 한 페이지의 배포 요청을 접수한다. 채널마다 대기열에 한 줄씩 넣는다(이미 대기·처리 중이면 넣지 않는다).
+ * 블로그처럼 사람이 올리는 채널의 게시물 기록은 여기서 만든다(금방 끝난다).
+ * 테스트 실행(dryRun)은 대기열에 넣지 않고 파일 업로드와 인증만 점검해 돌려준다.
+ */
+async function intakeRow(
   cfg: Config,
   pageId: string,
   dryRun: boolean,
@@ -1683,13 +1705,19 @@ async function publishRow(
     doneChannels = plan.done;
   }
 
+  // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
+  let channels: Channel[] = CHANNELS.filter((channel) => wanted.has(channel));
+  if (channels.length === 0 && dryRun && recordChannels.length === 0 && !youtube) channels = [...CHANNELS];
+
+  if (dryRun) return await dryRunRow(cfg, pageId, props, channels, youtube, recordChannels);
+
   let records: PostRecord[] = [];
   let recordFailures: string[] = [];
-  if (recordChannels.length > 0 && !dryRun) {
+  if (recordChannels.length > 0) {
     ({ records, failures: recordFailures } = await createPostRecords(cfg, pageId, props, recordChannels));
   }
   // 블로그처럼 사람이 올리는 채널이 아직 안 올라갔으면(기록에 게시 링크 없음) 콘텐츠 상태를 '게시대기'로 둔다.
-  // 그래야 Aside의 '블로그 대기' 보기(상태=게시대기)에 뜬다. 이 경우 아래 자동 발행이 성공해도 '게시완료'로 넘기지 않는다.
+  // 그래야 Aside의 '블로그 대기' 보기(상태=게시대기)에 뜬다. 이 경우 자동 발행이 성공해도 '게시완료'로 넘기지 않는다.
   const manualPending = records.some((record) => MANUAL_PUBLISH_CHANNELS.has(record.channel) && !record.linked);
   if (manualPending) {
     try {
@@ -1699,38 +1727,24 @@ async function publishRow(
     }
   }
 
-  // 테스트 실행은 요청 채널이 없어도 두 채널 기준으로 점검한다.
-  let channels: Channel[] = CHANNELS.filter((channel) => wanted.has(channel));
-  if (channels.length === 0 && dryRun && recordChannels.length === 0 && !youtube) channels = [...CHANNELS];
-  if (channels.length === 0 && !youtube && (recordChannels.length > 0 || doneChannels.length > 0)) {
-    // 스레드 본글은 이미 올라갔고 하위 항목 답글이 남았으면 그것만 이어 단다.
-    let replies = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
-    if (!dryRun && doneChannels.includes("스레드")) {
-      try {
-        replies = await resumeThreadsReplies(cfg, pageId, props);
-      } catch (e) {
-        replies.failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}`);
-      }
-      await reportReplies(cfg, pageId, replies);
-    }
-    return {
-      ok: recordFailures.length === 0 && replies.failures.length === 0,
-      pageId,
-      dryRun,
-      records: dryRun ? recordChannels : records,
-      recordFailures,
-      alreadyDone: doneChannels,
-      ...(replies.posted.length > 0 ? { threadsReplies: replies.posted } : {}),
-      ...(replies.failures.length > 0 ? { replyFailures: replies.failures } : {}),
-    };
+  // 대기열에 넣을 채널. 유튜브를 먼저 넣는다(업로드만 하면 끝나 금방 끝난다).
+  const jobs: string[] = [...(youtube ? [YOUTUBE_CHANNEL] : []), ...channels];
+  // 스레드 본글은 이미 올라갔고 하위 항목 답글이 남았으면 스레드 줄을 넣어 답글만 잇게 한다.
+  if (
+    !jobs.includes("스레드") && doneChannels.includes("스레드") && relationIds(props[SUB_ITEMS_PROP]).length > 0
+  ) {
+    jobs.push("스레드");
   }
-  if (channels.length === 0 && !youtube) {
+
+  if (jobs.length === 0) {
+    if (recordChannels.length > 0 || doneChannels.length > 0) {
+      return { ok: recordFailures.length === 0, pageId, records, recordFailures, alreadyDone: doneChannels };
+    }
     // 버튼 설정이 어긋나면 여기로 온다. '배포 채널'이 비었거나, 예전 버튼이 상태를 ⚪ 대기로 바꾸지 않은 경우다.
-    // 예전에는 아무 흔적 없이 끝나서 원인을 찾기 어려웠다. 이제는 로그와 안내를 남긴다.
     console.log("hada-publish 건너뜀", pageId, "요청된 채널 없음");
     const reason = "요청된 채널이 없어 아무것도 하지 않았습니다. " +
       "'배포 채널'에서 올릴 채널을 골랐는지 확인하세요.";
-    if (!dryRun && only === null) {
+    if (only === null) {
       try {
         await addComment(cfg, pageId, `META 업로드 안내\n\n${reason}`);
       } catch (e) {
@@ -1740,316 +1754,123 @@ async function publishRow(
     return { ok: true, pageId, skipped: true, reason };
   }
 
-  if (kind === null) {
-    throw new Error(
-      `'형식' 값을 확인하세요. 지금 값: '${format || "비어 있음"}'. 쓸 수 있는 값: ${FORMAT_NAMES.join(" / ")}`,
-    );
-  }
-
-  const plan = collectSources(props, kind);
-  const captionText = richText(contentField(props, "body"));
-  const caption = buildCaption(captionText, cfg.fixedComment);
-  const title = youtubeTitle(richText(contentField(props, "title")), pageTitle(props));
-  const thumbnail = thumbnailUrl(props);
-  // 본문이 비어도 막지 않는다. 카드뉴스는 그림이 본체라 글 없이 올리는 편이 낫다.
-  // 글이 본체인 '짧은글' 형식만 본문이 필요하다(텍스트 전용 발행은 메타가 글을 요구한다).
-  if (caption.trim() === "" && kind === "text") {
-    throw new Error(`'${format}' 형식은 글이 본체라 '본문'이 필요합니다. '본문'을 채운 뒤 다시 실행하세요.`);
-  }
-
-  // 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다.
-  if (dryRun) {
-    const uploaded = await uploadPlan(cfg, pageId, plan);
-    let threadsAuthNote = "요청 채널에 스레드가 없습니다.";
-    if (channels.includes("스레드")) {
-      try {
-        threadsAuthNote = `정상 (사용자 ID ${(await resolveThreadsAuth(cfg)).userId})`;
-      } catch (e) {
-        threadsAuthNote = message(e);
-      }
-    }
-    let youtubeNote = "배포 채널에 유튜브가 없거나 업로드 대상이 아닙니다.";
-    if (youtube) {
-      try {
-        await youtubeAccessToken(cfg);
-        youtubeNote = "정상";
-      } catch (e) {
-        youtubeNote = message(e);
-      }
-    }
-    const shorts = isShortsFormat(format);
-    return {
-      ok: true,
-      dryRun: true,
-      pageId,
-      channels,
-      youtube: youtube
-        ? {
-          auth: youtubeNote,
-          shorts,
-          privacy: cfg.youtubePrivacy,
-          title,
-          description: youtubeDescription(caption, shorts),
-          thumbnail: thumbnail === "" ? "없음" : "붙임",
-        }
-        : youtubeNote,
-      format,
-      mediaKind: kind,
-      media: uploaded,
-      caption,
-      captionLength: caption.length,
-      threadsCaptionLength: threadsLength(caption),
-      threadsReplies: relationIds(props[SUB_ITEMS_PROP]).length,
-      threadsAuth: threadsAuthNote,
-      note: "테스트 실행입니다. 발행하지 않았고 페이지 상태도 바꾸지 않았습니다.",
-    };
-  }
-
-  await updatePage(cfg, pageId, {
-    "처리 시작 시각": { date: { start: new Date().toISOString() } },
-  });
-  console.log("hada-publish 시작", pageId, channels.join(","), `${format} · ${kind} · 캡션 ${caption.length}자`);
-
-  // 파일은 채널마다 공개 URL이 필요하다. 한 번 올려서 요청한 채널이 같이 쓴다.
-  let uploaded: MediaPlan | null = null;
-  const results: Json = {};
-  const failures: string[] = [];
-  const postFailures: string[] = [];
-  const notices: string[] = [];
-  let succeeded = false;
-
-  // 유튜브는 업로드만 하면 처리를 기다리지 않아 금방 끝난다. 영상 처리를 기다리는 메타 채널보다 먼저 해서
-  // 함수 실행 한도에 밀려 잘리지 않게 한다. '이미 올렸는지'는 게시물 기록의 게시 링크로 본다(상태 칸보다 믿을 만하다).
-  if (youtube && plan.kind === "video") {
-    if (!(await claimJob(cfg, pageId, YOUTUBE_CHANNEL))) {
-      results[YOUTUBE_CHANNEL] = "다른 실행이 처리 중이라 건너뛰었습니다.";
-    } else {
-      try {
-        await updatePage(cfg, pageId, {
-          [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_WORKING } },
-        });
-        const postedLink = await youtubePostedLink(cfg, pageId);
-        if (postedLink !== "") {
-          doneChannels.push(YOUTUBE_CHANNEL);
-          results[YOUTUBE_CHANNEL] = "이미 올린 기록(게시 링크)이 있어 건너뛰었습니다.";
-          // 다시 배포하면 '섬네일'만 다시 붙인다. 섬네일을 바꾼 뒤 영상은 그대로 두고 섬네일만 갈 때 쓴다.
-          const postedId = youtubeVideoIdOf(postedLink);
-          if (thumbnail !== "" && postedId !== "") {
-            try {
-              await setYoutubeThumbnail(cfg, postedId, thumbnail);
-              notices.push("유튜브: 이미 올린 영상에 '섬네일'을 다시 붙였습니다.");
-            } catch (e) {
-              notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))}`);
-            }
-          }
-          await updatePage(cfg, pageId, {
-            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
-          });
-        } else {
-          const shorts = isShortsFormat(format);
-          const file = await downloadMedia(plan.url, "video");
-          const video = await uploadYoutube(cfg, file, title, youtubeDescription(caption, shorts));
-          const link = youtubeWatchUrl(video.id, shorts);
-          succeeded = true;
-          if (thumbnail !== "") {
-            try {
-              await setYoutubeThumbnail(cfg, video.id, thumbnail);
-            } catch (e) {
-              notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))} 영상은 올라갔습니다.`);
-            }
-          }
-          await updatePage(cfg, pageId, {
-            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } },
-          });
-          results[YOUTUBE_CHANNEL] = link;
-          console.log("hada-publish 완료", pageId, YOUTUBE_CHANNEL, link, video.privacy);
-          if (video.privacy !== "" && video.privacy !== cfg.youtubePrivacy) {
-            notices.push(
-              `유튜브: '${cfg.youtubePrivacy}'로 요청했지만 '${video.privacy}'로 올라갔습니다. ` +
-                "구글 클라우드 프로젝트가 유튜브 API 감사를 받기 전에는 API 로 올린 영상이 비공개로 묶입니다. " +
-                "유튜브 스튜디오에서 공개 범위를 바꿔주세요.",
-            );
-          }
-          try {
-            await recordPublishedPost(cfg, pageId, props, YOUTUBE_CHANNEL, link);
-          } catch (e) {
-            postFailures.push(`${YOUTUBE_CHANNEL} — ${maskSecrets(message(e), secretsOf(cfg))} (링크: ${link})`);
-          }
-        }
-      } catch (e) {
-        const detail = maskSecrets(message(e), secretsOf(cfg));
-        failures.push(`${YOUTUBE_CHANNEL} — ${detail}`);
-        results[YOUTUBE_CHANNEL] = detail;
-        try {
-          await updatePage(cfg, pageId, {
-            [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_ERROR } },
-            "마지막 오류": {
-              rich_text: [{ type: "text", text: { content: truncate(`${YOUTUBE_CHANNEL} — ${detail}`, 1800) } }],
-            },
-          });
-        } catch {
-          // 아래 실패 코멘트로 남는다.
-        }
-      } finally {
-        await releaseJob(cfg, pageId, YOUTUBE_CHANNEL);
-      }
+  const store = new RestQueueStore(cfg);
+  const enqueued: string[] = [];
+  const alreadyQueued: string[] = [];
+  const queueFailures: string[] = [];
+  for (const channel of jobs) {
+    try {
+      if (await store.enqueue(pageId, channel, { manualPending })) enqueued.push(channel);
+      else alreadyQueued.push(channel);
+    } catch (e) {
+      queueFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}`);
     }
   }
+  console.log("hada-publish 접수", pageId, "넣음", enqueued.join(",") || "-", "이미 대기", alreadyQueued.join(",") || "-");
 
-  for (const channel of channels) {
-    if (!(await claimJob(cfg, pageId, channel))) {
-      results[channel] = "다른 실행이 처리 중이라 건너뛰었습니다.";
-      continue;
-    }
+  if (queueFailures.length > 0) {
+    // 대기열 표가 없으면(publish_queue.sql 미실행) 여기서 막힌다. 조용히 끝나지 않게 페이지에 남긴다.
+    const detail = `대기열에 넣지 못했습니다. supabase/publish_queue.sql 을 실행했는지 확인하세요.\n${queueFailures.join("\n")}`;
     try {
       await updatePage(cfg, pageId, {
-        [RESULT_PROP[channel]]: { select: { name: STATUS_WORKING } },
+        "마지막 오류": { rich_text: [{ type: "text", text: { content: truncate(detail, 1800) } }] },
       });
-
-      // 한도 초과는 그 채널의 업로드와 발행보다 앞에서 막는다.
-      const limitError = captionLimitError(caption, [channel]);
-      if (limitError) {
-        // 어느 값이 길이를 만들었는지 같이 알려준다. 그래야 바로 고칠 수 있다.
-        const fixedLength = cfg.fixedComment.trim().length;
-        throw new Error(
-          `${limitError} (본문 ${captionText.trim().length}자 + 고정 멘트 ${fixedLength}자 = 발행 문구 ${caption.length}자)`,
-        );
-      }
-
-      // 인스타그램은 미디어 없는 발행을 지원하지 않는다. 이 채널만 실패로 남기고 스레드는 계속 간다.
-      if (kind === "text" && channel === "인스타그램") {
-        throw new Error(`'${format}' 형식은 미디어가 없어 인스타그램에 발행할 수 없습니다. '배포 채널'에서 인스타그램을 빼주세요.`);
-      }
-
-      if (!uploaded) uploaded = await uploadPlan(cfg, pageId, plan);
-      const media: MediaPlan = uploaded;
-
-      let link = "";
-      let threadsRootId = "";
-      let threadsAuth: ThreadsAuth | null = null;
-      if (channel === "인스타그램") {
-        if (media.kind === "mixed") {
-          throw new Error("인스타그램은 영상이 섞인 카드뉴스를 아직 올리지 못합니다. '배포 채널'에서 인스타그램을 빼거나 이미지만 넣어주세요.");
-        }
-        if (media.kind === "video") {
-          // 섬네일은 릴스 커버로 쓴다. 공개 주소가 필요해 콘텐츠 파일과 같은 곳에 올린다.
-          const cover = thumbnail === "" ? "" : await uploadMedia(cfg, pageId, "cover", thumbnail, "image");
-          link = await publishInstagramReel(cfg, media.url, caption, cover);
-        } else {
-          link = await publishInstagram(cfg, media.kind === "images" ? media.urls : [], caption);
-        }
-      } else {
-        threadsAuth = await resolveThreadsAuth(cfg);
-        const posted = await publishThreads(cfg, threadsAuth, media, caption);
-        link = posted.link;
-        threadsRootId = posted.id;
-      }
-
-      succeeded = true;
-      await updatePage(cfg, pageId, {
-        [RESULT_PROP[channel]]: { select: { name: STATUS_DONE } },
-      });
-      console.log("hada-publish 완료", pageId, channel, link || "(링크 없음)");
-      results[channel] = link || "성공";
-
-      // 링크는 게시물 기록에 남긴다. 이미 올라간 글이므로 기록 실패는 발행 실패로 치지 않고 따로 알린다.
-      try {
-        await recordPublishedPost(cfg, pageId, props, channel, link, threadsRootId);
-      } catch (e) {
-        postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
-      }
-
-      // 본글이 올라간 뒤 하위 항목을 답글로 잇는다. 답글 실패는 본글 성공을 되돌리지 않는다.
-      if (threadsAuth && threadsRootId !== "") {
-        try {
-          const replies = await publishThreadsReplies(cfg, threadsAuth, props, threadsRootId);
-          if (replies.posted.length > 0) results["스레드 답글"] = replies.posted;
-          failures.push(...replies.failures);
-          postFailures.push(...replies.postFailures);
-        } catch (e) {
-          failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}. 본글은 올라갔습니다.`);
-        }
-      }
+      await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}`);
     } catch (e) {
-      // 메타는 거절한 토큰을 오류 문구에 되돌려준다. 노션에 쓰기 전에 한 번 더 가린다.
-      const detail = maskSecrets(message(e), secretsOf(cfg));
-      failures.push(`${channel} — ${detail}`);
-      results[channel] = detail;
-      try {
-        await updatePage(cfg, pageId, {
-          [RESULT_PROP[channel]]: { select: { name: STATUS_ERROR } },
-          "마지막 오류": {
-            rich_text: [{ type: "text", text: { content: truncate(`${channel} — ${detail}`, 1800) } }],
-          },
-        });
-      } catch {
-        // 상태 기록까지 실패하면 코멘트로만 남긴다.
-      }
-    } finally {
-      await releaseJob(cfg, pageId, channel);
-    }
-  }
-
-  if (succeeded) {
-    // 한 채널이라도 올라갔으면 콘텐츠 상태를 '게시완료'로 옮긴다.
-    // 블로그처럼 사람이 올릴 채널이 남아 있으면 '게시대기'를 유지하고, Aside가 올린 뒤 '게시완료'로 바꾼다.
-    await updatePage(cfg, pageId, {
-      "발행 시각": { date: { start: new Date().toISOString() } },
-      ...(manualPending ? {} : { "상태": { select: { name: CONTENT_STATUS_PUBLISHED } } }),
-    });
-  }
-
-  // 실패가 없으면 지난 오류 메시지를 비운다.
-  // 전체 요약은 '실시간 처리 상태' 수식이 채널 상태를 읽어 계산하므로 함수가 따로 쓰지 않는다.
-  if (failures.length === 0) {
-    await updatePage(cfg, pageId, { "마지막 오류": { rich_text: [] } });
-  }
-
-  if (failures.length > 0) {
-    const note = succeeded
-      ? "성공한 채널은 그대로 두었습니다. 배포 버튼을 다시 누르면 완료된 채널은 건너뛰고 실패한 채널만 다시 시도합니다."
-      : "발행된 채널이 없습니다. 원인을 고친 뒤 다시 실행하세요.";
-    const detail = maskSecrets(failures.join("\n"), secretsOf(cfg));
-    await addComment(cfg, pageId, `META 업로드 실패\n\n${detail}\n\n${note}`);
-  }
-
-  if (notices.length > 0) {
-    try {
-      await addComment(cfg, pageId, `배포 안내\n\n${notices.join("\n")}`);
-    } catch (e) {
-      console.error("배포 안내 코멘트 실패", message(e));
-    }
-  }
-
-  if (postFailures.length > 0) {
-    try {
-      await addComment(
-        cfg,
-        pageId,
-        `게시물 기록 실패\n\n${postFailures.join("\n")}\n\n발행은 됐습니다. 게시물 DB 에 직접 기록하고 링크를 붙여주세요.`,
-      );
-    } catch (e) {
-      console.error("게시물 기록 실패 코멘트 실패", message(e));
+      console.error("접수 실패 기록 실패", message(e));
     }
   }
 
   return {
-    ok: failures.length === 0,
+    ok: queueFailures.length === 0 && recordFailures.length === 0,
     pageId,
-    channels: youtube ? [...channels, YOUTUBE_CHANNEL] : channels,
-    format,
-    mediaKind: kind,
-    results,
-    failures,
+    queued: true,
+    enqueued,
+    alreadyQueued,
+    queueFailures,
     records,
     recordFailures,
-    postFailures,
     alreadyDone: doneChannels,
   };
 }
 
+/** 테스트 실행: 파일 업로드까지만 하고 발행도 상태 변경도 하지 않는다. */
+async function dryRunRow(
+  cfg: Config,
+  pageId: string,
+  props: Json,
+  channels: Channel[],
+  youtube: boolean,
+  recordChannels: string[],
+): Promise<Json> {
+  const format = selectName(props["형식"]);
+  const kind = mediaKindFor(format);
+  if (channels.length === 0 && !youtube) {
+    return { ok: true, dryRun: true, pageId, records: recordChannels, skipped: channels.length === 0 };
+  }
+  if (kind === null) throw new Error(formatError(format));
+  const plan = collectSources(props, kind);
+  const caption = buildCaption(richText(contentField(props, "body")), cfg.fixedComment);
+  const title = youtubeTitle(richText(contentField(props, "title")), pageTitle(props));
+  const thumbnail = thumbnailUrl(props);
+  if (caption.trim() === "" && kind === "text") throw new Error(bodyRequiredError(format));
+
+  const uploaded = await uploadPlan(cfg, pageId, plan);
+  let threadsAuthNote = "요청 채널에 스레드가 없습니다.";
+  if (channels.includes("스레드")) {
+    try {
+      threadsAuthNote = `정상 (사용자 ID ${(await resolveThreadsAuth(cfg)).userId})`;
+    } catch (e) {
+      threadsAuthNote = message(e);
+    }
+  }
+  let youtubeNote = "배포 채널에 유튜브가 없거나 업로드 대상이 아닙니다.";
+  if (youtube) {
+    try {
+      await youtubeAccessToken(cfg);
+      youtubeNote = "정상";
+    } catch (e) {
+      youtubeNote = message(e);
+    }
+  }
+  const shorts = isShortsFormat(format);
+  return {
+    ok: true,
+    dryRun: true,
+    pageId,
+    channels,
+    records: recordChannels,
+    youtube: youtube
+      ? {
+        auth: youtubeNote,
+        shorts,
+        privacy: cfg.youtubePrivacy,
+        title,
+        description: youtubeDescription(caption, shorts),
+        thumbnail: thumbnail === "" ? "없음" : "붙임",
+      }
+      : youtubeNote,
+    format,
+    mediaKind: kind,
+    media: uploaded,
+    caption,
+    captionLength: caption.length,
+    threadsCaptionLength: threadsLength(caption),
+    threadsReplies: relationIds(props[SUB_ITEMS_PROP]).length,
+    threadsAuth: threadsAuthNote,
+    note: "테스트 실행입니다. 대기열에 넣지 않았고 발행도 페이지 상태 변경도 하지 않았습니다.",
+  };
+}
+
+function formatError(format: string): string {
+  return `'형식' 값을 확인하세요. 지금 값: '${format || "비어 있음"}'. 쓸 수 있는 값: ${FORMAT_NAMES.join(" / ")}`;
+}
+
+function bodyRequiredError(format: string): string {
+  return `'${format}' 형식은 글이 본체라 '본문'이 필요합니다. '본문'을 채운 뒤 다시 실행하세요.`;
+}
+
 async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
-  const startedAt = Date.now();
   const queued = await findQueuedPageIds(cfg);
   if (queued.length === 0) {
     return {
@@ -2059,44 +1880,614 @@ async function runQueue(cfg: Config, dryRun: boolean): Promise<Json> {
       requested: 0,
       processed: 0,
       results: [],
-      remaining: [],
       message: "요청(⚪ 대기)으로 남아 있는 콘텐츠가 없습니다.",
     };
   }
 
+  // 접수만 하므로 금방 끝난다. 실제 발행은 워커가 한다.
   const results: Json[] = [];
-  const remaining: string[] = [];
-  for (let index = 0; index < queued.length; index++) {
-    // 한 번의 실행이 함수 실행 시간 한도를 넘지 않도록 남은 행은 다음 호출로 미룬다.
-    if (index > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
-      remaining.push(queued[index]);
-      continue;
-    }
+  for (const pageId of queued) {
     try {
-      results.push({ pageId: queued[index], ...(await publishRow(cfg, queued[index], dryRun)) });
+      results.push({ pageId, ...(await intakeRow(cfg, pageId, dryRun)) });
     } catch (e) {
-      results.push({ pageId: queued[index], ok: false, error: message(e) });
+      results.push({ pageId, ok: false, error: message(e) });
     }
   }
-
-  const body: Json = {
+  return {
     ok: results.every((item) => item.ok !== false),
     queue: true,
     dryRun,
     requested: queued.length,
     processed: results.length,
     results,
-    remaining,
   };
-  if (remaining.length > 0) {
-    body.note = "처리 시간이 부족해 남은 행은 그대로 두었습니다. 버튼을 한 번 더 눌러주세요.";
+}
+
+// ---------- 대기열: 워커 ----------
+// 한 실행이 대기열에서 한 줄(한 페이지의 한 채널)만 꺼내 처리한다.
+// 메타 컨테이너가 아직 처리 중이면 실패로 치지 않고 container_id 를 남겨 1분 뒤 이어서 확인한다.
+
+// 한 실행에서 컨테이너 처리를 기다리는 시간(실행 시작부터). 넘으면 1분 뒤 다음 실행이 이어서 확인한다.
+// 함수 실행 한도(150초) 안에서 발행·노션 기록·답글까지 끝낼 여유를 남긴다.
+const JOB_POLL_BUDGET_MS = 90_000;
+const JOB_POLL_INTERVAL_MS = 5000;
+// 방금 만든 스레드 컨테이너는 잠깐 "없다"고 답할 수 있다. 이보다 오래된 컨테이너가 없다고 하면 만료로 본다.
+const THREADS_FRESH_MS = 5 * 60_000;
+
+type ContainerCheck = { status: string; detail: string };
+
+/**
+ * 컨테이너가 끝날 때까지 deadline 까지만 기다린다. 끝나면 true, 아직 처리 중이면 false.
+ * 처리 실패(ERROR)는 예외, 만료(EXPIRED)는 ContainerExpired 를 던진다.
+ */
+async function pollContainer(
+  check: () => Promise<ContainerCheck>,
+  deadline: number,
+  label: string,
+): Promise<boolean> {
+  while (true) {
+    const info = await check();
+    const step = containerStep(info.status);
+    if (step === "ready") return true;
+    if (step === "error") throw new Error(`${label} 컨테이너 처리 실패: ${truncate(info.detail, 300)}`);
+    if (step === "expired") throw new ContainerExpired(`${label} 컨테이너가 만료되었습니다.`);
+    if (Date.now() + JOB_POLL_INTERVAL_MS > deadline) return false;
+    await sleep(JOB_POLL_INTERVAL_MS);
   }
-  return body;
+}
+
+async function igContainerCheck(cfg: Config, id: string): Promise<ContainerCheck> {
+  const info = await igGet(cfg, `${id}?fields=status_code,status`);
+  return {
+    status: String(info.status_code ?? info.status ?? ""),
+    detail: maskSecrets(JSON.stringify(info), secretsOf(cfg)),
+  };
+}
+
+async function threadsContainerCheck(
+  cfg: Config,
+  auth: ThreadsAuth,
+  id: string,
+  createdAt: string,
+): Promise<ContainerCheck> {
+  try {
+    const info = await threadsGet(cfg, auth, `${id}?fields=status,error_message`);
+    return {
+      status: String(info.status ?? ""),
+      detail: maskSecrets(String(info.error_message ?? JSON.stringify(info)), secretsOf(cfg)),
+    };
+  } catch (e) {
+    if (!isThreadsNotFound(e)) throw e;
+    const fresh = Date.now() - Date.parse(createdAt) < THREADS_FRESH_MS;
+    return { status: fresh ? "IN_PROGRESS" : "EXPIRED", detail: message(e) };
+  }
+}
+
+type QueuedPublish = { kind: "done"; id: string; link: string } | { kind: "wait"; container: ContainerState };
+
+/**
+ * 인스타그램 발행(대기열용). 저장해 둔 컨테이너가 있으면 새로 올리지 않고 그 상태를 이어서 확인한다.
+ * 컨테이너가 만료됐으면 한 번 새로 만든다.
+ */
+async function publishInstagramQueued(
+  cfg: Config,
+  job: PublishJob,
+  hooks: ProcessHooks,
+  loadMedia: () => Promise<MediaPlan>,
+  loadCover: () => Promise<string>,
+  caption: string,
+  deadline: number,
+): Promise<QueuedPublish> {
+  const text = truncate(caption, IG_CAPTION_LIMIT);
+  let publishedId = job.published_id ?? "";
+  if (publishedId === "") {
+    for (let round = 0; round < 2; round++) {
+      let state = round === 0 ? resumableContainer(job, Date.now()) : null;
+      try {
+        if (!state) {
+          const media = await loadMedia();
+          const createdAt = new Date().toISOString();
+          let containerId: string;
+          if (media.kind === "video") {
+            const container = await igPost(cfg, `${cfg.igUserId}/media`, {
+              media_type: "REELS",
+              video_url: media.url,
+              ...optionalText("caption", text),
+              ...optionalText("cover_url", await loadCover()),
+              share_to_feed: "true",
+            });
+            containerId = container.id;
+          } else {
+            const urls = media.kind === "images" ? media.urls : [];
+            if (urls.length === 1) {
+              const container = await igPost(cfg, `${cfg.igUserId}/media`, {
+                image_url: urls[0],
+                ...optionalText("caption", text),
+              });
+              containerId = container.id;
+            } else {
+              assertCarouselSize(urls.length, IG_CAROUSEL_MIN, IG_CAROUSEL_MAX, "인스타그램");
+              const children: string[] = [];
+              for (const url of urls) {
+                const child = await igPost(cfg, `${cfg.igUserId}/media`, { image_url: url, is_carousel_item: "true" });
+                children.push(child.id);
+              }
+              const container = await igPost(cfg, `${cfg.igUserId}/media`, {
+                media_type: "CAROUSEL",
+                children: children.join(","),
+                ...optionalText("caption", text),
+              });
+              containerId = container.id;
+            }
+          }
+          state = { id: String(containerId), children: [], createdAt };
+          await hooks.saveContainer(state);
+          console.log("인스타 컨테이너 생성", job.page_id, state.id);
+        } else {
+          console.log("인스타 컨테이너 이어서 확인", job.page_id, state.id);
+        }
+        const container = state;
+        if (!(await pollContainer(() => igContainerCheck(cfg, container.id), deadline, "인스타"))) {
+          return { kind: "wait", container };
+        }
+        const published = await igPost(cfg, `${cfg.igUserId}/media_publish`, { creation_id: container.id });
+        publishedId = String(published.id ?? "");
+        await hooks.markPublished(publishedId);
+        break;
+      } catch (e) {
+        if (round === 0 && isContainerExpired(e)) {
+          console.warn("인스타 컨테이너 만료, 새로 만든다", job.page_id);
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+  const info = await igGet(cfg, `${publishedId}?fields=permalink`);
+  return { kind: "done", id: publishedId, link: info.permalink ?? "" };
+}
+
+/** 스레드 컨테이너를 만든다. 캐러셀은 자식만 만들고(id 비움) 자식이 끝나면 부모를 만든다. */
+async function createThreadsContainers(
+  cfg: Config,
+  auth: ThreadsAuth,
+  media: MediaPlan,
+  text: string,
+): Promise<ContainerState> {
+  const uid = auth.userId;
+  const createdAt = new Date().toISOString();
+  if (media.kind === "video") {
+    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
+      media_type: "VIDEO",
+      video_url: media.url,
+      ...optionalText("text", text),
+    });
+    return { id: String(container.id), children: [], createdAt };
+  }
+  if (media.kind === "images" && media.urls.length === 1) {
+    const container = await threadsPost(cfg, auth, `${uid}/threads`, {
+      media_type: "IMAGE",
+      image_url: media.urls[0],
+      ...optionalText("text", text),
+    });
+    return { id: String(container.id), children: [], createdAt };
+  }
+  const items: MediaItem[] = media.kind === "mixed"
+    ? media.items
+    : media.kind === "images"
+    ? media.urls.map((url) => ({ type: "image" as const, url }))
+    : [];
+  assertCarouselSize(items.length, THREADS_CAROUSEL_MIN, THREADS_CAROUSEL_MAX, "스레드");
+  const children: string[] = [];
+  for (const item of items) {
+    const child = await threadsPost(cfg, auth, `${uid}/threads`, item.type === "video"
+      ? { media_type: "VIDEO", video_url: item.url, is_carousel_item: "true" }
+      : { media_type: "IMAGE", image_url: item.url, is_carousel_item: "true" });
+    children.push(String(child.id));
+  }
+  return { id: "", children, createdAt };
+}
+
+/**
+ * 스레드 본글 발행(대기열용). 저장해 둔 컨테이너가 있으면 새로 올리지 않고 이어서 확인한다.
+ * 짧은글(글만)은 처리를 기다리지 않으므로 컨테이너를 남기지 않고 바로 발행한다.
+ */
+async function publishThreadsQueued(
+  cfg: Config,
+  auth: ThreadsAuth,
+  job: PublishJob,
+  hooks: ProcessHooks,
+  loadMedia: () => Promise<MediaPlan>,
+  caption: string,
+  deadline: number,
+): Promise<QueuedPublish> {
+  const text = truncate(caption, THREADS_TEXT_LIMIT);
+  let publishedId = job.published_id ?? "";
+  if (publishedId === "") {
+    for (let round = 0; round < 2; round++) {
+      let state = round === 0 ? resumableContainer(job, Date.now()) : null;
+      try {
+        if (!state) {
+          const media = await loadMedia();
+          if (media.kind === "text") {
+            const container = await threadsPost(cfg, auth, `${auth.userId}/threads`, {
+              media_type: "TEXT",
+              ...optionalText("text", text),
+            });
+            const published = await publishThreadsContainer(cfg, auth, String(container.id));
+            publishedId = String(published.id ?? "");
+            await hooks.markPublished(publishedId);
+            break;
+          }
+          state = await createThreadsContainers(cfg, auth, media, text);
+          await hooks.saveContainer(state);
+          console.log("스레드 컨테이너 생성", job.page_id, state.id || `자식 ${state.children.length}개`);
+        } else {
+          console.log("스레드 컨테이너 이어서 확인", job.page_id, state.id || `자식 ${state.children.length}개`);
+        }
+
+        if (state.id === "") {
+          // 부모를 만들기 전에 자식들이 처리를 마쳐야 한다. 건너뛰면 4279004 로 거절당한다.
+          const pending = state;
+          const ready = await Promise.all(
+            pending.children.map((id) =>
+              pollContainer(() => threadsContainerCheck(cfg, auth, id, pending.createdAt), deadline, "스레드")
+            ),
+          );
+          if (ready.some((done) => !done)) return { kind: "wait", container: pending };
+          const parent = await createThreadsCarousel(cfg, auth, pending.children, text);
+          state = { ...pending, id: String(parent.id) };
+          await hooks.saveContainer(state);
+        }
+
+        const container = state;
+        const ready = await pollContainer(
+          () => threadsContainerCheck(cfg, auth, container.id, container.createdAt),
+          deadline,
+          "스레드",
+        );
+        if (!ready) return { kind: "wait", container };
+        const published = await publishThreadsContainer(cfg, auth, container.id);
+        publishedId = String(published.id ?? "");
+        await hooks.markPublished(publishedId);
+        break;
+      } catch (e) {
+        if (round === 0 && isContainerExpired(e)) {
+          console.warn("스레드 컨테이너 만료, 새로 만든다", job.page_id);
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+  const info = await threadsGet(cfg, auth, `${publishedId}?fields=permalink`);
+  return { kind: "done", id: publishedId, link: info.permalink ?? "" };
+}
+
+/** 한 채널이라도 올라갔으면 콘텐츠 상태를 '게시완료'로 옮긴다(사람이 올릴 채널이 남았으면 '게시대기' 유지). */
+async function markContentPublished(cfg: Config, pageId: string, manualPending: boolean): Promise<void> {
+  await updatePage(cfg, pageId, {
+    "발행 시각": { date: { start: new Date().toISOString() } },
+    ...(manualPending ? {} : { "상태": { select: { name: CONTENT_STATUS_PUBLISHED } } }),
+  });
+}
+
+/** '마지막 오류'가 이 채널 것이면 비운다. 다른 채널의 오류는 남겨 둔다. */
+async function clearOwnError(cfg: Config, pageId: string, props: Json, channel: string): Promise<void> {
+  const last = richText(props["마지막 오류"] as Json).trim();
+  if (last === "" || !last.startsWith(`${channel} — `)) return;
+  await updatePage(cfg, pageId, { "마지막 오류": { rich_text: [] } });
+}
+
+async function commentLines(cfg: Config, pageId: string, title: string, lines: string[], note = ""): Promise<void> {
+  if (lines.length === 0) return;
+  try {
+    const body = maskSecrets(lines.join("\n"), secretsOf(cfg));
+    await addComment(cfg, pageId, `${title}\n\n${body}${note ? `\n\n${note}` : ""}`);
+  } catch (e) {
+    console.error(`${title} 코멘트 실패`, message(e));
+  }
+}
+
+function statusPropOf(channel: string): string {
+  return channel === YOUTUBE_CHANNEL ? YOUTUBE_RESULT_PROP : RESULT_PROP[channel as Channel];
+}
+
+/** 대기열 한 줄을 처리한다. 다시 시도해도 소용없는 오류는 PermanentError 로 던진다. */
+async function processJob(cfg: Config, job: PublishJob, hooks: ProcessHooks): Promise<ProcessResult> {
+  const deadline = Date.now() + JOB_POLL_BUDGET_MS;
+  if (job.channel !== YOUTUBE_CHANNEL && !(CHANNELS as readonly string[]).includes(job.channel)) {
+    throw new PermanentError(`알 수 없는 채널입니다: ${job.channel}`);
+  }
+  // 채널 잠금(meta_jobs). 예전 방식 실행이 같은 채널을 잡고 있으면 1분 뒤 다시 본다.
+  if (!(await claimJob(cfg, job.page_id, job.channel))) {
+    return { kind: "wait", container: null, reason: "다른 실행이 같은 채널을 처리 중" };
+  }
+  try {
+    const page = await notion(cfg, `/pages/${job.page_id}`);
+    const props = (page.properties ?? {}) as Json;
+    const manualPending = job.payload?.manualPending === true;
+    if (job.channel === YOUTUBE_CHANNEL) return await processYoutubeJob(cfg, job, hooks, props, manualPending);
+    return await processMetaJob(cfg, job, hooks, props, manualPending, deadline);
+  } finally {
+    await releaseJob(cfg, job.page_id, job.channel);
+  }
+}
+
+async function processMetaJob(
+  cfg: Config,
+  job: PublishJob,
+  hooks: ProcessHooks,
+  props: Json,
+  manualPending: boolean,
+  deadline: number,
+): Promise<ProcessResult> {
+  const pageId = job.page_id;
+  const channel = job.channel as Channel;
+  const status = selectName(props[RESULT_PROP[channel]]);
+
+  // 이미 완료면 다시 올리지 않는다. 스레드는 아직 못 단 하위 항목 답글만 잇는다.
+  if (status === STATUS_DONE) {
+    if (channel === "스레드") {
+      let replies = { posted: [] as string[], failures: [] as string[], postFailures: [] as string[] };
+      try {
+        replies = await resumeThreadsReplies(cfg, pageId, props);
+      } catch (e) {
+        replies.failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}`);
+      }
+      await reportReplies(cfg, pageId, replies);
+      return { kind: "done", detail: `이미 완료, 답글 ${replies.posted.length}개` };
+    }
+    return { kind: "done", detail: "이미 완료" };
+  }
+
+  if (status !== STATUS_WORKING) {
+    await updatePage(cfg, pageId, {
+      [RESULT_PROP[channel]]: { select: { name: STATUS_WORKING } },
+      "처리 시작 시각": { date: { start: new Date().toISOString() } },
+    });
+  }
+
+  const format = selectName(props["형식"]);
+  const kind = mediaKindFor(format);
+  if (kind === null) throw new PermanentError(formatError(format));
+  let plan: MediaPlan;
+  try {
+    plan = collectSources(props, kind);
+  } catch (e) {
+    throw new PermanentError(message(e));
+  }
+  const captionText = richText(contentField(props, "body"));
+  const caption = buildCaption(captionText, cfg.fixedComment);
+  if (caption.trim() === "" && kind === "text") throw new PermanentError(bodyRequiredError(format));
+
+  // 한도 초과는 그 채널의 업로드와 발행보다 앞에서 막는다. 어느 값이 길이를 만들었는지 같이 알려준다.
+  const limitError = captionLimitError(caption, [channel]);
+  if (limitError) {
+    const fixedLength = cfg.fixedComment.trim().length;
+    throw new PermanentError(
+      `${limitError} (본문 ${captionText.trim().length}자 + 고정 멘트 ${fixedLength}자 = 발행 문구 ${caption.length}자)`,
+    );
+  }
+  if (channel === "인스타그램") {
+    // 인스타그램은 미디어 없는 발행을 지원하지 않는다.
+    if (kind === "text") {
+      throw new PermanentError(`'${format}' 형식은 미디어가 없어 인스타그램에 발행할 수 없습니다. '배포 채널'에서 인스타그램을 빼주세요.`);
+    }
+    if (plan.kind === "mixed") {
+      throw new PermanentError("인스타그램은 영상이 섞인 카드뉴스를 아직 올리지 못합니다. '배포 채널'에서 인스타그램을 빼거나 이미지만 넣어주세요.");
+    }
+  }
+
+  // 파일은 새 컨테이너를 만들 때만 올린다. 처리 대기를 이어서 확인할 때는 올리지 않는다.
+  let uploaded: MediaPlan | null = null;
+  const loadMedia = async () => (uploaded ??= await uploadPlan(cfg, pageId, plan));
+  const thumbnail = thumbnailUrl(props);
+
+  let posted: QueuedPublish;
+  let threadsAuth: ThreadsAuth | null = null;
+  if (channel === "인스타그램") {
+    // 섬네일은 릴스 커버로 쓴다. 공개 주소가 필요해 콘텐츠 파일과 같은 곳에 올린다.
+    const loadCover = async () => thumbnail === "" ? "" : await uploadMedia(cfg, pageId, "cover", thumbnail, "image");
+    posted = await publishInstagramQueued(cfg, job, hooks, loadMedia, loadCover, caption, deadline);
+  } else {
+    threadsAuth = await resolveThreadsAuth(cfg);
+    posted = await publishThreadsQueued(cfg, threadsAuth, job, hooks, loadMedia, caption, deadline);
+  }
+  if (posted.kind === "wait") {
+    console.log("hada-publish 처리 대기", pageId, channel, posted.container.id || "(자식 대기)");
+    return { kind: "wait", container: posted.container, reason: "메타가 파일을 처리하는 중" };
+  }
+
+  const link = posted.link;
+  await updatePage(cfg, pageId, { [RESULT_PROP[channel]]: { select: { name: STATUS_DONE } } });
+  console.log("hada-publish 완료", pageId, channel, link || "(링크 없음)");
+
+  const failures: string[] = [];
+  const postFailures: string[] = [];
+  // 링크는 게시물 기록에 남긴다. 이미 올라간 글이므로 기록 실패는 발행 실패로 치지 않고 따로 알린다.
+  try {
+    await recordPublishedPost(cfg, pageId, props, channel, link, channel === "스레드" ? posted.id : "");
+  } catch (e) {
+    postFailures.push(`${channel} — ${maskSecrets(message(e), secretsOf(cfg))}${link ? ` (링크: ${link})` : ""}`);
+  }
+  // 본글이 올라간 뒤 하위 항목을 답글로 잇는다. 답글 실패는 본글 성공을 되돌리지 않는다.
+  if (threadsAuth && posted.id !== "") {
+    try {
+      const replies = await publishThreadsReplies(cfg, threadsAuth, props, posted.id);
+      failures.push(...replies.failures);
+      postFailures.push(...replies.postFailures);
+    } catch (e) {
+      failures.push(`스레드 답글 — ${maskSecrets(message(e), secretsOf(cfg))}. 본글은 올라갔습니다.`);
+    }
+  }
+
+  await markContentPublished(cfg, pageId, manualPending);
+  if (failures.length === 0) await clearOwnError(cfg, pageId, props, channel);
+  await commentLines(
+    cfg,
+    pageId,
+    "META 업로드 실패",
+    failures,
+    "본글은 올라갔습니다. 원인을 고친 뒤 배포 버튼을 다시 누르면 남은 답글만 이어 답니다.",
+  );
+  await commentLines(
+    cfg,
+    pageId,
+    "게시물 기록 실패",
+    postFailures,
+    "발행은 됐습니다. 게시물 DB 에 직접 기록하고 링크를 붙여주세요.",
+  );
+  return { kind: "done", detail: link || "성공" };
+}
+
+/**
+ * 유튜브 업로드. 업로드만 하면 끝나고(처리는 유튜브가 나중에 한다) 컨테이너 대기가 없다.
+ * '이미 올렸는지'는 게시물 기록의 게시 링크와 이 줄의 published_id 로 본다.
+ */
+async function processYoutubeJob(
+  cfg: Config,
+  job: PublishJob,
+  hooks: ProcessHooks,
+  props: Json,
+  manualPending: boolean,
+): Promise<ProcessResult> {
+  const pageId = job.page_id;
+  const format = selectName(props["형식"]);
+  const kind = mediaKindFor(format);
+  if (kind !== "video") throw new PermanentError(`유튜브는 영상 형식만 올립니다. 지금 '형식': '${format || "비어 있음"}'`);
+  let plan: MediaPlan;
+  try {
+    plan = collectSources(props, kind);
+  } catch (e) {
+    throw new PermanentError(message(e));
+  }
+  if (plan.kind !== "video") throw new PermanentError("'콘텐츠'에 영상 파일이 없습니다.");
+  const caption = buildCaption(richText(contentField(props, "body")), cfg.fixedComment);
+  const title = youtubeTitle(richText(contentField(props, "title")), pageTitle(props));
+  const thumbnail = thumbnailUrl(props);
+  const shorts = isShortsFormat(format);
+
+  await updatePage(cfg, pageId, {
+    [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_WORKING } },
+    "처리 시작 시각": { date: { start: new Date().toISOString() } },
+  });
+
+  const notices: string[] = [];
+  const postFailures: string[] = [];
+  const postedLink = job.published_id ? "" : await youtubePostedLink(cfg, pageId);
+  if (postedLink !== "") {
+    // 다시 배포하면 '섬네일'만 다시 붙인다. 섬네일을 바꾼 뒤 영상은 그대로 두고 섬네일만 갈 때 쓴다.
+    const postedId = youtubeVideoIdOf(postedLink);
+    if (thumbnail !== "" && postedId !== "") {
+      try {
+        await setYoutubeThumbnail(cfg, postedId, thumbnail);
+        notices.push("유튜브: 이미 올린 영상에 '섬네일'을 다시 붙였습니다.");
+      } catch (e) {
+        notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))}`);
+      }
+    }
+    await updatePage(cfg, pageId, { [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } } });
+    await clearOwnError(cfg, pageId, props, YOUTUBE_CHANNEL);
+    await commentLines(cfg, pageId, "배포 안내", notices);
+    return { kind: "done", detail: "이미 올린 기록(게시 링크)이 있어 건너뛰었습니다." };
+  }
+
+  let videoId = job.published_id ?? "";
+  let privacy = "";
+  if (videoId === "") {
+    const file = await downloadMedia(plan.url, "video");
+    const video = await uploadYoutube(cfg, file, title, youtubeDescription(caption, shorts));
+    videoId = video.id;
+    privacy = video.privacy;
+    await hooks.markPublished(videoId);
+  }
+  const link = youtubeWatchUrl(videoId, shorts);
+  if (thumbnail !== "") {
+    try {
+      await setYoutubeThumbnail(cfg, videoId, thumbnail);
+    } catch (e) {
+      notices.push(`유튜브 섬네일: ${maskSecrets(message(e), secretsOf(cfg))} 영상은 올라갔습니다.`);
+    }
+  }
+  await updatePage(cfg, pageId, { [YOUTUBE_RESULT_PROP]: { select: { name: STATUS_DONE } } });
+  console.log("hada-publish 완료", pageId, YOUTUBE_CHANNEL, link, privacy);
+  if (privacy !== "" && privacy !== cfg.youtubePrivacy) {
+    notices.push(
+      `유튜브: '${cfg.youtubePrivacy}'로 요청했지만 '${privacy}'로 올라갔습니다. ` +
+        "구글 클라우드 프로젝트가 유튜브 API 감사를 받기 전에는 API 로 올린 영상이 비공개로 묶입니다. " +
+        "유튜브 스튜디오에서 공개 범위를 바꿔주세요.",
+    );
+  }
+  try {
+    await recordPublishedPost(cfg, pageId, props, YOUTUBE_CHANNEL, link);
+  } catch (e) {
+    postFailures.push(`${YOUTUBE_CHANNEL} — ${maskSecrets(message(e), secretsOf(cfg))} (링크: ${link})`);
+  }
+  await markContentPublished(cfg, pageId, manualPending);
+  await clearOwnError(cfg, pageId, props, YOUTUBE_CHANNEL);
+  await commentLines(cfg, pageId, "배포 안내", notices);
+  await commentLines(
+    cfg,
+    pageId,
+    "게시물 기록 실패",
+    postFailures,
+    "발행은 됐습니다. 게시물 DB 에 직접 기록하고 링크를 붙여주세요.",
+  );
+  return { kind: "done", detail: link };
+}
+
+/** 워커가 쓰는 처리기. 오류 문구의 비밀값은 대기열 표에 남기기 전에 가린다. */
+function queueHandlers(cfg: Config): JobHandlers {
+  return {
+    async process(job, hooks) {
+      try {
+        return await processJob(cfg, job, hooks);
+      } catch (e) {
+        const masked = maskSecrets(message(e), secretsOf(cfg));
+        throw isPermanent(e) ? new PermanentError(masked) : new Error(masked);
+      }
+    },
+    async onRetry(job, error, attempt, maxAttempts) {
+      console.warn("hada-publish 재시도 예정", job.page_id, job.channel, `${attempt}/${maxAttempts}`, error);
+      await updatePage(cfg, job.page_id, {
+        "마지막 오류": {
+          rich_text: [{
+            type: "text",
+            text: { content: truncate(`${job.channel} — 재시도 예정(${attempt}/${maxAttempts}): ${error}`, 1800) },
+          }],
+        },
+      });
+    },
+    async onFailed(job, error) {
+      console.error("hada-publish 실패 확정", job.page_id, job.channel, error);
+      await updatePage(cfg, job.page_id, {
+        [statusPropOf(job.channel)]: { select: { name: STATUS_ERROR } },
+        "마지막 오류": { rich_text: [{ type: "text", text: { content: truncate(`${job.channel} — ${error}`, 1800) } }] },
+      });
+      await commentLines(
+        cfg,
+        job.page_id,
+        "META 업로드 실패",
+        [`${job.channel} — ${error}`],
+        "올라간 글은 없습니다. 원인을 고친 뒤 배포 버튼을 다시 누르면 다시 대기열에 넣습니다(완료된 채널은 건너뜁니다).",
+      );
+    },
+  };
+}
+
+/** 워커 한 번. 남은 줄이 있으면 다음 실행을 바로 깨운다(한 실행 = 한 채널). */
+async function runWorker(cfg: Config): Promise<Json> {
+  if (!storageReady(cfg)) throw new Error("대기열 저장소 설정(SB_URL, SB_SERVICE_ROLE_KEY)이 없습니다.");
+  const report = await runWorkerOnce(new RestQueueStore(cfg), queueHandlers(cfg));
+  if (report.ran && report.hasMore) wakeWorker(cfg);
+  return { ok: !(report.ran && report.job !== null && report.outcome === "failed"), worker: true, ...report };
 }
 
 // ---------- 예약 발행 ----------
 // 대표가 콘텐츠를 '게시대기'로 두고 '예약 시각'(날짜+시간)을 넣으면, pg_cron 이 5분마다 ?due=1 을 불러
-// 시각이 된 행을 배포 버튼과 같은 경로(publishRow)로 올린다(supabase/publish_cron.sql).
+// 시각이 된 행을 배포 버튼과 같은 경로(intakeRow → 대기열)로 넣는다(supabase/publish_cron.sql).
+// 직접 올리지 않으므로 1분 워커 크론과 겹쳐도 같은 글을 두 번 처리하지 않는다.
 // 발행할 채널 상태가 이미 있으면(대기·작업중·완료·오류) 건너뛴다. 실패한 글을 5분마다 다시 올리는 일을 막는다.
 
 const SCHEDULE_PROP = "예약 시각";
@@ -2126,7 +2517,6 @@ async function runDue(cfg: Config, dryRun: boolean): Promise<Json> {
   const pages = await findDuePages(cfg, nowIso);
   const results: Json[] = [];
   const skipped: Json[] = [];
-  const remaining: string[] = [];
   for (const page of pages) {
     const pageId = page.id as string;
     const props = (page.properties ?? {}) as Json;
@@ -2145,16 +2535,13 @@ async function runDue(cfg: Config, dryRun: boolean): Promise<Json> {
       }
       continue;
     }
-    if (results.length > 0 && Date.now() - startedAt > QUEUE_TIME_BUDGET_MS) {
-      remaining.push(pageId);
-      continue;
-    }
     try {
-      results.push({ pageId, scheduledAt: start, ...(await publishRow(cfg, pageId, dryRun, null, true)) });
+      results.push({ pageId, scheduledAt: start, ...(await intakeRow(cfg, pageId, dryRun, null, true)) });
     } catch (e) {
       results.push({ pageId, scheduledAt: start, ok: false, error: message(e) });
     }
   }
+  if (!dryRun && results.some((item) => (item.enqueued as string[] | undefined)?.length)) wakeWorker(cfg);
   return {
     ok: results.every((item) => item.ok !== false),
     due: true,
@@ -2164,7 +2551,6 @@ async function runDue(cfg: Config, dryRun: boolean): Promise<Json> {
     processed: results.length,
     results,
     skipped,
-    remaining,
   };
 }
 
@@ -3046,9 +3432,9 @@ Deno.serve(async (req) => {
   // Supabase pg_cron 의 매시 호출은 x-cron-key 로 들어온다. 값은 meta_tokens 표(channel = cron)에만 있고,
   // 예약 성과 수집(?metrics=1&scheduled=1)과 예약 발행(?due=1)에만 통한다.
   const cronKey = req.headers.get("x-cron-key") ?? "";
-  // 예약 발행(?due=1)도 같은 키로 5분마다 들어온다.
+  // 예약 발행(?due=1)도 같은 키로 5분마다, 배포 워커(?worker=1)는 1분마다 들어온다.
   const cronRoute = (reqUrl.searchParams.get("metrics") === "1" && reqUrl.searchParams.get("scheduled") === "1") ||
-    reqUrl.searchParams.get("due") === "1";
+    reqUrl.searchParams.get("due") === "1" || reqUrl.searchParams.get("worker") === "1";
   const cronOk = cronKey !== "" && cronRoute &&
     (await readToken(cfg, "cron").catch(() => null))?.access_token === cronKey;
   if (!cronOk && req.headers.get("x-admin-key") !== cfg.adminSecret) {
@@ -3107,7 +3493,30 @@ Deno.serve(async (req) => {
   }
   const wait = reqUrl.searchParams.get("wait") === "1";
 
-  // 예약 발행. pg_cron 호출은 10초 안에 끝나야 하므로 접수(202)만 돌려주고 뒤에서 올린다.
+  // 배포 워커. 대기열에서 한 줄(한 채널)만 처리한다. 크론 호출은 10초 안에 끝나야 하므로 접수(202)만 돌려준다.
+  if (reqUrl.searchParams.get("worker") === "1") {
+    const workerTask = runWorker(cfg);
+    const runtime = (globalThis as {
+      EdgeRuntime?: { waitUntil?: (promise: Promise<unknown>) => void };
+    }).EdgeRuntime;
+    if (!wait && runtime?.waitUntil) {
+      runtime.waitUntil(
+        workerTask
+          .then((body) => console.log("배포 워커 결과", JSON.stringify(body)))
+          .catch((e) => console.error("배포 워커 실패", message(e))),
+      );
+      return json({ ok: true, accepted: true, message: "배포 워커를 시작했습니다." }, 202);
+    }
+    try {
+      const body = await workerTask;
+      return json(body, body.ok === false ? 500 : 200);
+    } catch (e) {
+      console.error("배포 워커 실패", message(e));
+      return json({ ok: false, error: message(e) }, 500);
+    }
+  }
+
+  // 예약 발행. pg_cron 호출은 10초 안에 끝나야 하므로 접수(202)만 돌려주고 뒤에서 대기열에 넣는다.
   if (reqUrl.searchParams.get("due") === "1") {
     const dueTask = runDue(cfg, dryRun);
     const runtime = (globalThis as {
@@ -3143,12 +3552,19 @@ Deno.serve(async (req) => {
   }
   console.log("hada-publish 대상", pageId || "(없음: 큐 모드)", "채널", hint ?? "(없음)");
 
-  const task: Promise<Json> = pageId !== ""
-    ? publishRow(cfg, pageId, dryRun, hint, hint === null)
-    : runQueue(cfg, dryRun);
+  // 접수만 한다(대기열에 넣기). 넣은 줄이 있으면 워커를 바로 깨운다.
+  const task: Promise<Json> = (pageId !== ""
+    ? intakeRow(cfg, pageId, dryRun, hint, hint === null)
+    : runQueue(cfg, dryRun)).then((body) => {
+      const enqueued = pageId !== ""
+        ? ((body.enqueued as string[] | undefined) ?? []).length > 0
+        : ((body.results as Json[] | undefined) ?? []).some((item) => ((item.enqueued as string[] | undefined) ?? []).length > 0);
+      if (!dryRun && enqueued) wakeWorker(cfg);
+      return body;
+    });
 
-  // 수동 호출(?pageId=·?pageUrl=·?url=)이나 ?wait=1 만 결과를 그대로 돌려준다.
-  // 버튼 웹훅은 본문에 페이지가 실려 오므로 여기서 걸리면 10초 제한에 걸린다. 항상 202 로 접수만 알린다.
+  // 수동 호출(?pageId=·?pageUrl=·?url=)이나 ?wait=1 만 접수 결과를 그대로 돌려준다(발행 결과는 워커가 페이지에 남긴다).
+  // 버튼 웹훅은 202 로 접수만 알린다.
   const manual = reqUrl.searchParams.has("pageId") || reqUrl.searchParams.has("pageUrl") ||
     reqUrl.searchParams.has("url");
   if (wait || manual) {
