@@ -1,4 +1,6 @@
--- 예약 발행. 콘텐츠 DB에서 상태=게시대기이고 '예약 시각'(날짜+시간)이 지난 글을 5분마다 올린다.
+-- 예약 발행. 콘텐츠 DB에서 상태=게시대기이고 '예약 시각'(날짜+시간)이 지난 글을 5분마다 배포 대기열에 넣는다.
+-- (261111) 직접 올리지 않고 대기열(publish_queue.sql)에 넣기만 한다. 실제 발행은 1분 워커 크론(hada-publish-worker)만 한다.
+-- 그래서 두 크론이 겹쳐도 같은 글을 두 번 처리하지 않는다. 이 파일은 바꿀 것이 없어 다시 실행하지 않아도 된다.
 -- 성과 수집 예약(metrics_cron.sql)과 같은 x-cron-key(meta_tokens, channel = cron)를 쓴다. 그 파일을 먼저 실행해 둔다.
 -- Supabase 대시보드 > SQL Editor 에 붙여넣고 실행한다. 다시 실행해도 된다(작업은 덮어쓴다).
 -- 끄기: select cron.unschedule('hada-scheduled-publish');
