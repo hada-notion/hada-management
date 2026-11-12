@@ -884,6 +884,20 @@ export function metricsErrorSummary(body: {
   return lines.join("\n");
 }
 
+/** 채널에서 지워진 게시물. 수집 실패가 아니라 따로 센다. */
+export const METRIC_GONE = "게시물 없음";
+
+/**
+ * 이 게시물(게시물 DB 행 id)의 결과가 이미 났는지. 제목은 여러 게시물이 같을 수 있어
+ * 제목으로 맞추면 다른 게시물의 실패에 살아 있는 게시물까지 묶인다. 그래서 행 id 로 맞춘다.
+ */
+export function metricResultReported(
+  results: { postId?: string; channel: string }[],
+  target: { id: string; channel: string },
+): boolean {
+  return results.some((r) => r.postId === target.id && r.channel === target.channel);
+}
+
 /** 한 번 수집할 때 갱신할 게시물 범위. null 이면 제한 없음. */
 export type MetricScope = { days: number | null; latest: number | null };
 
@@ -943,6 +957,8 @@ export function metricsResultSummary(body: {
   const deferred = statuses.filter((s) => s === "시간 초과로 다음에").length;
   const counts = [`게시물 ${num(body.targets)}건 확인`, `새 기록 ${num(body.created)}건`, `변화 없음 ${unchanged}건`];
   if (deferred > 0) counts.push(`다음으로 미룸 ${deferred}건`);
+  const gone = statuses.filter((s) => s === METRIC_GONE).length;
+  if (gone > 0) counts.push(`채널에서 지워진 게시물 ${gone}건`);
   const lines = [`${kstDateTime(nowMs)} 수집 · ${scope}`, counts.join(" · ")];
   const imported = num(body.imported?.count);
   if (imported > 0) lines.push(`계정에서 새로 가져온 게시물 ${imported}건`);

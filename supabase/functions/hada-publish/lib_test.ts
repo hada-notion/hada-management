@@ -39,6 +39,8 @@ import {
   metricChannelByLabel,
   naverBlogIdOf,
   naverBlogMetrics,
+  METRIC_GONE,
+  metricResultReported,
   metricsErrorSummary,
   metricsResultSummary,
   postHeadline,
@@ -768,4 +770,33 @@ Deno.test("extractMediaItems keeps order and splits image/video", () => {
     { type: "video", url: "https://x/b?s=2" },
     { type: "image", url: "https://x/c.jpg" },
   ]);
+});
+
+Deno.test("metricResultReported: 같은 제목의 다른 게시물이 실패해도 살아 있는 게시물은 기록한다", () => {
+  // 같은 제목 두 건: 지운 글(a)은 인사이트 조회가 실패, 살아 있는 글(b)은 아직 결과가 없다.
+  const a = { id: "post-a", title: "같은 제목", channel: "threads" };
+  const b = { id: "post-b", title: "같은 제목", channel: "threads" };
+  const results = [{ post: a.title, postId: a.id, channel: "threads", status: "실패" }];
+  assertEquals(metricResultReported(results, a), true);
+  assertEquals(metricResultReported(results, b), false, "제목이 같아도 다른 행은 이어서 수집해야 한다");
+  // 채널이 다르면 같은 id 라도 다른 결과다.
+  assertEquals(metricResultReported(results, { id: "post-a", channel: "instagram" }), false);
+  // 게시물 기록을 못 만든 결과(postId 없음)는 어떤 대상과도 맞지 않는다.
+  assertEquals(metricResultReported([{ channel: "threads" }], b), false);
+});
+
+Deno.test("metricsResultSummary: 지워진 게시물은 오류가 아니라 건수로만 적는다", () => {
+  const now = Date.parse("2026-11-12T19:00:00Z");
+  const body = {
+    targets: 6,
+    created: 2,
+    results: [{ status: "기록" }, { status: "기록" }, { status: METRIC_GONE }, { status: METRIC_GONE }],
+    channelErrors: {},
+    failures: 0,
+  };
+  assertEquals(
+    metricsResultSummary(body, now, "스레드"),
+    "2026-11-13 04:00 수집 · 스레드\n게시물 6건 확인 · 새 기록 2건 · 변화 없음 0건 · 채널에서 지워진 게시물 2건",
+  );
+  assertEquals(metricsErrorSummary(body), "");
 });
