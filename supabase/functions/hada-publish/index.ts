@@ -101,6 +101,8 @@ import {
   pickPostContentProp,
   pickContentTypeOption,
   metricChannelByLabel,
+  METRIC_GONE,
+  metricResultReported,
   metricsErrorSummary,
   metricsResultSummary,
   applyMetricScope,
@@ -2521,7 +2523,8 @@ type PostTarget = {
   publishedAt: string;
   threadsId: string;
 };
-type CollectResult = { post: string; channel: MetricChannel; status: string; delta?: Metrics; error?: string };
+// postId 는 게시물 DB 행 id. 게시물 기록을 만들지 못한 경우에만 비어 있다.
+type CollectResult = { post: string; postId?: string; channel: MetricChannel; status: string; delta?: Metrics; error?: string };
 
 async function queryAll(cfg: Config, dataSourceId: string, filter?: Json): Promise<Json[]> {
   const rows: Json[] = [];
@@ -3068,7 +3071,12 @@ async function runMetrics(
       try {
         current.set(target.id, await threadsMetrics(cfg, auth, mediaId));
       } catch (e) {
-        results.push({ post: target.title, channel: "threads", status: "실패", error: message(e) });
+        // 스레드에서 지운 글은 인사이트가 "없다"고 답한다. 수집 실패가 아니므로 따로 적는다.
+        if (isThreadsNotFound(e)) {
+          results.push({ post: target.title, postId: target.id, channel: "threads", status: METRIC_GONE, error: message(e) });
+        } else {
+          results.push({ post: target.title, postId: target.id, channel: "threads", status: "실패", error: message(e) });
+        }
       }
     }
   } catch (e) {
@@ -3115,36 +3123,36 @@ async function runMetrics(
 
   let created = 0;
   for (const target of targets) {
-    if (results.some((r) => r.post === target.title && r.channel === target.channel)) continue;
+    if (metricResultReported(results, target)) continue;
     const failed = channelError.get(target.channel);
     if (failed) {
-      results.push({ post: target.title, channel: target.channel, status: "실패", error: failed });
+      results.push({ post: target.title, postId: target.id, channel: target.channel, status: "실패", error: failed });
       continue;
     }
     const metrics = current.get(target.id);
     if (!metrics) {
-      results.push({ post: target.title, channel: target.channel, status: "못 찾음", error: `계정에서 ${target.code} 게시물을 찾지 못했습니다.` });
+      results.push({ post: target.title, postId: target.id, channel: target.channel, status: "못 찾음", error: `계정에서 ${target.code} 게시물을 찾지 못했습니다.` });
       continue;
     }
     const delta = metricDelta(metrics, logged.get(target.id) ?? {});
     if (delta === null) {
-      results.push({ post: target.title, channel: target.channel, status: "변화 없음" });
+      results.push({ post: target.title, postId: target.id, channel: target.channel, status: "변화 없음" });
       continue;
     }
     if (Date.now() - started > METRICS_TIME_BUDGET_MS) {
-      results.push({ post: target.title, channel: target.channel, status: "시간 초과로 다음에", delta });
+      results.push({ post: target.title, postId: target.id, channel: target.channel, status: "시간 초과로 다음에", delta });
       continue;
     }
     if (!dryRun) {
       try {
         await createMetricLog(cfg, target, delta, date);
       } catch (e) {
-        results.push({ post: target.title, channel: target.channel, status: "실패", delta, error: message(e) });
+        results.push({ post: target.title, postId: target.id, channel: target.channel, status: "실패", delta, error: message(e) });
         continue;
       }
     }
     created++;
-    results.push({ post: target.title, channel: target.channel, status: dryRun ? "기록 예정" : "기록", delta });
+    results.push({ post: target.title, postId: target.id, channel: target.channel, status: dryRun ? "기록 예정" : "기록", delta });
   }
 
   const failures = results.filter((r) => r.status === "실패").length;
